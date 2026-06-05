@@ -21,10 +21,9 @@ ROADMAP="FormalFrontier/TauCetiRoadmap"
 REVIEW="FormalFrontier/TauCetiReview"
 ME="kim-em"
 STORE="$HOME/.cache/tauceti-review/store/FormalFrontier__TauCeti/ledger.json"
-CHECKOUT="$HERE/checkouts/TauCeti"
 STATE="$HERE/state"
 MAX_FIX_ATTEMPTS=3
-mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
+mkdir -p "$STATE"
 
 log() { echo "$(date '+%F %T') round: $*" >&2; }
 die() { log "$*"; exit 1; }
@@ -62,28 +61,84 @@ ledger_blocking() {
 # sanitized non-negative integer from a state file (0 if absent/garbage).
 counter() { local n; n=$(cat "$1" 2>/dev/null || echo 0); [[ "$n" =~ ^[0-9]+$ ]] || n=0; echo "$n"; }
 
-# Make $CHECKOUT a clean checkout of TauCeti `main` (clone once; keep .lake for
-# fast rebuilds, clean every other tracked/ignored leftover from a prior round).
-prepare_checkout() {
-    if [[ ! -d "$CHECKOUT/.git" ]]; then
-        log "cloning $TAUCETI → $CHECKOUT (first run)"
-        git clone -q "https://github.com/$TAUCETI" "$CHECKOUT" || return 1
+# Authoring/fixing runs inside a `bubble` container (kim-em/bubble): the per-round
+# checkout, `lake exe cache get` / `lake build` / `lake exe axioms`, and every
+# `git`/`gh` call happen IN the container, never on the host. GitHub access is
+# mediated by bubble's auth proxy, repo-scoped to FormalFrontier/TauCeti — the
+# host's `kim-em` token never enters the container, and a push outside TauCeti is
+# rejected by the proxy (not merely flagged by CI after the fact). Only the one
+# subscription credential the work model needs is seeded; no host config (notably
+# ~/.claude/CLAUDE.md) crosses the boundary.
+BUBBLE="tauceti-worker"   # fixed name; rounds are sequential, so one suffices
+
+# agent_cred_flags — bubble flags seeding ONLY the work model's subscription
+# credential, with all config and the other subscription kept out of the sandbox.
+agent_cred_flags() {
+    if [[ "$WORK_MODEL" == codex ]]; then
+        printf '%s\n' --codex-credentials --no-codex-config --no-claude-credentials --no-claude-config
+    else
+        printf '%s\n' --claude-credentials --no-claude-config --no-codex-credentials --no-codex-config
     fi
-    git -C "$CHECKOUT" fetch -q origin || return 1
-    git -C "$CHECKOUT" switch -q main 2>/dev/null || git -C "$CHECKOUT" checkout -q -B main origin/main
-    git -C "$CHECKOUT" reset -q --hard origin/main
-    git -C "$CHECKOUT" clean -fdxq -e .lake
 }
 
-# run_agent CWD PROMPT — drive the chosen subscription model on a coding task in
-# CWD with full tool access, billed to the subscription. Returns the agent's rc.
-run_agent() {
-    local cwd="$1" prompt="$2"
+# agent_inner_cmd — the command bubble runs INSIDE the container. bubble execs it
+# as `bash -lc 'cd <repo> && exec <cmd>'`, so it lands in the checkout with
+# /etc/profile.d sourced (GH_TOKEN for the repo-scoped proxy). The prompt is read
+# from a read-only mount, never threaded through bubble's argv parsing. Emptying
+# the *_API_KEY vars forces subscription auth (mirrors the old host invocation).
+agent_inner_cmd() {
     if [[ "$WORK_MODEL" == codex ]]; then
-        ( cd "$cwd" && codex exec --sandbox danger-full-access --skip-git-repo-check "$prompt" )
+        printf '%s' 'env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
     else
-        ( cd "$cwd" && env -u ANTHROPIC_API_KEY claude -p "$prompt" \
-              --model opus --dangerously-skip-permissions )
+        printf '%s' 'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" --dangerously-skip-permissions --model opus'
+    fi
+}
+
+# run_in_bubble TARGET PROMPT [HOST:CONTAINER:ro ...] — open a fresh, repo-scoped
+# bubble for TARGET (a bubble target like FormalFrontier/TauCeti or .../pull/N),
+# run the work model on PROMPT to completion inside it, then pop it (--ephemeral).
+# Trailing args are extra read-only host→container mounts (e.g. reference clones
+# the TauCeti-scoped proxy would otherwise block the agent from fetching). Returns
+# the agent's exit code.
+run_in_bubble() {
+    local target="$1" prompt="$2"; shift 2
+    local rounddir="$STATE/bubble-round"
+    rm -rf "$rounddir"; mkdir -p "$rounddir"
+    printf '%s' "$prompt" > "$rounddir/prompt.txt"
+
+    # Clear any container left by a previous round that loop.sh's timeout SIGKILLed
+    # before --ephemeral could fire (a SIGKILL can't be trapped). Rounds run one at
+    # a time, so the fixed name is self-cleaning.
+    bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true
+    trap 'bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true' EXIT
+
+    local mounts=( --mount "$rounddir:/opt/round:ro" ) m
+    for m in "$@"; do mounts+=( --mount "$m" ); done
+    local creds=(); while IFS= read -r m; do creds+=( "$m" ); done < <(agent_cred_flags)
+
+    # allowlist-write-graphql is the minimal level that still lets the agent open a
+    # PR and post review-thread replies, all repo-scoped to TauCeti by the proxy.
+    # Pinning it keeps the worker independent of the host's bubble default (a
+    # `security.github=off` lockdown still wins and would correctly abort).
+    local rc=0
+    bubble open "$target" --shell --name "$BUBBLE" --ephemeral \
+        --github-security allowlist-write-graphql \
+        "${mounts[@]}" "${creds[@]}" --command "$(agent_inner_cmd)" || rc=$?
+
+    trap - EXIT
+    return $rc
+}
+
+# fetch_ref REPO DIR — keep DIR a shallow checkout of REPO's default branch on the
+# host (full token), to be mounted read-only into a bubble. The container's GitHub
+# proxy is scoped to TauCeti, so the agent can't clone these reference repos itself.
+fetch_ref() {
+    local repo="$1" dir="$2"
+    if [[ -d "$dir/.git" ]]; then
+        git -C "$dir" fetch -q --depth 1 origin HEAD && git -C "$dir" reset -q --hard FETCH_HEAD
+    else
+        rm -rf "$dir"; mkdir -p "$(dirname "$dir")"
+        git clone -q --depth 1 "https://github.com/$repo" "$dir"
     fi
 }
 # fill_prompt FILE KEY VAL [KEY VAL...] — substitute __KEY__ placeholders.
@@ -105,11 +160,12 @@ do_review() {
 # 2. Fix -----------------------------------------------------------------------
 do_fix() {
     local pr="$1" head="$2"
-    prepare_checkout || die "checkout failed"
-    ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || die "gh pr checkout #$pr failed"
     local key="$STATE/fix-$pr-${head:0:12}" n; n=$(counter "$key")
-    log "fixing PR #$pr (attempt $((n+1))/$MAX_FIX_ATTEMPTS) with $AGENT"
-    run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"
+    log "fixing PR #$pr (attempt $((n+1))/$MAX_FIX_ATTEMPTS) with $AGENT in a bubble"
+    # bubble checks out the PR branch inside the container; the agent reads the
+    # review, fixes, builds, and pushes to the PR branch — all repo-scoped.
+    run_in_bubble "$TAUCETI/pull/$pr" \
+        "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"
     local rc=$?
     echo $((n+1)) > "$key"   # count the attempt only after it ran
     return $rc
@@ -117,10 +173,16 @@ do_fix() {
 
 # 3. Roadmap -------------------------------------------------------------------
 do_roadmap() {
-    local avoid="$1"
-    prepare_checkout || die "checkout failed"
-    log "roadmap round with $AGENT (avoiding area: $avoid)"
-    run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/roadmap.md" AVOID "$avoid" AGENT "$AGENT")"
+    local avoid="$1" refs="$STATE/refs"
+    # Stage the read-only reference repos on the host; the in-bubble proxy is
+    # TauCeti-scoped, so the agent can't fetch these itself. They mount at
+    # /opt/roadmap and /opt/review inside the container (see prompts/roadmap.md).
+    fetch_ref "$ROADMAP" "$refs/roadmap" || die "fetch $ROADMAP failed"
+    fetch_ref "$REVIEW"  "$refs/review"  || die "fetch $REVIEW failed"
+    log "roadmap round with $AGENT in a bubble (avoiding area: $avoid)"
+    run_in_bubble "$TAUCETI" \
+        "$(fill_prompt "$HERE/prompts/roadmap.md" AVOID "$avoid" AGENT "$AGENT")" \
+        "$refs/roadmap:/opt/roadmap:ro" "$refs/review:/opt/review:ro"
 }
 
 # ------------------------------------------------------------------------------
