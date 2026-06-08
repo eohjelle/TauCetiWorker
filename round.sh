@@ -332,7 +332,10 @@ do_fix() {
             "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     else
         prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
-        ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        # --force resets a diverged/stale local PR branch (left by a prior round
+        # whose remote was since rewritten) to the PR's remote head, instead of
+        # aborting on a non-fast-forward and failing every attempt.
+        ( cd "$CHECKOUT" && gh pr checkout "$pr" --force ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
         log "fixing PR #$pr (head $((n+1))/$MAX_FIX_ATTEMPTS, PR total $((np+1))/$MAX_FIX_PR_ATTEMPTS) with $AGENT on the host"
         run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     fi
@@ -355,7 +358,10 @@ do_fix_ci() {
             "$(fill_prompt "$HERE/prompts/fix-ci.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     else
         prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
-        ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        # --force resets a diverged/stale local PR branch (left by a prior round
+        # whose remote was since rewritten) to the PR's remote head, instead of
+        # aborting on a non-fast-forward and failing every attempt.
+        ( cd "$CHECKOUT" && gh pr checkout "$pr" --force ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
         log "fixing red CI on PR #$pr (head $((n+1))/$MAX_CI_ATTEMPTS, PR total $((np+1))/$MAX_CI_PR_ATTEMPTS) with $AGENT on the host"
         run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix-ci.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     fi
