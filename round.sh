@@ -10,7 +10,10 @@
 #      requests changes (🟡) or blocks (⛔) — drive an agent to address them.
 #      Bounded per-head (MAX_FIX_ATTEMPTS) and per-PR over its lifetime
 #      (MAX_FIX_PR_ATTEMPTS), so review↔fix can't ping-pong indefinitely.
-#   3. Otherwise advance a roadmap target with a new PR.
+#   3. Fix red CI on one of kim-em's open PRs whose "build" check has FAILED at
+#      head (it can't be reviewed or review-fixed, so it would sit red forever).
+#      Bounded per-head (MAX_CI_ATTEMPTS) and per-PR (MAX_CI_PR_ATTEMPTS).
+#   4. Otherwise advance a roadmap target with a new PR.
 #
 # A GitHub API failure ABORTS the round (exit 1) rather than being read as "no
 # work" — otherwise a transient outage would silently fall through to authoring.
@@ -30,6 +33,8 @@ MAX_FIX_ATTEMPTS=3        # per-head: stop fixing the same head after this many 
 MAX_FIX_PR_ATTEMPTS=5     # per-PR lifetime backstop: stop fixing a PR across all heads
 MAX_REVIEW_ATTEMPTS=3     # never re-review the same PR more than this many times (real reviews)
 MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
+MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
+MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
 mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
 log() { echo "$(date '+%F %T') round: $*" >&2; }
@@ -138,7 +143,21 @@ do_fix() {
     run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"
 }
 
-# 3. Roadmap -------------------------------------------------------------------
+# 3. Fix red CI ----------------------------------------------------------------
+do_fix_ci() {
+    local pr="$1" head="$2"
+    local hkey="$STATE/ci-$pr-${head:0:12}" pkey="$STATE/ci-pr-$pr"
+    local n np; n=$(counter "$hkey"); np=$(counter "$pkey")
+    # Same up-front counting as do_fix: a failed checkout can't wedge the loop.
+    echo $((n+1))  > "$hkey"
+    echo $((np+1)) > "$pkey"
+    log "fixing red CI on PR #$pr (head $((n+1))/$MAX_CI_ATTEMPTS, PR total $((np+1))/$MAX_CI_PR_ATTEMPTS) with $AGENT"
+    prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
+    ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+    run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix-ci.md" PR "$pr" AGENT "$AGENT")"
+}
+
+# 4. Roadmap -------------------------------------------------------------------
 do_roadmap() {
     local avoid="$1"
     prepare_checkout || die "checkout failed"
@@ -187,7 +206,23 @@ main() {
         do_fix "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[] | select(.author.login==$me) | "\(.number) \(.headRefOid)"')
 
-    # 3) Roadmap: avoid the area (top TauCeti/ subdir) of the most recent PR.
+    # 3) Fix red CI: kim-em's open PRs whose "build" check has FAILED at the
+    #    current head (not merely pending). Such a PR is never reviewable (review
+    #    needs green) and never review-fixable (never reviewed), so without this it
+    #    sits red forever while the loop authors around it. Bounded per-head and
+    #    per-PR, like the review-fix step, so it can't churn one PR indefinitely.
+    while read -r pr head; do
+        [[ -z "$pr" ]] && break
+        (( $(counter "$STATE/ci-$pr-${head:0:12}") >= MAX_CI_ATTEMPTS )) && continue
+        (( $(counter "$STATE/ci-pr-$pr") >= MAX_CI_PR_ATTEMPTS )) && continue
+        do_fix_ci "$pr" "$head"; exit $?
+    done < <(echo "$open" | jq -r --arg me "$ME" '.[]
+        | select(.author.login==$me)
+        | select([.statusCheckRollup[]? | select(.name=="build")
+                  | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
+        | "\(.number) \(.headRefOid)"')
+
+    # 4) Roadmap: avoid the area (top TauCeti/ subdir) of the most recent PR.
     local recent avoid
     recent=$(gh pr list --repo "$TAUCETI" --state all --limit 1 --json files) \
         || die "gh pr list (recent) failed — aborting round"
