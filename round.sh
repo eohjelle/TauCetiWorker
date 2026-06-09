@@ -9,18 +9,21 @@
 #      CI-side review and auto-merge are intentionally off, so the worker is the
 #      only path that lands or retires PRs. These are cheap pre-passes (no quota),
 #      then the round does ONE work unit:
-#   1. Review an open TauCeti PR whose current head has not been cleanly reviewed
+#   1. Resolve conflicts: rebase one of kim-em's PRs that has become un-mergeable
+#      (usually the root TauCeti.lean import line, after a sibling module PR merged
+#      first) onto main — drive an agent. Bounded per-PR (MAX_REBASE_ATTEMPTS).
+#   2. Review an open TauCeti PR whose current head has not been cleanly reviewed
 #      yet (and whose CI build is green) — via the `tauceti-review` CLI. A moved
 #      head (after a fix) is a new commit and gets reviewed; total review rounds
-#      per PR are bounded by MAX_REVIEW_ROUNDS (then step 0b abandons it).
-#   2. Fix one of kim-em's open PRs whose latest review (on the current head)
+#      per PR are bounded by MAX_REVIEW_ROUNDS (then the abandon pre-pass closes it).
+#   3. Fix one of kim-em's open PRs whose latest review (on the current head)
 #      requests changes (🟡) or blocks (⛔) — drive an agent to address them.
 #      Bounded per-head (MAX_FIX_ATTEMPTS) and per-PR over its lifetime
 #      (MAX_FIX_PR_ATTEMPTS), so review↔fix can't ping-pong indefinitely.
-#   3. Fix red CI on one of kim-em's open PRs whose "build" check has FAILED at
+#   4. Fix red CI on one of kim-em's open PRs whose "build" check has FAILED at
 #      head (it can't be reviewed or review-fixed, so it would sit red forever).
 #      Bounded per-head (MAX_CI_ATTEMPTS) and per-PR (MAX_CI_PR_ATTEMPTS).
-#   4. Otherwise advance a roadmap target with a new PR — unless the worker
+#   5. Otherwise advance a roadmap target with a new PR — unless the worker
 #      already has >= MAX_OPEN_PRS of its PRs open (backpressure: drain before
 #      authoring more). The roadmap prompt also has the agent check open PRs and
 #      avoid duplicating one already in flight.
@@ -52,6 +55,7 @@ MAX_REVIEW_ROUNDS=6       # lifetime review budget per PR: a non-green PR past t
 MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
+MAX_REBASE_ATTEMPTS=3     # per-PR: stop trying to rebase/resolve a conflicting PR after this many tries
 MAX_OPEN_PRS=8            # backpressure: don't author new roadmap PRs while this many of the worker's PRs are already open
 mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
@@ -398,6 +402,31 @@ do_fix_ci() {
     return $rc
 }
 
+# 4. Resolve conflicts ---------------------------------------------------------
+# Drive an agent to rebase a PR that has become un-mergeable (mergeable=CONFLICTING)
+# onto current main and resolve the conflicts. Most conflicts are on the root
+# TauCeti.lean import list (several module PRs each add a line; whoever merges
+# first conflicts the rest), which is mechanical to union — but rebasing is an
+# agent's job (it must rebuild green and may face real content conflicts), not a
+# scripted git merge. Bounded per-PR so a PR that can't be cleanly rebased is
+# eventually abandoned by the budget rule instead of looping.
+do_rebase() {
+    local pr="$1"
+    local pkey="$STATE/rebase-pr-$pr" np rc; np=$(counter "$pkey")
+    echo $((np+1)) > "$pkey"   # count up front: a failed checkout can't wedge the loop
+    if (( BUBBLE_MODE )); then
+        log "resolving conflicts on PR #$pr (attempt $((np+1))/$MAX_REBASE_ATTEMPTS) with $AGENT in a bubble"
+        run_in_bubble "$TAUCETI/pull/$pr" \
+            "$(fill_prompt "$HERE/prompts/rebase.md" PR "$pr" AGENT "$AGENT")"; rc=$?
+    else
+        prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
+        ( cd "$CHECKOUT" && gh pr checkout "$pr" --force ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        log "resolving conflicts on PR #$pr (attempt $((np+1))/$MAX_REBASE_ATTEMPTS) with $AGENT on the host"
+        run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/rebase.md" PR "$pr" AGENT "$AGENT")"; rc=$?
+    fi
+    return $rc
+}
+
 # 4. Roadmap -------------------------------------------------------------------
 # Both modes stage the read-only roadmap/review reference repos on the host (the
 # in-bubble proxy is TauCeti-scoped, so the agent can't fetch them itself) and
@@ -511,7 +540,7 @@ main() {
 
     # One authoritative fetch of open PRs; a GitHub failure aborts the round.
     local open; open=$(gh pr list --repo "$TAUCETI" --state open \
-        --json number,headRefOid,isDraft,statusCheckRollup,author) \
+        --json number,headRefOid,isDraft,statusCheckRollup,author,mergeable) \
         || die "gh pr list failed (GitHub API?) — aborting round, not falling through to authoring"
 
     # Visibility: how much review work the queue actually offers. If 'reviewable'
@@ -524,14 +553,29 @@ main() {
         | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))] | length')
     log "open PRs: ${n_open} non-draft, ${n_reviewable} build-green (before re-review caps)"
 
-    # 1) Review: first non-draft, build-green PR whose CURRENT head has not been
+    # 1) Resolve conflicts: kim-em's PRs that have become un-mergeable (typically
+    #    the root TauCeti.lean import line, after a sibling module PR merged first).
+    #    Do this before review — rebasing produces a new head, so reviewing the old
+    #    one would be wasted. Bounded per-PR; a PR that can't be rebased rides to
+    #    the review budget and is abandoned. Skip past-budget PRs (abandon owns them).
+    local pr head
+    while read -r pr head; do
+        [[ -z "$pr" ]] && break
+        (( $(ledger_total_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
+        (( $(counter "$STATE/rebase-pr-$pr") >= MAX_REBASE_ATTEMPTS )) && continue
+        do_rebase "$pr"; exit $?
+    done < <(echo "$open" | jq -r --arg me "$ME" '.[]
+        | select(.isDraft|not) | select(.author.login==$me)
+        | select(.mergeable=="CONFLICTING")
+        | "\(.number) \(.headRefOid)"')
+
+    # 2) Review: first non-draft, build-green PR whose CURRENT head has not been
     #    cleanly reviewed yet. The head-guard (clean_head != head) is what prevents
     #    re-reviewing the same commit; a head that moved after a fix is a NEW commit
     #    and gets reviewed even if earlier heads were reviewed — otherwise a fix
     #    leaves the PR stuck (reviewed at an old head, unreviewable at the new one).
     #    The lifetime budget (MAX_REVIEW_ROUNDS) bounds total churn; a PR that blows
-    #    through it without going green is abandoned in step 3b below.
-    local pr head
+    #    through it without going green is abandoned by the abandon pre-pass.
     while read -r pr head; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_clean_head "$pr")" == "$head" ]] && continue
@@ -543,7 +587,7 @@ main() {
         | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))
         | "\(.number) \(.headRefOid)"')
 
-    # 2) Fix: first of kim-em's open PRs reviewed-at-head with a 🟡/⛔ rubric.
+    # 3) Fix: first of kim-em's open PRs reviewed-at-head with a 🟡/⛔ rubric.
     while read -r pr head; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_head "$pr")" == "$head" ]] || continue
@@ -553,7 +597,7 @@ main() {
         do_fix "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[] | select(.author.login==$me) | "\(.number) \(.headRefOid)"')
 
-    # 3) Fix red CI: kim-em's open PRs whose "build" check has FAILED at the
+    # 4) Fix red CI: kim-em's open PRs whose "build" check has FAILED at the
     #    current head (not merely pending). Such a PR is never reviewable (review
     #    needs green) and never review-fixable (never reviewed), so without this it
     #    sits red forever while the loop authors around it. Bounded per-head and
@@ -569,7 +613,7 @@ main() {
                   | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
         | "\(.number) \(.headRefOid)"')
 
-    # 4) Roadmap: author a new PR — but hold off while the worker already has a
+    # 5) Roadmap: author a new PR — but hold off while the worker already has a
     #    large backlog open. Backpressure stops the queue growing without bound
     #    (and spawning more duplicates) while review/fix/merge drain it; authoring
     #    resumes automatically once the open count falls back below the threshold.
