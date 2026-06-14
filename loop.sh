@@ -49,7 +49,16 @@ CODEX_REFRESH="$REAL_HOME/.claude/skills/claude-usage/codex-usage-refresh"
 SWAP="$REAL_HOME/.claude/swap-account"   # picks the Claude account with the most quota
 POLL=300             # seconds between quota checks while waiting
 ROUND_TIMEOUT=5400   # 90 min hard cap per round (a full author+build can be long)
-INTERROUND=20        # min gap between rounds, so a no-op round can't busy-loop
+INTERROUND=20        # min gap after a PRODUCTIVE round, so back-to-back work isn't throttled
+# Escalating back-off for unproductive rounds. round.sh exits EX_NOPROGRESS (75) when it did no work
+# (queue backpressure, nothing reviewable, or a transient GitHub failure); a no-op round must NOT
+# re-cycle every INTERROUND seconds and re-hammer the API (the failure that ran ~700 no-op rounds
+# against a rate-limited GitHub). Each consecutive no-progress/error round doubles the sleep from
+# BACKOFF_BASE up to BACKOFF_MAX; the first productive round resets the streak.
+EX_NOPROGRESS=75
+BACKOFF_BASE=30      # first no-progress sleep (doubles each consecutive no-progress round)
+BACKOFF_MAX=900      # cap on the escalating sleep (15 min)
+noprogress_streak=0
 
 # OpenRouter providers driven through `pi` (kept in sync with round.sh's map).
 # They are pay-per-token, so they bypass the subscription-quota wait entirely.
@@ -171,12 +180,32 @@ run_round() {
     wait "$round_tpid" || rc=$?
     round_tpid=""
     if (( rc == 124 || rc == 137 )); then
-        echo "$(date '+%F %T') round[$label] timed out after ${ROUND_TIMEOUT}s — pausing 60s" >&2
-        sleep 60
+        echo "$(date '+%F %T') round[$label] timed out after ${ROUND_TIMEOUT}s" >&2
+    elif (( rc == EX_NOPROGRESS )); then
+        echo "$(date '+%F %T') round[$label] no productive work this round (see $log)" >&2
     elif (( rc != 0 )); then
-        echo "$(date '+%F %T') round[$label] exited rc=$rc (see $log) — pausing 60s" >&2
-        sleep 60
+        echo "$(date '+%F %T') round[$label] exited rc=$rc (see $log)" >&2
     fi
+    return "$rc"
+}
+
+# settle RC — sleep the right amount after a round and update the no-progress streak. A productive
+# round (rc 0) resets the streak and waits only INTERROUND; a no-progress round (rc 75), a timeout,
+# or any other error backs off exponentially (BACKOFF_BASE·2^n, capped at BACKOFF_MAX) so a stuck
+# queue or a rate-limited GitHub is probed ever more slowly instead of being re-hammered.
+settle() {
+    local rc="$1" nap shift_by
+    if (( rc == 0 )); then
+        noprogress_streak=0
+        sleep "$INTERROUND"
+        return
+    fi
+    (( noprogress_streak++ ))
+    shift_by=$(( noprogress_streak < 5 ? noprogress_streak : 5 ))   # cap the exponent so 2^n can't overflow
+    nap=$(( BACKOFF_BASE * (1 << shift_by) ))
+    (( nap > BACKOFF_MAX )) && nap="$BACKOFF_MAX"
+    echo "$(date '+%F %T') no-progress streak=$noprogress_streak — backing off ${nap}s" >&2
+    sleep "$nap"
 }
 
 while true; do
@@ -185,8 +214,7 @@ while true; do
     # bounded by you having chosen to run with --$FORCE.
     if [[ -n "$FORCE" ]] && is_openrouter "$FORCE"; then
         echo "$(date '+%F %T') forced $FORCE (OpenRouter via pi)${BUBBLE_MODE:+ [bubble]} — one round" >&2
-        run_round task "$HERE/round.sh" "${ROUND_ARGS[@]}"
-        sleep "$INTERROUND"
+        run_round task "$HERE/round.sh" "${ROUND_ARGS[@]}"; settle $?
         continue
     fi
 
@@ -236,5 +264,5 @@ while true; do
     else
         CODEX_OK="$codex_ok" OPUS_OK="$opus_ok" run_round task "$HERE/round.sh" "${ROUND_ARGS[@]}"
     fi
-    sleep "$INTERROUND"   # floor between rounds; a no-op round can't tight-loop
+    settle $?   # productive → INTERROUND; no-progress/error → escalating back-off
 done

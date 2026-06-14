@@ -15,9 +15,23 @@ set -uo pipefail
 
 CLAIM_KEY="${TAUCETI_AUTHOR_CLAIM_KEY:-}"
 MARKER="${TAUCETI_TARGET_MARKER:-}"
+REQUIRE_MARKER="${TAUCETI_REQUIRE_TARGET_MARKER:-}"   # 1 ⇒ body must carry SOME <!--tauceti-target--> marker
 CLAIM_SH="${TAUCETI_CLAIM_SH:-$(cd "$(dirname "$0")" && pwd)/claim.sh}"
 
 die() { echo "gh-safe-pr-create: $*" >&2; exit 1; }
+
+# extract the PR body from the passed `gh pr create` flags (--body/-b <s>, --body-file/-F <f>).
+pr_body_from_args() {
+    local b="" prev=""
+    for a in "$@"; do
+        case "$prev" in
+            --body|-b) b="$a";;
+            --body-file|-F) [[ -f "$a" ]] && b="$(cat "$a")";;
+        esac
+        prev="$a"
+    done
+    printf '%s' "$b"
+}
 
 # 1) Author claim must still be ours (else another agent is authoring this target — abandon).
 if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
@@ -25,21 +39,21 @@ if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
         || die "author lease '$CLAIM_KEY' lost (another agent took the target) — do NOT create the PR"
 fi
 
-# 2) The PR body must carry the target marker so the conservative dup-sweeper can match it. Find the
-#    body in the passed args (--body <s> / --body-file <f> / -F <f>) and verify the marker is present.
+# 2) The PR body must carry the target marker so the conservative dup-sweeper can match it.
+#    Either an EXACT marker is mandated (TAUCETI_TARGET_MARKER, when the shell pre-picked the target),
+#    or just SOME well-formed marker is required (TAUCETI_REQUIRE_TARGET_MARKER, agent-picked target).
 if [[ -n "$MARKER" ]]; then
-    body="" prev=""
-    for a in "$@"; do
-        case "$prev" in
-            --body|-b) body="$a";;
-            --body-file|-F) [[ -f "$a" ]] && body="$(cat "$a")";;
-        esac
-        prev="$a"
-    done
+    body="$(pr_body_from_args "$@")"
     [[ "$body" == *"$MARKER"* ]] \
         || die "PR body is missing the required target marker:
   $MARKER
 Add it to the PR body (it lets other agents and the dup-sweeper recognize this target)."
+elif [[ "$REQUIRE_MARKER" == "1" ]]; then
+    body="$(pr_body_from_args "$@")"
+    grep -qE '<!--tauceti-target:v1 \{[^}]*"id"[[:space:]]*:[[:space:]]*"[^"]+"[^}]*\}-->' <<<"$body" \
+        || die "PR body is missing a target marker. Add a line like:
+  <!--tauceti-target:v1 {\"focus\":\"<area>\",\"id\":\"<slug>\"}-->
+It lets other agents and the dup-sweeper recognize which roadmap target this PR authors."
 fi
 
 echo "gh-safe-pr-create: gh pr create $*" >&2

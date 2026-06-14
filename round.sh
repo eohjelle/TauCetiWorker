@@ -52,6 +52,7 @@ ME="kim-em"
 # and exports TAUCETI_WORKER_ID; a bare round.sh run falls back to "default". Sanitized for path/
 # container-name use (lowercased, [a-z0-9-]).
 WID="${TAUCETI_WORKER_ID:-default}"; WID="${WID,,}"; WID="${WID//[^a-z0-9-]/-}"
+export TAUCETI_WORKER_ID="$WID"   # stable claim owner id for claim.sh / the push wrappers (host + heartbeat)
 STORE_DIR="$HOME/.cache/tauceti-review/$WID/store/FormalFrontier__TauCeti"   # per-worker review store
 STORE="$STORE_DIR/ledger.json"
 CHECKOUT="$HERE/checkouts/$WID/TauCeti"   # host authoring checkout (used without --bubble)
@@ -69,6 +70,12 @@ mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
 log() { echo "$(date '+%F %T') round: $*" >&2; }
 die() { log "$*"; exit 1; }
+# EX_NOPROGRESS: the round did NO productive work (queue backpressure, nothing reviewable, or a
+# transient GitHub failure) — distinct from a real error (exit 1) and from success (exit 0). loop.sh
+# reads this to back off with an escalating sleep instead of re-cycling every INTERROUND seconds and
+# re-hammering the API (the failure mode that ran 700 no-op rounds against a rate-limited GitHub).
+EX_NOPROGRESS=75
+noprogress() { log "$*"; exit "$EX_NOPROGRESS"; }
 
 # Args: an optional model override and an optional --bubble (sandbox) flag.
 FORCE=""; BUBBLE_MODE=0
@@ -149,25 +156,44 @@ fi
 # <!--tauceti-meta:v1 {...}--> JSON with .head_sha, .round (engine round number), and .runs[] (one
 # per rubric, each .verdict ∈ approve|request_changes|block|error). We parse THAT. The helper names
 # below are unchanged so the selection loops are untouched; only their source moved to GitHub.
-# Per-ROUND cache (cleared at process start): one scoreboard fetch per PR is reused across the
-# merge/abandon/review/fix passes of this round, but never staled across rounds.
-SBCACHE="$STATE/cache/scoreboard"; rm -rf "$SBCACHE"; mkdir -p "$SBCACHE"
+# Scoreboard meta cache, with a SHORT cross-round TTL (not wiped at process start). Within a round
+# every pass (merge/abandon/review/fix) reuses one fetch per PR; across rounds, a cached meta younger
+# than SBCACHE_TTL is reused so a rapid re-cycle (or a flurry of workers) doesn't re-paginate every
+# PR's comments every INTERROUND seconds. The TTL is short enough that genuinely new review state is
+# picked up promptly, and bust_meta() invalidates a PR the moment THIS round changes it (review/fix/
+# rebase), so merges aren't delayed. Crucially, a FAILED fetch falls back to the last cached value
+# rather than '{}' — a transient GitHub outage must never read as "never reviewed" (which would
+# re-review heads and, worse, let abandon/merge act on phantom state). [HARD for merge; COOP for dedup.]
+SBCACHE="$STATE/cache/scoreboard"; mkdir -p "$SBCACHE"
+SBCACHE_TTL="${TAUCETI_META_TTL:-120}"   # seconds a cached scoreboard meta stays fresh across rounds
 
 # gh_meta PR — newest trusted scoreboard's meta JSON ("{}" if none). Trust = the
 # <!--tauceti-scoreboard--> marker AND an author with repo association (OWNER/MEMBER/COLLABORATOR),
-# so a random external comment can't forge review state. Cached once per PR per round.
+# so a random external comment can't forge review state.
 gh_meta() {
-    local pr="$1" cache="$SBCACHE/$1.json" meta
-    [[ -f "$cache" ]] && { cat "$cache"; return; }
+    local pr="$1" cache="$SBCACHE/$1.json" meta age
+    if [[ -f "$cache" ]]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+        (( age < SBCACHE_TTL )) && { cat "$cache"; return; }
+    fi
     meta=$(gh api --paginate "/repos/$TAUCETI/issues/$pr/comments?per_page=100" \
             --jq '[.[] | select(.body|contains("<!--tauceti-scoreboard-->"))
                        | select(.author_association|IN("OWNER","MEMBER","COLLABORATOR"))]
                   | sort_by(.updated_at) | last | .body // ""' 2>/dev/null \
           | grep -oE '<!--tauceti-meta:v1 .*-->' | tail -1 \
           | sed -E 's/^<!--tauceti-meta:v1 //; s/-->$//')
-    [[ -z "$meta" ]] && meta='{}'
+    if [[ -z "$meta" ]]; then
+        # Empty = transient fetch failure OR genuinely no scoreboard. Either way, if we have a prior
+        # value, serve it (stale-but-real beats a phantom '{}'); only fall to '{}' with no cache at all.
+        [[ -f "$cache" ]] && { cat "$cache"; return; }
+        meta='{}'
+    fi
     printf '%s\n' "$meta" > "$cache"; printf '%s\n' "$meta"
 }
+# bust_meta PR — drop a PR's cached meta so the NEXT gh_meta re-fetches. Call right after this round
+# changes the PR's review state (a fresh review posted, or a new head pushed), so the next round's
+# merge/select passes see the new scoreboard immediately instead of waiting out the TTL.
+bust_meta() { rm -f "$SBCACHE/$1.json"; }
 
 # ledger_head PR — head_sha of the latest scoreboard (used by the FIX step).
 ledger_head() { gh_meta "$1" | jq -r '.head_sha // ""'; }
@@ -249,6 +275,7 @@ prepare_checkout() {
 # tool access on the host. Returns the agent's rc.
 run_agent() {
     local cwd="$1" prompt="$2"
+    export PATH="$HERE:$PATH"   # so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
     if [[ "$WORK_MODEL" == codex ]]; then
         ( cd "$cwd" && codex exec --sandbox danger-full-access --skip-git-repo-check "$prompt" )
     elif [[ -n "${OPENROUTER_MODELS[$WORK_MODEL]:-}" ]]; then
@@ -333,6 +360,10 @@ run_in_bubble() {
     local rounddir="$STATE/bubble-round"
     rm -rf "$rounddir"; mkdir -p "$rounddir"
     printf '%s' "$prompt" > "$rounddir/prompt.txt"
+    # Stage the write wrappers (contract §1/§4) into the round dir, mounted read-only at /opt/round and
+    # put on PATH inside the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
+    cp "$HERE/git-safe-push" "$HERE/gh-safe-pr-create" "$HERE/claim.sh" "$rounddir/" 2>/dev/null \
+        && chmod +x "$rounddir/git-safe-push" "$rounddir/gh-safe-pr-create" "$rounddir/claim.sh"
     # OpenRouter models need their API key INSIDE the container — there is no proxy
     # for it (unlike GitHub). Stage it 0600 in the round dir; it mounts read-only at
     # /opt/round/openrouter.key and agent_inner_cmd exports it. Gone with the dir.
@@ -343,12 +374,24 @@ run_in_bubble() {
     # Clear any container left by a previous round that loop.sh's timeout SIGKILLed
     # before --ephemeral could fire (a SIGKILL can't be trapped). Rounds run one at
     # a time (enforced by the flock above), so the fixed name is self-cleaning.
+    # The global `cleanup` EXIT trap pops the bubble if we're killed mid-run (BUBBLE_ACTIVE).
     bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true
-    trap 'bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true' EXIT
 
     local mounts=( --mount "$rounddir:/opt/round:ro" ) m
     for m in "$@"; do mounts+=( --mount "$m" ); done
     local creds=(); while IFS= read -r m; do creds+=( "$m" ); done < <(agent_cred_flags)
+
+    # Push-arbiter env crossing into the container: put /opt/round (the wrappers) on PATH and forward
+    # the branch-CAS inputs the agent's git-safe-push / gh-safe-pr-create need. \$PATH stays single-ish
+    # so it expands to the CONTAINER PATH inside bubble's `bash -lc`. We do NOT forward TAUCETI_CLAIM_*:
+    # the [COOP] claim + heartbeat are managed host-side around this call (claim.sh in-container would
+    # have to re-auth through the proxy); the branch CAS is the [HARD] guarantee and needs no claim.
+    local tcenv="env PATH=/opt/round:\$PATH"
+    [[ -n "${TAUCETI_PUSH_REF:-}"    ]] && tcenv+=" TAUCETI_PUSH_REF=$(printf '%q' "$TAUCETI_PUSH_REF")"
+    [[ -n "${TAUCETI_PUSH_EXPECT:-}" ]] && tcenv+=" TAUCETI_PUSH_EXPECT=$(printf '%q' "$TAUCETI_PUSH_EXPECT")"
+    [[ -n "${TAUCETI_PUSH_REMOTE:-}" ]] && tcenv+=" TAUCETI_PUSH_REMOTE=$(printf '%q' "$TAUCETI_PUSH_REMOTE")"
+    [[ -n "${TAUCETI_TARGET_MARKER:-}" ]] && tcenv+=" TAUCETI_TARGET_MARKER=$(printf '%q' "$TAUCETI_TARGET_MARKER")"
+    [[ -n "${TAUCETI_REQUIRE_TARGET_MARKER:-}" ]] && tcenv+=" TAUCETI_REQUIRE_TARGET_MARKER=$(printf '%q' "$TAUCETI_REQUIRE_TARGET_MARKER")"
 
     # --local forces the local Incus runtime (a host remote/cloud default would
     # reject the --mount). --github-security allowlist-write-graphql is the minimal
@@ -357,15 +400,76 @@ run_in_bubble() {
     # of the host bubble default (a `security.github=off` lockdown still wins and
     # would correctly abort).
     local rc=0
+    BUBBLE_ACTIVE=1
     bubble open "$target" --shell --local --name "$BUBBLE" --ephemeral \
         --github-security allowlist-write-graphql \
-        "${mounts[@]}" "${creds[@]}" --command "$(agent_inner_cmd)" || rc=$?
+        "${mounts[@]}" "${creds[@]}" --command "$tcenv $(agent_inner_cmd)" || rc=$?
 
     # Don't rely on --ephemeral's pop alone: if it failed, the container (with the
     # mounted credential) would linger. Pop again before returning.
     bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true
-    trap - EXIT
+    BUBBLE_ACTIVE=0
     return $rc
+}
+
+# ===== [COOP] claims + [HARD] push-arbiter wiring ============================
+# Mutating tasks (rebase/fix/fix-ci) and authoring push through git-safe-push / gh-safe-pr-create
+# (coordination contract §1/§4): the wrappers do a branch-level compare-and-swap so we never clobber
+# another agent's work — cooperating or not. Around each mutating task the shell ALSO takes a [COOP]
+# branch/<pr> claim and heartbeats it (dedup only; the CAS is the real guarantee). A single EXIT trap
+# tears down the heartbeat, any open bubble, and any held claim, so nothing leaks when a do_* `exit`s.
+CLAIM_SH="$HERE/claim.sh"
+CLAIM_TTL_S="${CLAIM_TTL:-1500}"              # 25 min lease; expires if a dead worker stops heartbeating
+CLAIM_HEARTBEAT_S="${CLAIM_HEARTBEAT:-300}"   # renew every 5 min while the agent runs
+export CLAIM_TTL="$CLAIM_TTL_S"               # claim.sh reads this as its default ttl (renew uses it)
+CLAIM_HELD=""        # branch/author claim key to release on exit ("" = none)
+HEARTBEAT_PID=""     # background lease-renewer pid ("" = none)
+BUBBLE_ACTIVE=0      # 1 while a bubble container is open, for the cleanup trap
+
+stop_heartbeat() { [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null; HEARTBEAT_PID=""; }
+start_heartbeat() {   # renew KEY every CLAIM_HEARTBEAT_S until killed, the lease is lost, OR round.sh dies
+    local key="$1" rpid=$$   # $$ is round.sh's pid even inside the subshell below (not BASHPID)
+    ( trap - EXIT INT TERM    # the renewer must never run the round's cleanup when it exits
+      while sleep "$CLAIM_HEARTBEAT_S"; do
+          kill -0 "$rpid" 2>/dev/null || exit 0     # round.sh gone (even via SIGKILL) → stop renewing so the lease can expire
+          "$CLAIM_SH" renew "$key" >/dev/null 2>&1 || exit 0
+      done ) &
+    HEARTBEAT_PID=$!
+}
+
+# cleanup — single EXIT handler: stop the heartbeat, pop any open bubble, release any held claim.
+cleanup() {
+    stop_heartbeat
+    (( BUBBLE_ACTIVE )) && bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true
+    [[ -n "$CLAIM_HELD" ]] && "$CLAIM_SH" release "$CLAIM_HELD" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 143' TERM   # loop.sh's timeout sends TERM first → run cleanup via the EXIT trap (release the lease)
+trap 'exit 130' INT
+
+# begin_branch_work PR HEAD REFNAME OWNER REPO — set the push-arbiter env for a mutating task and take
+# the [COOP] branch claim. Returns 1 if another live worker already holds the claim (caller skips the
+# PR — dedup); 0 to proceed. The push env is set ONLY on the proceed path, so a skipped candidate can't
+# leak stale TAUCETI_PUSH_* into a later authoring round. A claim error (GitHub hiccup) is non-fatal:
+# we proceed unclaimed, since git-safe-push's branch CAS is what actually protects the write.
+begin_branch_work() {
+    local pr="$1" head="$2" refname="$3" owner="$4" repo="$5" key="branch/$pr" rc
+    "$CLAIM_SH" acquire "$key" "$CLAIM_TTL_S" >/dev/null 2>&1; rc=$?
+    if (( rc == 1 )); then
+        log "branch #$pr claimed by another worker — skipping (COOP dedup)"
+        return 1
+    fi
+    export TAUCETI_PUSH_REF="$refname"
+    export TAUCETI_PUSH_EXPECT="$head"
+    export TAUCETI_PUSH_REMOTE="https://github.com/$owner/$repo"
+    export TAUCETI_CLAIM_SH="$CLAIM_SH"
+    if (( rc == 0 )); then
+        CLAIM_HELD="$key"; export TAUCETI_CLAIM_KEY="$key"; start_heartbeat "$key"
+    else
+        log "claim acquire #$pr errored (rc=$rc) — proceeding unclaimed (branch CAS still protects)"
+        unset TAUCETI_CLAIM_KEY 2>/dev/null || true
+    fi
+    return 0
 }
 
 # 1. Review --------------------------------------------------------------------
@@ -379,7 +483,7 @@ do_review() {
     local rc=$?
     # A clean run records a ledger round (the real-review cap counts those); reset
     # the transient-error counter. A failure didn't review, so bound the retries.
-    if (( rc == 0 )); then echo 0 > "$errkey"
+    if (( rc == 0 )); then echo 0 > "$errkey"; bust_meta "$pr"   # fresh scoreboard posted — re-read next round
     else local e; e=$(counter "$errkey"); echo $((e+1)) > "$errkey"; fi
     return $rc
 }
@@ -406,9 +510,13 @@ do_fix() {
         # whose remote was since rewritten) to the PR's remote head, instead of
         # aborting on a non-fast-forward and failing every attempt.
         ( cd "$CHECKOUT" && gh pr checkout "$pr" --force ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        # CAS against the head we actually checked out (a concurrent push since round-start would make
+        # the round-start oid stale and fail every push); falls back to the round-start head.
+        export TAUCETI_PUSH_EXPECT="$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || echo "$head")"
         log "fixing PR #$pr (head $((n+1))/$MAX_FIX_ATTEMPTS, PR total $((np+1))/$MAX_FIX_PR_ATTEMPTS) with $AGENT on the host"
         run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     fi
+    (( rc == 0 )) && bust_meta "$pr"   # head likely moved — re-read the scoreboard next round
     return $rc
 }
 
@@ -432,9 +540,11 @@ do_fix_ci() {
         # whose remote was since rewritten) to the PR's remote head, instead of
         # aborting on a non-fast-forward and failing every attempt.
         ( cd "$CHECKOUT" && gh pr checkout "$pr" --force ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        export TAUCETI_PUSH_EXPECT="$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || echo "$head")"
         log "fixing red CI on PR #$pr (head $((n+1))/$MAX_CI_ATTEMPTS, PR total $((np+1))/$MAX_CI_PR_ATTEMPTS) with $AGENT on the host"
         run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix-ci.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     fi
+    (( rc == 0 )) && bust_meta "$pr"   # head likely moved — re-read the scoreboard next round
     return $rc
 }
 
@@ -447,7 +557,7 @@ do_fix_ci() {
 # scripted git merge. Bounded per-PR so a PR that can't be cleanly rebased is
 # eventually abandoned by the budget rule instead of looping.
 do_rebase() {
-    local pr="$1"
+    local pr="$1" head="$2"
     local pkey="$STATE/rebase-pr-$pr" np rc; np=$(counter "$pkey")
     echo $((np+1)) > "$pkey"   # count up front: a failed checkout can't wedge the loop
     if (( BUBBLE_MODE )); then
@@ -457,9 +567,13 @@ do_rebase() {
     else
         prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
         ( cd "$CHECKOUT" && gh pr checkout "$pr" --force ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        # CAS the force-push against the pre-rebase head we checked out (lease succeeds iff no one else
+        # pushed since): a rewritten history is allowed, a concurrent push is not.
+        export TAUCETI_PUSH_EXPECT="$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || echo "$head")"
         log "resolving conflicts on PR #$pr (attempt $((np+1))/$MAX_REBASE_ATTEMPTS) with $AGENT on the host"
         run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/rebase.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     fi
+    (( rc == 0 )) && bust_meta "$pr"   # head moved (rebased) — re-read the scoreboard next round
     return $rc
 }
 
@@ -474,6 +588,15 @@ do_roadmap() {
     local focus="$1" refs="$STATE/refs"
     fetch_ref "$ROADMAP" "$refs/roadmap" || die "fetch $ROADMAP failed"
     fetch_ref "$REVIEW"  "$refs/review"  || die "fetch $REVIEW failed"
+    # Authoring path of the [HARD] write arbiter (contract §4): the agent claims its target
+    # (author/<focus>/<id>) via claim.sh, stamps the body with <!--tauceti-target--> for the dup
+    # sweeper, create-only-pushes the new branch with git-safe-push, and opens the PR with
+    # gh-safe-pr-create. Requiring the target marker makes gh-safe-pr-create reject a PR the sweeper
+    # could not later de-duplicate. (claim.sh + the wrappers are on PATH: host via run_agent, bubble via
+    # the staged /opt/round mount.) The agent owns target SELECTION — Targets.lean has no stable machine
+    # id to enumerate from the shell — so the claim is acquired agent-side; correctness still rests on
+    # the [HARD] sweeper + branch CAS, with the claim as [COOP] dedup.
+    export TAUCETI_REQUIRE_TARGET_MARKER=1
     if (( BUBBLE_MODE )); then
         log "roadmap round with $AGENT in a bubble (focus: $focus)"
         run_in_bubble "$TAUCETI" \
@@ -574,18 +697,57 @@ abandon_stuck_prs() {
     done < <(echo "$list" | jq -r '.[] | select(.isDraft|not) | [(.number|tostring), .headRefOid] | @tsv')
 }
 
+# 0c. De-duplicate authored PRs ------------------------------------------------
+# Close a NEWER PR that authors the SAME roadmap target as an older open one. SAFE FOR MANY AGENTS
+# (contract §4/§5): the target id comes from the machine-readable <!--tauceti-target:v1 {focus,id}-->
+# marker the authoring agent stamps; we act ONLY when two of OUR open PRs carry the EXACT same id,
+# keep the lowest PR number, and close the higher one(s) — never one with human activity, never a PR
+# without a parseable marker. A non-cooperator's duplicate (no marker, or a different id) is left alone;
+# the branch-CAS already stops any write clash, so the worst it causes is bounded duplicate review.
+# Cheap, no quota. [HARD guard on the close; COOP on the dedup itself.]
+sweep_duplicate_authored_prs() {
+    local list; list=$(gh pr list --repo "$TAUCETI" --state open --author "$ME" \
+        --json number,body,isDraft 2>/dev/null) \
+        || { log "dup-sweep: gh pr list failed — skipping"; return 0; }
+    declare -A seen   # target-id -> lowest (oldest) open PR number that owns it
+    local pr body id
+    while IFS=$'\t' read -r pr body; do
+        [[ -z "$pr" ]] && continue
+        id=$(printf '%s' "$body" | grep -oE '<!--tauceti-target:v1 \{[^}]*\}-->' | head -1 \
+             | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')
+        [[ -z "$id" ]] && continue   # no parseable target marker → never treated as a duplicate
+        if [[ -n "${seen[$id]:-}" ]]; then
+            if has_human_activity "$pr"; then
+                log "dup-sweep: PR #$pr duplicates #${seen[$id]} (target '$id') but has human activity — leaving"
+                continue
+            fi
+            log "dup-sweep: closing PR #$pr — duplicate authored target '$id' (older open #${seen[$id]} kept)"
+            if gh pr close "$pr" --repo "$TAUCETI" \
+                --comment "Closing automatically: this PR authors the same roadmap target (\`$id\`) as the older open #${seen[$id]}. An autonomous worker keeps the earlier PR and closes this duplicate to avoid redundant review. The branch is left in place — add the \`keep\` label if it is intentionally distinct." >/dev/null 2>&1; then
+                log "dup-sweep: closed #$pr"
+            else
+                log "dup-sweep: close of #$pr failed"
+            fi
+        else
+            seen[$id]="$pr"
+        fi
+    done < <(echo "$list" | jq -r '.[] | select(.isDraft|not)
+        | [(.number|tostring), (.body // "" | gsub("[\n\r\t]";" "))] | @tsv' | sort -n)
+}
+
 # ------------------------------------------------------------------------------
 main() {
     # Land anything already green-lit, then abandon anything that has exhausted its
     # budget without converging — both before doing more work (CI merge/review is
     # off; the worker is the only path that merges or retires PRs). Cheap, no quota.
     merge_ready_prs
+    sweep_duplicate_authored_prs
     abandon_stuck_prs
 
     # One authoritative fetch of open PRs; a GitHub failure aborts the round.
     local open; open=$(gh pr list --repo "$TAUCETI" --state open \
-        --json number,headRefOid,isDraft,statusCheckRollup,author,mergeable) \
-        || die "gh pr list failed (GitHub API?) — aborting round, not falling through to authoring"
+        --json number,headRefOid,headRefName,headRepositoryOwner,headRepository,isDraft,statusCheckRollup,author,mergeable) \
+        || noprogress "gh pr list failed (GitHub API?) — aborting round, not falling through to authoring"
 
     # Visibility: how much review work the queue actually offers. If 'reviewable'
     # is 0 while PRs are open, review silently can't fire (build pending/renamed,
@@ -602,16 +764,17 @@ main() {
     #    Do this before review — rebasing produces a new head, so reviewing the old
     #    one would be wasted. Bounded per-PR; a PR that can't be rebased rides to
     #    the review budget and is abandoned. Skip past-budget PRs (abandon owns them).
-    local pr head
-    while read -r pr head; do
+    local pr head refname owner repo
+    while read -r pr head refname owner repo; do
         [[ -z "$pr" ]] && break
         (( $(review_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
         (( $(counter "$STATE/rebase-pr-$pr") >= MAX_REBASE_ATTEMPTS )) && continue
-        do_rebase "$pr"; exit $?
+        begin_branch_work "$pr" "$head" "$refname" "$owner" "$repo" || continue   # [COOP] dedup: another worker has it
+        do_rebase "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[]
         | select(.isDraft|not) | select(.author.login==$me)
         | select(.mergeable=="CONFLICTING")
-        | "\(.number) \(.headRefOid)"')
+        | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
 
     # 2) Review: first non-draft, build-green PR whose CURRENT head has not been
     #    cleanly reviewed yet. The head-guard (clean_head != head) is what prevents
@@ -632,30 +795,33 @@ main() {
         | "\(.number) \(.headRefOid)"')
 
     # 3) Fix: first of kim-em's open PRs reviewed-at-head with a 🟡/⛔ rubric.
-    while read -r pr head; do
+    while read -r pr head refname owner repo; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_head "$pr")" == "$head" ]] || continue
         [[ "$(ledger_blocking "$pr" "$head")" == "1" ]] || continue
         (( $(counter "$STATE/fix-$pr-${head:0:12}") >= MAX_FIX_ATTEMPTS )) && continue
         (( $(counter "$STATE/fix-pr-$pr") >= MAX_FIX_PR_ATTEMPTS )) && continue
+        begin_branch_work "$pr" "$head" "$refname" "$owner" "$repo" || continue
         do_fix "$pr" "$head"; exit $?
-    done < <(echo "$open" | jq -r --arg me "$ME" '.[] | select(.author.login==$me) | "\(.number) \(.headRefOid)"')
+    done < <(echo "$open" | jq -r --arg me "$ME" '.[] | select(.author.login==$me)
+        | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
 
     # 4) Fix red CI: kim-em's open PRs whose "build" check has FAILED at the
     #    current head (not merely pending). Such a PR is never reviewable (review
     #    needs green) and never review-fixable (never reviewed), so without this it
     #    sits red forever while the loop authors around it. Bounded per-head and
     #    per-PR, like the review-fix step, so it can't churn one PR indefinitely.
-    while read -r pr head; do
+    while read -r pr head refname owner repo; do
         [[ -z "$pr" ]] && break
         (( $(counter "$STATE/ci-$pr-${head:0:12}") >= MAX_CI_ATTEMPTS )) && continue
         (( $(counter "$STATE/ci-pr-$pr") >= MAX_CI_PR_ATTEMPTS )) && continue
+        begin_branch_work "$pr" "$head" "$refname" "$owner" "$repo" || continue
         do_fix_ci "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[]
         | select(.author.login==$me)
         | select([.statusCheckRollup[]? | select(.name=="build")
                   | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
-        | "\(.number) \(.headRefOid)"')
+        | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
 
     # 5) Roadmap: author a new PR — but hold off while the worker already has a
     #    large backlog open. Backpressure stops the queue growing without bound
@@ -664,8 +830,7 @@ main() {
     local n_mine
     n_mine=$(echo "$open" | jq --arg me "$ME" '[.[] | select(.isDraft|not) | select(.author.login==$me)] | length')
     if (( n_mine >= MAX_OPEN_PRS )); then
-        log "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
-        exit 0
+        noprogress "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
     fi
     # Confine authoring to ROADMAP_FOCUS (a single TauCetiRoadmap/ area), or range
     # over all areas when it is empty. Dedup against open PRs (handled in the
