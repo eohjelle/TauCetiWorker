@@ -142,45 +142,63 @@ fi
 # outage permanently benches a PR at its current head, looking "reviewed" when it
 # wasn't. (The jq selects rounds with no "error" among their rubric states.)
 
-# ledger_head PR — last head_sha of ANY recorded round (used by the FIX step).
-ledger_head() {
-    [[ -f "$STORE" ]] || { echo ""; return; }
-    jq -r --arg pr "$1" '.prs[$pr].rounds[-1].head_sha // ""' "$STORE"
+# ===== Review state: read from GitHub, NOT a local ledger =====================
+# In a multi-agent world the authoritative review state is the PR's canonical scoreboard comment
+# (coordination contract §2), not this worker's private $STORE — another agent's review must be
+# visible to us, or we re-review heads someone already did. The scoreboard carries a
+# <!--tauceti-meta:v1 {...}--> JSON with .head_sha, .round (engine round number), and .runs[] (one
+# per rubric, each .verdict ∈ approve|request_changes|block|error). We parse THAT. The helper names
+# below are unchanged so the selection loops are untouched; only their source moved to GitHub.
+# Per-ROUND cache (cleared at process start): one scoreboard fetch per PR is reused across the
+# merge/abandon/review/fix passes of this round, but never staled across rounds.
+SBCACHE="$STATE/cache/scoreboard"; rm -rf "$SBCACHE"; mkdir -p "$SBCACHE"
+
+# gh_meta PR — newest trusted scoreboard's meta JSON ("{}" if none). Trust = the
+# <!--tauceti-scoreboard--> marker AND an author with repo association (OWNER/MEMBER/COLLABORATOR),
+# so a random external comment can't forge review state. Cached once per PR per round.
+gh_meta() {
+    local pr="$1" cache="$SBCACHE/$1.json" meta
+    [[ -f "$cache" ]] && { cat "$cache"; return; }
+    meta=$(gh api --paginate "/repos/$TAUCETI/issues/$pr/comments?per_page=100" \
+            --jq '[.[] | select(.body|contains("<!--tauceti-scoreboard-->"))
+                       | select(.author_association|IN("OWNER","MEMBER","COLLABORATOR"))]
+                  | sort_by(.updated_at) | last | .body // ""' 2>/dev/null \
+          | grep -oE '<!--tauceti-meta:v1 .*-->' | tail -1 \
+          | sed -E 's/^<!--tauceti-meta:v1 //; s/-->$//')
+    [[ -z "$meta" ]] && meta='{}'
+    printf '%s\n' "$meta" > "$cache"; printf '%s\n' "$meta"
 }
-# ledger_clean_head PR — head_sha of the last CLEAN round (empty if none). The
-# review head-guard uses this, so a PR whose only review at HEAD errored stays
-# eligible for a real re-review.
+
+# ledger_head PR — head_sha of the latest scoreboard (used by the FIX step).
+ledger_head() { gh_meta "$1" | jq -r '.head_sha // ""'; }
+# ledger_clean_head PR — head_sha if the latest scoreboard round is CLEAN (every rubric ran without
+# erroring), else "" — so a PR whose review errored stays eligible for a real re-review.
 ledger_clean_head() {
-    [[ -f "$STORE" ]] || { echo ""; return; }
-    jq -r --arg pr "$1" '
-        [ .prs[$pr].rounds[]? | select(([ (.states // {})[] ] | any(. == "error")) | not) ]
-        | last | .head_sha // ""' "$STORE"
+    gh_meta "$1" | jq -r 'if ((.runs // []) | length > 0) and ((.runs // []) | all(.verdict != "error"))
+                          then (.head_sha // "") else "" end'
 }
-# ledger_total_rounds PR — ALL recorded rounds (clean+errored); the error-loop
-# ceiling, so a PR that keeps erroring still can't be re-reviewed forever.
-ledger_total_rounds() {
-    [[ -f "$STORE" ]] || { echo 0; return; }
-    jq -r --arg pr "$1" '(.prs[$pr].rounds // []) | length' "$STORE"
-}
-# review_rounds PR — review rounds counted against the budget, i.e. ledger rounds
-# MINUS the resurrection baseline (state/round-base-PR). Reviving a PR writes the
-# baseline = its round count at that moment, so it gets a fresh MAX_REVIEW_ROUNDS
-# budget while its ledger history (which re-reviews audit) is preserved.
+# review_rounds PR — review-round count from the scoreboard's engine round number (GitHub-visible,
+# shared across agents), minus the local resurrection baseline (state/round-base-PR) which gives a
+# revived PR a fresh budget.
 review_rounds() {
-    local total base; total=$(ledger_total_rounds "$1"); base=$(counter "$STATE/round-base-$1")
+    local total base; total=$(gh_meta "$1" | jq -r '.round // 0'); base=$(counter "$STATE/round-base-$1")
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
     local n=$(( total - base )); (( n < 0 )) && n=0; echo "$n"
 }
-# ledger_blocking PR HEAD — "1" if the latest round at exactly HEAD has a
-# changes-requested (🟡) or blocked (⛔) rubric.
+# ledger_blocking PR HEAD — "1" if the latest scoreboard is at HEAD and any rubric is blocking
+# (verdict not "approve" and not "error").
 ledger_blocking() {
-    [[ -f "$STORE" ]] || { echo 0; return; }
-    jq -r --arg pr "$1" --arg head "$2" '
-        (.prs[$pr].rounds[-1] // {}) as $r
-        | if ($r.head_sha // "") == $head then
-            ([ ($r.states // {}) | to_entries[] | .value ]
-             | map(select(. == "blocking_request" or . == "blocking_block")) | length) > 0
-          else false end
-        | if . then 1 else 0 end' "$STORE"
+    gh_meta "$1" | jq -r --arg head "$2" '
+        if (.head_sha // "") == $head
+           and ((.runs // []) | map(select(.verdict != "approve" and .verdict != "error")) | length > 0)
+        then 1 else 0 end'
+}
+# review_all_green PR HEAD — "1" if the latest scoreboard is at HEAD, ran, and every rubric approved.
+review_all_green() {
+    gh_meta "$1" | jq -r --arg head "$2" '
+        if (.head_sha // "") == $head and ((.runs // []) | length > 0)
+           and ((.runs // []) | all(.verdict == "approve"))
+        then 1 else 0 end'
 }
 # sanitized non-negative integer from a state file (0 if absent/garbage).
 counter() { local n; n=$(cat "$1" 2>/dev/null || echo 0); [[ "$n" =~ ^[0-9]+$ ]] || n=0; echo "$n"; }
@@ -481,21 +499,15 @@ do_roadmap() {
 # lands PRs. No quota/agent, so it runs every round; each merge is logged and a
 # failed merge is left open for human attention.
 merge_ready_prs() {
-    [[ -f "$STORE" ]] || return 0   # nothing reviewed yet ⇒ nothing to merge
     local list; list=$(gh pr list --repo "$TAUCETI" --state open --author "$ME" \
         --json number,headRefOid,isDraft,mergeable,statusCheckRollup,files 2>/dev/null) \
         || { log "merge: gh pr list failed — skipping merge pass"; return 0; }
-    local pr head ready
+    local pr head
     while IFS=$'\t' read -r pr head; do
         [[ -z "$pr" ]] && continue
-        # Ledger: latest round must be at this exact head with EVERY rubric green.
-        ready=$(jq -r --arg pr "$pr" --arg head "$head" '
-            (.prs[$pr].rounds[-1] // {}) as $r
-            | if ($r.head_sha // "") == $head
-                 and (($r.states // {}) | length > 0)
-                 and ([ ($r.states // {})[] ] | all(. == "green"))
-              then 1 else 0 end' "$STORE" 2>/dev/null) || ready=0
-        [[ "$ready" == "1" ]] || continue
+        # GitHub scoreboard (contract §2/§5): latest review must be at this exact head, every rubric
+        # approved. This is the merge gate; GitHub itself serializes the merge ([HARD]).
+        [[ "$(review_all_green "$pr" "$head")" == "1" ]] || continue
         log "merging PR #$pr (all rubrics green @ ${head:0:12}, TauCeti/ + root only)"
         # --admin: kim-em is a repo admin and enforce_admins is off, so this
         # overrides the "1 approving review" branch policy (CI's bot approval is
@@ -513,40 +525,51 @@ merge_ready_prs() {
         | [(.number|tostring), .headRefOid] | @tsv')
 }
 
+# has_human_activity PR — "1" if anyone other than this worker's automated identities has engaged:
+# a protective label (keep/hold/wip/human), or a comment/review by a login that isn't us or a bot.
+# Conservative and FAIL-SAFE: on any API error or doubt it returns 1 (treat as human-touched), so we
+# never auto-close a PR a person cares about. (Caveat: the worker posts as $ME, so a HUMAN acting as
+# $ME is indistinguishable from the worker — a person protecting a PR should use the 'keep' label.)
+has_human_activity() {
+    local pr="$1" out
+    out=$(gh pr view "$pr" --repo "$TAUCETI" --json labels,comments,reviews 2>/dev/null) || return 0
+    jq -e '(.labels//[]) | any(.name | ascii_downcase | IN("keep","hold","wip","human","do-not-close"))' \
+        <<<"$out" >/dev/null && return 0
+    jq -e --arg me "$ME" '
+        [ (.comments//[]),(.reviews//[]) | .[] | .author.login // "" ]
+        | map(select(. != "" and . != $me and (endswith("[bot]")|not) and (startswith("app/")|not)))
+        | length > 0' <<<"$out" >/dev/null && return 0
+    return 1
+}
+
 # 0b. Abandon -----------------------------------------------------------------
-# Close kim-em PRs that can no longer make progress: a non-green PR that has spent
-# its lifetime review budget (MAX_REVIEW_ROUNDS) or is blocking at head with its
-# fix budget (MAX_FIX_PR_ATTEMPTS) spent. With CI review/merge off, such a PR has
-# cycled review↔fix without reaching green and would otherwise wedge the queue
-# forever; closing it keeps the queue self-limiting and frees the worker to pursue
-# fresh targets. The branch is kept around (no --delete-branch) so the work can be
-# revived by hand. Cheap, no quota — runs every round, each close logged.
+# Close our PRs that can no longer make progress. SAFE FOR MANY AGENTS (contract §5): we close only a
+# PR that is (a) ours (--author $ME), (b) NOT green at head, (c) whose CURRENT head is the one that was
+# actually reviewed (so a freshly-pushed-but-unreviewed fix is never closed), (d) past the GitHub-
+# visible review-round budget (the scoreboard's round number, shared across agents — never a private
+# local fix counter), and (e) free of human activity. The branch is kept (no --delete-branch) so the
+# work can be revived. Cheap, no quota — runs every round.
 abandon_stuck_prs() {
-    [[ -f "$STORE" ]] || return 0
     local list; list=$(gh pr list --repo "$TAUCETI" --state open --author "$ME" \
         --json number,headRefOid,isDraft 2>/dev/null) \
         || { log "abandon: gh pr list failed — skipping"; return 0; }
-    local pr head total blk fixpr greenathead
+    local pr head total
     while IFS=$'\t' read -r pr head; do
         [[ -z "$pr" ]] && continue
-        # Never abandon a PR that is green at its current head — it merges elsewhere,
-        # or is only held up by a conflict/CI, which is not ours to close.
-        greenathead=$(jq -r --arg pr "$pr" --arg head "$head" '
-            (.prs[$pr].rounds[-1] // {}) as $r
-            | if ($r.head_sha//"")==$head and (($r.states//{})|length>0)
-                 and ([($r.states//{})[]]|all(.=="green")) then 1 else 0 end' "$STORE" 2>/dev/null) || greenathead=0
-        [[ "$greenathead" == "1" ]] && continue
+        [[ "$(review_all_green "$pr" "$head")" == "1" ]] && continue       # green merges elsewhere
+        [[ "$(ledger_head "$pr")" == "$head" ]] || continue                # head not yet reviewed → let it
         total=$(review_rounds "$pr")
-        blk=$(ledger_blocking "$pr" "$head")
-        fixpr=$(counter "$STATE/fix-pr-$pr")
-        if (( total >= MAX_REVIEW_ROUNDS )) || { (( blk == 1 )) && (( fixpr >= MAX_FIX_PR_ATTEMPTS )); }; then
-            log "abandoning PR #$pr (review rounds=$total, fix attempts=$fixpr) — budget spent without reaching green"
-            if gh pr close "$pr" --repo "$TAUCETI" \
-                --comment "Closing automatically: this PR used its full review/fix budget (${total} review rounds) without reaching an all-green review, so the worker is abandoning it to keep the queue moving on other roadmap targets. The branch is left in place, so the work can be revived and finished by hand if it's worth completing." 2>&1 | tail -1; then
-                log "abandoned PR #$pr"
-            else
-                log "abandon of PR #$pr failed"
-            fi
+        (( total >= MAX_REVIEW_ROUNDS )) || continue                       # GitHub-visible budget
+        if has_human_activity "$pr"; then
+            log "abandon: PR #$pr past budget but has human activity / keep-label — leaving for a human"
+            continue
+        fi
+        log "abandoning PR #$pr (review rounds=$total) — review budget spent at the reviewed head without reaching green"
+        if gh pr close "$pr" --repo "$TAUCETI" \
+            --comment "Closing automatically: this PR used its full review budget (${total} review rounds) without reaching an all-green review at its current head, so an autonomous worker is abandoning it to keep the queue moving. The branch is left in place — revive and finish it by hand if it's worth completing, or add the \`keep\` label to stop auto-close." 2>&1 | tail -1; then
+            log "abandoned PR #$pr"
+        else
+            log "abandon of PR #$pr failed"
         fi
     done < <(echo "$list" | jq -r '.[] | select(.isDraft|not) | [(.number|tostring), .headRefOid] | @tsv')
 }
