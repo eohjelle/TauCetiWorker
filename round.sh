@@ -276,16 +276,18 @@ prepare_checkout() {
 run_agent() {
     local cwd="$1" prompt="$2"
     export PATH="$HERE:$PATH"   # so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
+    # 9>&- on each agent subshell: the agent (and any build daemon it spawns) must NOT inherit the
+    # round.lock fd, or a lingering grandchild would keep the lock held past the round's end.
     if [[ "$WORK_MODEL" == codex ]]; then
-        ( cd "$cwd" && codex exec --sandbox danger-full-access --skip-git-repo-check "$prompt" )
+        ( cd "$cwd" && codex exec --sandbox danger-full-access --skip-git-repo-check "$prompt" ) 9>&-
     elif [[ -n "${OPENROUTER_MODELS[$WORK_MODEL]:-}" ]]; then
         # OpenRouter model via the `pi` agentic loop: same prompt, full tools so it
         # can build, edit, and push like the others; billed per-token to
         # OPENROUTER_API_KEY (no subscription quota).
-        ( cd "$cwd" && "$PI_RUN" openrouter "${OPENROUTER_MODELS[$WORK_MODEL]}" --prompt "$prompt" )
+        ( cd "$cwd" && "$PI_RUN" openrouter "${OPENROUTER_MODELS[$WORK_MODEL]}" --prompt "$prompt" ) 9>&-
     else
         ( cd "$cwd" && env -u ANTHROPIC_API_KEY claude -p "$prompt" \
-              --model opus --dangerously-skip-permissions )
+              --model opus --dangerously-skip-permissions ) 9>&-
     fi
 }
 
@@ -403,7 +405,7 @@ run_in_bubble() {
     BUBBLE_ACTIVE=1
     bubble open "$target" --shell --local --name "$BUBBLE" --ephemeral \
         --github-security allowlist-write-graphql \
-        "${mounts[@]}" "${creds[@]}" --command "$tcenv $(agent_inner_cmd)" || rc=$?
+        "${mounts[@]}" "${creds[@]}" --command "$tcenv $(agent_inner_cmd)" 9>&- || rc=$?
 
     # Don't rely on --ephemeral's pop alone: if it failed, the container (with the
     # mounted credential) would linger. Pop again before returning.
@@ -429,11 +431,13 @@ BUBBLE_ACTIVE=0      # 1 while a bubble container is open, for the cleanup trap
 stop_heartbeat() { [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null; HEARTBEAT_PID=""; }
 start_heartbeat() {   # renew KEY every CLAIM_HEARTBEAT_S until killed, the lease is lost, OR round.sh dies
     local key="$1" rpid=$$   # $$ is round.sh's pid even inside the subshell below (not BASHPID)
+    # 9>&- : do NOT inherit the round.lock fd — otherwise this subshell's `sleep` grandchild keeps the
+    # lock held for up to CLAIM_HEARTBEAT_S after the round exits, blocking the next round ("holds round.lock").
     ( trap - EXIT INT TERM    # the renewer must never run the round's cleanup when it exits
       while sleep "$CLAIM_HEARTBEAT_S"; do
           kill -0 "$rpid" 2>/dev/null || exit 0     # round.sh gone (even via SIGKILL) → stop renewing so the lease can expire
           "$CLAIM_SH" renew "$key" >/dev/null 2>&1 || exit 0
-      done ) &
+      done ) 9>&- &
     HEARTBEAT_PID=$!
 }
 
@@ -478,8 +482,9 @@ do_review() {
     [[ -n "$REVIEWERS" ]] || die "no reviewer models available"
     local errkey="$STATE/review-err-$pr" nrnd; nrnd=$(review_rounds "$pr")
     log "reviewing PR #$pr @ ${head:0:12} (review $((nrnd+1))/$MAX_REVIEW_ROUNDS budget, reviewers=$REVIEWERS)"
+    # 9>&- : the reviewer (and its model subprocesses) must not inherit the round.lock fd.
     uvx --from "git+https://github.com/$REVIEW" tauceti-review "$pr" \
-        --store "$STORE_DIR" --post --reviewer "$REVIEWERS" --expect-head "$head"
+        --store "$STORE_DIR" --post --reviewer "$REVIEWERS" --expect-head "$head" 9>&-
     local rc=$?
     # A clean run records a ledger round (the real-review cap counts those); reset
     # the transient-error counter. A failure didn't review, so bound the retries.
