@@ -1,0 +1,1269 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["rich"]      # rich is used ONLY by the TUI/status render; every other path is stdlib.
+# ///
+"""tauceti — the Tau Ceti worker, one self-contained tool.
+
+Consolidates the former loop.sh + round.sh into a single program. Bare `tauceti`
+opens a TUI overview + launcher; `tauceti work [--loop]` does the work (one round,
+or the driver loop); `tauceti status` prints the read-only survey.
+
+The worker maintains FormalFrontier/TauCeti as `kim-em`: each round does exactly ONE
+unit of work, chosen in priority order — merge/abandon/dedup housekeeping (always),
+then rebase → review → fix → fix-ci → bump → roadmap. CI-side review and auto-merge
+are intentionally off, so the worker is the only path that lands or retires PRs.
+
+Kept as standalone shell on PATH (invoked BY the agents inside a round): claim.sh,
+git-safe-push, gh-safe-pr-create. Prompts live in prompts/*.md. External tools we
+call: gh, git, uvx tauceti-review, bubble, the agent CLIs (claude/codex/pi).
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+# ============================================================================
+# Config — every literal/budget/path. Mirrors the head of round.sh / loop.sh.
+# ============================================================================
+
+HERE = Path(__file__).resolve().parent
+
+TAUCETI = "FormalFrontier/TauCeti"
+ROADMAP = "FormalFrontier/TauCetiRoadmap"
+REVIEW = "FormalFrontier/TauCetiReview"
+ME = "kim-em"
+
+# Per-PR budgets (a PR can never churn forever). Names match round.sh.
+MAX_FIX_ATTEMPTS = 3        # per-head: stop fixing the same head after this many tries
+MAX_FIX_PR_ATTEMPTS = 7     # per-PR lifetime backstop across all heads
+MAX_REVIEW_ROUNDS = 8       # lifetime review budget per PR; past this the abandon pass closes it
+MAX_REVIEW_ERRORS = 3       # give up re-trying a PR whose review keeps erroring (transient infra)
+MAX_CI_ATTEMPTS = 3         # per-head: stop trying to green a red-CI head
+MAX_CI_PR_ATTEMPTS = 5      # per-PR lifetime backstop for red-CI fixing
+MAX_REBASE_ATTEMPTS = 3     # per-PR: stop trying to rebase a conflicting PR
+MAX_BUMP_ATTEMPTS = 3       # per mathlib-master-tip (a newer tip resets it)
+MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
+
+BUMP_BRANCH_PREFIX = "bump-mathlib"
+ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # "" = all areas
+
+# Loop timing (loop.sh).
+POLL = 300            # seconds between quota checks while waiting
+ROUND_TIMEOUT = 5400  # 90 min hard cap per round
+INTERROUND = 20       # min gap after a PRODUCTIVE round
+EX_NOPROGRESS = 75    # round did NO productive work (distinct from error=1 / success=0)
+BACKOFF_BASE = 30     # first no-progress sleep (doubles each consecutive no-progress round)
+BACKOFF_MAX = 900     # cap on the escalating sleep (15 min)
+# The escalating back-off exists because a no-op round must NOT re-cycle every INTERROUND seconds and
+# re-hammer the API — the failure that ran ~700 no-op rounds against a rate-limited GitHub.
+
+# Claims / scoreboard cache.
+CLAIM_TTL_S = int(os.environ.get("CLAIM_TTL", "1500"))         # 25 min lease; expires if a worker stops heartbeating
+CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every 5 min while the agent runs
+SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))   # seconds a cached scoreboard meta stays fresh
+
+# Agents.
+OPENROUTER_MODELS = {
+    "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek/deepseek-v4-pro"),
+    "minimax": os.environ.get("MINIMAX_MODEL", "minimax/minimax-m3"),
+}
+AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek", "minimax": "MiniMax"}
+PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
+
+# Task taxonomy. WORK_TASKS spend a model; `merge` is housekeeping-only (no model, no quota wait).
+ALLOWED_TASKS = ["merge", "rebase", "review", "fix", "fix-ci", "bump", "roadmap"]
+WORK_TASKS = ["rebase", "review", "fix", "fix-ci", "bump", "roadmap"]
+# Every mode that runs a MODEL on third-party content defaults to bubble (opt out with --host).
+SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}  # review included; merge runs no model.
+
+AGENTS = ["auto", "codex", "claude", "deepseek", "minimax"]
+SUBSCRIPTION_AGENTS = {"codex", "claude"}
+
+
+def sanitize_wid(raw: str) -> str:
+    s = raw.lower()
+    return re.sub(r"[^a-z0-9-]", "-", s)
+
+
+@dataclass(frozen=True)
+class Config:
+    """Resolved per-worker configuration (paths derived from the worker id)."""
+    wid: str
+    home: Path                 # HOME the worker runs under (may be isolated)
+    state: Path                # HERE/state/<wid>
+    checkout: Path             # host authoring checkout
+    store_dir: Path            # tauceti-review persistent store
+    sbcache: Path              # scoreboard meta cache dir
+    logdir: Path               # HERE/logs/<wid>
+    quota_cache: Path          # raw provider usage responses
+
+    @property
+    def store(self) -> Path:
+        return self.store_dir / "ledger.json"
+
+    @staticmethod
+    def resolve(worker_id: Optional[str] = None, home: Optional[Path] = None) -> "Config":
+        wid = sanitize_wid(worker_id or os.environ.get("TAUCETI_WORKER_ID", "default") or "default")
+        h = home or Path(os.environ.get("HOME", os.path.expanduser("~")))
+        state = HERE / "state" / wid
+        return Config(
+            wid=wid,
+            home=h,
+            state=state,
+            checkout=HERE / "checkouts" / wid / "TauCeti",
+            store_dir=h / ".cache" / "tauceti-review" / wid / "store" / "FormalFrontier__TauCeti",
+            sbcache=state / "cache" / "scoreboard",
+            logdir=HERE / "logs" / wid,
+            quota_cache=state / "cache",
+        )
+
+
+def log(msg: str) -> None:
+    print(f"{time.strftime('%F %T')} tauceti: {msg}", file=sys.stderr, flush=True)
+
+
+class Die(Exception):
+    """Fatal error → exit 1."""
+
+
+class NoProgress(Exception):
+    """Round did no productive work → exit EX_NOPROGRESS (75)."""
+
+
+# ============================================================================
+# run() — subprocess helpers. close_fds=True (Python default) means children never
+# inherit the round.lock fd, retiring round.sh's hand-managed `9>&-` fd-leak fix.
+# ============================================================================
+
+class GitHubError(Exception):
+    """A `gh` call failed (distinct from 'ran fine, returned no rows')."""
+
+
+def run(argv: list[str], *, cwd: Optional[Path] = None, env: Optional[dict] = None,
+        capture: bool = True, check: bool = False, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv, cwd=str(cwd) if cwd else None, env=env, text=True,
+        capture_output=capture, input=input_text, check=check,
+    )
+
+
+# ============================================================================
+# GitHub — every gh wrapper. JSON via `gh ... --json` + stdlib json (no jq).
+# ============================================================================
+
+class GitHub:
+    def __init__(self, repo: str = TAUCETI):
+        self.repo = repo
+
+    def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
+        return run(["gh", *args])
+
+    def pr_list(self, fields: list[str], *, author: Optional[str] = None, state: str = "open") -> list[dict]:
+        args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200",
+                "--json", ",".join(fields)]
+        if author:
+            args += ["--author", author]
+        p = self._gh(args)
+        if p.returncode != 0:
+            raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+        return json.loads(p.stdout or "[]")
+
+    def pr_view(self, pr: int, fields: list[str]) -> Optional[dict]:
+        p = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", ",".join(fields)])
+        if p.returncode != 0:
+            return None
+        return json.loads(p.stdout or "{}")
+
+    def issue_comments(self, pr: int) -> Optional[list[dict]]:
+        """All issue comments for a PR (paginated). None on fetch failure (distinct from empty)."""
+        p = self._gh(["api", "--paginate", f"/repos/{self.repo}/issues/{pr}/comments?per_page=100"])
+        if p.returncode != 0:
+            return None
+        try:
+            return json.loads(p.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+
+    def api_jq(self, path: str, jq: str) -> Optional[str]:
+        p = self._gh(["api", path, "--jq", jq])
+        if p.returncode != 0:
+            return None
+        return p.stdout.strip()
+
+
+# ============================================================================
+# Counters — state/<wid>/... single-integer files (round.sh `counter`).
+# ============================================================================
+
+class Counters:
+    def __init__(self, cfg: Config):
+        self.state = cfg.state
+
+    def read(self, name: str) -> int:
+        try:
+            txt = (self.state / name).read_text().strip()
+        except OSError:
+            return 0
+        return int(txt) if txt.isdigit() else 0
+
+    def write(self, name: str, value: int) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / name).write_text(str(value))
+
+    def incr(self, name: str) -> int:
+        v = self.read(name) + 1
+        self.write(name, v)
+        return v
+
+
+# ============================================================================
+# Quota — self-contained pacer. Direct API reads of the same credential files the
+# official CLIs maintain (no ~/.claude skill, no gist, no curve files). Paces
+# `used% ≤ elapsed%` on BOTH the session and weekly windows of each provider — the
+# shippable form of the linear curve. Auto-selection prefers codex (spare Opus).
+# Treats the reverse-engineered endpoints as UNSTABLE adapters: schema-tolerant,
+# clock-normalized, explicit unknown/exhausted states, raw responses cached.
+# ============================================================================
+
+import base64
+import urllib.error
+import urllib.request
+
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_BETA = "oauth-2025-04-20"
+SESSION_WINDOW_S = 5 * 3600
+WEEK_WINDOW_S = 7 * 24 * 3600
+QUOTA_TTL = {"codex": 600, "claude": 3600}
+
+
+@dataclass
+class Window:
+    name: str
+    used: Optional[float]       # percent 0..100 (None = unknown)
+    elapsed: Optional[float]    # percent 0..100 (None = unknown)
+    resets_at: Optional[float]  # epoch seconds
+    status: str                 # under-pace | over-pace | exhausted | unknown
+
+
+@dataclass
+class Provider:
+    name: str                   # codex | claude
+    available: bool             # all windows under pace (and a usable model)
+    model: Optional[str]        # gpt-5 | opus | sonnet | None
+    windows: list[Window] = field(default_factory=list)
+    error: Optional[str] = None
+    next_eligible: Optional[float] = None  # epoch when a blocking window should free
+
+
+def _classify_window(name: str, used: Optional[float], elapsed: Optional[float],
+                     resets_at: Optional[float], limit_reached: bool) -> Window:
+    # Normalize: clamp elapsed to [0,100]; null used → fresh (0); null elapsed → permissive (100).
+    e = None if elapsed is None else max(0.0, min(100.0, elapsed))
+    u = 0.0 if used is None else used
+    if limit_reached or u >= 100:
+        st = "exhausted"
+    elif used is None and elapsed is None:
+        st = "unknown"
+    else:
+        eff_e = 100.0 if e is None else e
+        st = "under-pace" if u <= eff_e else "over-pace"
+    return Window(name, used, e, resets_at, st)
+
+
+def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict]:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        raise GitHubError(f"usage fetch failed: {e}")
+
+
+def _http_post_form(url: str, form: dict, timeout: int = 15) -> tuple[int, dict]:
+    import urllib.parse
+    data = urllib.parse.urlencode(form).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return 0, {}
+
+
+def _read_json_file(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_json_atomic(path: Path, data: dict, mode: int = 0o600) -> None:
+    """Write JSON preserving the file's other contents; atomic rename, restrictive perms.
+    (Residual: no cross-process file lock yet — the official CLIs may also rewrite these. Noted in plan.)"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+class Quota:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.cache_dir = cfg.quota_cache
+
+    def _cached_raw(self, provider: str) -> Optional[dict]:
+        p = self.cache_dir / f"quota-{provider}.json"
+        d = _read_json_file(p)
+        if not d:
+            return None
+        if time.time() - d.get("fetched_at", 0) > QUOTA_TTL[provider]:
+            return None
+        return d.get("payload")
+
+    def _store_raw(self, provider: str, payload: dict) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / f"quota-{provider}.json").write_text(
+            json.dumps({"fetched_at": int(time.time()), "payload": payload}))
+
+    # --- Codex -------------------------------------------------------------
+    def _codex_creds(self) -> Optional[dict]:
+        return _read_json_file(self.cfg.home / ".codex" / "auth.json")
+
+    def _codex_account_id(self, auth: dict) -> Optional[str]:
+        tok = auth.get("tokens") or {}
+        if tok.get("account_id"):
+            return tok["account_id"]
+        idt = tok.get("id_token")
+        if idt and idt.count(".") == 2:
+            try:
+                payload = idt.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                return claims.get("chatgpt_account_id") or claims.get("account_id")
+            except Exception:
+                return None
+        return None
+
+    def codex(self) -> Provider:
+        auth = self._codex_creds()
+        if not auth:
+            return Provider("codex", False, None, error="no ~/.codex/auth.json")
+        payload = self._cached_raw("codex")
+        if payload is None:
+            tok = (auth.get("tokens") or {}).get("access_token")
+            if not tok:
+                return Provider("codex", False, None, error="no codex access_token")
+            headers = {"Authorization": f"Bearer {tok}", "User-Agent": "codex-cli"}
+            acct = self._codex_account_id(auth)
+            if acct:
+                headers["ChatGPT-Account-Id"] = acct
+            try:
+                code, payload = _http_get_json(CODEX_USAGE_URL, headers)
+            except GitHubError as e:
+                return Provider("codex", False, None, error=str(e))
+            if code == 401:
+                tok = self._refresh_codex(auth)   # one refresh attempt on expiry
+                if not tok:
+                    return Provider("codex", False, None, error="codex 401 (refresh failed)")
+                headers["Authorization"] = f"Bearer {tok}"
+                try:
+                    code, payload = _http_get_json(CODEX_USAGE_URL, headers)
+                except GitHubError as e:
+                    return Provider("codex", False, None, error=str(e))
+            if code != 200 or not payload:
+                return Provider("codex", False, None, error=f"codex usage HTTP {code}")
+            self._store_raw("codex", payload)
+        return self._codex_from_payload(payload)
+
+    def _refresh_codex(self, auth: dict) -> Optional[str]:
+        rt = (auth.get("tokens") or {}).get("refresh_token")
+        if not rt:
+            return None
+        code, resp = _http_post_form(CODEX_TOKEN_URL, {
+            "grant_type": "refresh_token", "client_id": CODEX_CLIENT_ID, "refresh_token": rt})
+        if code != 200 or not resp.get("access_token"):
+            return None
+        tok = auth.setdefault("tokens", {})
+        tok["access_token"] = resp["access_token"]
+        if resp.get("refresh_token"):
+            tok["refresh_token"] = resp["refresh_token"]
+        if resp.get("id_token"):
+            tok["id_token"] = resp["id_token"]
+        auth["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_json_atomic(self.cfg.home / ".codex" / "auth.json", auth)
+        return resp["access_token"]
+
+    def _codex_from_payload(self, payload: dict) -> Provider:
+        rl = payload.get("rate_limit") or {}
+        limit_reached = bool(rl.get("limit_reached"))
+        wins = []
+        for key, name in (("primary_window", "session"), ("secondary_window", "weekly")):
+            w = rl.get(key) or {}
+            lim = w.get("limit_window_seconds")
+            ra = w.get("reset_after_seconds")
+            elapsed = None
+            resets = None
+            if isinstance(lim, (int, float)) and lim > 0 and isinstance(ra, (int, float)):
+                elapsed = (lim - ra) / lim * 100
+                resets = time.time() + max(0, ra)
+            wins.append(_classify_window(name, w.get("used_percent"), elapsed, resets, limit_reached))
+        avail = all(x.status == "under-pace" for x in wins) and not limit_reached
+        nxt = self._next_eligible(wins)
+        return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
+
+    # --- Claude ------------------------------------------------------------
+    def _claude_creds(self) -> Optional[dict]:
+        d = _read_json_file(self.cfg.home / ".claude" / ".credentials.json")
+        return (d or {}).get("claudeAiOauth") if d else None
+
+    def claude(self) -> Provider:
+        oauth = self._claude_creds()
+        if not oauth:
+            return Provider("claude", False, None, error="no ~/.claude/.credentials.json")
+        payload = self._cached_raw("claude")
+        if payload is None:
+            tok = oauth.get("accessToken")
+            if not tok:
+                return Provider("claude", False, None, error="no claude accessToken")
+            headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA,
+                       "User-Agent": "claude-code/2.1"}
+            try:
+                code, payload = _http_get_json(CLAUDE_USAGE_URL, headers)
+            except GitHubError as e:
+                return Provider("claude", False, None, error=str(e))
+            if code == 401:
+                tok = self._refresh_claude(oauth)
+                if not tok:
+                    return Provider("claude", False, None, error="claude 401 (refresh failed)")
+                headers["Authorization"] = f"Bearer {tok}"
+                try:
+                    code, payload = _http_get_json(CLAUDE_USAGE_URL, headers)
+                except GitHubError as e:
+                    return Provider("claude", False, None, error=str(e))
+            if code != 200 or not payload:
+                return Provider("claude", False, None, error=f"claude usage HTTP {code}")
+            self._store_raw("claude", payload)
+        return self._claude_from_payload(payload)
+
+    def _refresh_claude(self, oauth: dict) -> Optional[str]:
+        rt = oauth.get("refreshToken")
+        if not rt:
+            return None
+        code, resp = _http_post_form(CLAUDE_TOKEN_URL, {
+            "grant_type": "refresh_token", "client_id": CLAUDE_CLIENT_ID, "refresh_token": rt,
+            "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers"})
+        if code != 200 or not resp.get("access_token"):
+            return None
+        path = self.cfg.home / ".claude" / ".credentials.json"
+        full = _read_json_file(path) or {}
+        block = full.setdefault("claudeAiOauth", {})
+        block["accessToken"] = resp["access_token"]
+        if resp.get("refresh_token"):
+            block["refreshToken"] = resp["refresh_token"]
+        if resp.get("expires_in"):
+            block["expiresAt"] = int(time.time() * 1000) + int(resp["expires_in"]) * 1000
+        _write_json_atomic(path, full)
+        return resp["access_token"]
+
+    def _claude_from_payload(self, payload: dict) -> Provider:
+        def win(key, name, window_s):
+            w = payload.get(key) or {}
+            used = w.get("utilization")
+            resets = self._parse_iso(w.get("resets_at"))
+            elapsed = None
+            if resets is not None:
+                remaining = resets - time.time()
+                elapsed = (window_s - remaining) / window_s * 100
+            return _classify_window(name, used, elapsed, resets, False)
+
+        session = win("five_hour", "session", SESSION_WINDOW_S)
+        weekly = win("seven_day", "weekly", WEEK_WINDOW_S)
+        sonnet = win("seven_day_sonnet", "weekly_sonnet", WEEK_WINDOW_S)
+        # All-null across windows ⇒ API unreachable/auth broken ⇒ unavailable.
+        if all(x.used is None for x in (session, weekly, sonnet)):
+            return Provider("claude", False, None, [session, weekly, sonnet], error="all usage null")
+        opus_ok = session.status == "under-pace" and weekly.status == "under-pace"
+        sonnet_ok = sonnet.status == "under-pace"
+        model = "opus" if opus_ok else ("sonnet" if sonnet_ok else None)
+        # The worker wants opus; sonnet does NOT count as available for work.
+        avail = opus_ok
+        nxt = self._next_eligible([session, weekly])
+        return Provider("claude", avail, model, [session, weekly, sonnet], None, nxt)
+
+    @staticmethod
+    def _parse_iso(s: Optional[str]) -> Optional[float]:
+        if not s:
+            return None
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _next_eligible(windows: list[Window]) -> Optional[float]:
+        # Earliest reset among windows that are currently blocking (over-pace/exhausted).
+        blocked = [w.resets_at for w in windows if w.status in ("over-pace", "exhausted") and w.resets_at]
+        return min(blocked) if blocked else None
+
+    # --- selection ---------------------------------------------------------
+    def choose(self, forced: Optional[str]) -> tuple[Optional[str], dict]:
+        """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
+
+        forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
+        fallback. OpenRouter agents (deepseek/minimax) bypass this entirely (handled by the caller).
+        """
+        snap = {}
+        if forced in (None, "auto", "codex"):
+            snap["codex"] = self.codex()
+        if forced in (None, "auto", "claude"):
+            snap["claude"] = self.claude()
+        codex_ok = snap.get("codex") and snap["codex"].available
+        opus_ok = snap.get("claude") and snap["claude"].available
+        if forced == "codex":
+            return ("codex" if codex_ok else None), snap
+        if forced == "claude":
+            return ("claude" if opus_ok else None), snap
+        if codex_ok:
+            return "codex", snap
+        if opus_ok:
+            return "claude", snap
+        return None, snap
+
+
+# ============================================================================
+# ReviewState — the PR scoreboard comment is the multi-agent source of truth; a
+# short-TTL local cache fronts it. Ports gh_meta/bust_meta/ledger_*/review_* with
+# the stale-but-real fallback (never serve a phantom {} over a real cached value).
+# Provenance is tracked so mutating passes can refuse to act on stale data.
+# ============================================================================
+
+META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
+TRUSTED_ASSOC = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+
+@dataclass
+class Meta:
+    data: dict
+    provenance: str   # "fresh" | "stale" | "missing" | "fetch_failed"
+
+
+class ReviewState:
+    def __init__(self, cfg: Config, gh: GitHub):
+        self.cfg = cfg
+        self.gh = gh
+        self.sbcache = cfg.sbcache
+
+    def _cache_path(self, pr: int) -> Path:
+        return self.sbcache / f"{pr}.json"
+
+    def gh_meta(self, pr: int) -> Meta:
+        """Newest trusted scoreboard's <!--tauceti-meta:v1 {...}--> JSON, with TTL cache.
+
+        Trust = the <!--tauceti-scoreboard--> marker AND an author with repo association, so a random
+        external comment can't forge review state. Empty fetch with a prior cache value → serve the
+        stale value (stale-but-real beats a phantom '{}'); only fall to '{}' with no cache at all.
+        """
+        cache = self._cache_path(pr)
+        if cache.exists():
+            age = time.time() - cache.stat().st_mtime
+            if age < SBCACHE_TTL:
+                return Meta(self._load(cache), "fresh")
+
+        comments = self.gh.issue_comments(pr)
+        meta_str = ""
+        fetch_failed = comments is None
+        if comments:
+            trusted = [c for c in comments
+                       if "<!--tauceti-scoreboard-->" in (c.get("body") or "")
+                       and c.get("author_association") in TRUSTED_ASSOC]
+            trusted.sort(key=lambda c: c.get("updated_at", ""))
+            if trusted:
+                body = trusted[-1].get("body") or ""
+                matches = META_RE.findall(body)
+                if matches:
+                    meta_str = matches[-1].strip()
+
+        if not meta_str:
+            # Transient fetch failure OR genuinely no scoreboard. If we have a prior value, serve it.
+            if cache.exists():
+                return Meta(self._load(cache), "stale" if fetch_failed else "fresh")
+            return Meta({}, "fetch_failed" if fetch_failed else "missing")
+
+        try:
+            data = json.loads(meta_str)
+        except json.JSONDecodeError:
+            if cache.exists():
+                return Meta(self._load(cache), "stale")
+            return Meta({}, "missing")
+        self.sbcache.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data) + "\n")
+        return Meta(data, "fresh")
+
+    @staticmethod
+    def _load(cache: Path) -> dict:
+        try:
+            return json.loads(cache.read_text() or "{}")
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def bust(self, pr: int) -> None:
+        self._cache_path(pr).unlink(missing_ok=True)
+
+    # --- predicates over the meta (verbatim ports of the round.sh jq) ---
+    def ledger_head(self, pr: int) -> str:
+        return str(self.gh_meta(pr).data.get("head_sha") or "")
+
+    def ledger_clean_head(self, pr: int) -> str:
+        runs = self.gh_meta(pr).data.get("runs") or []
+        if runs and all(r.get("verdict") != "error" for r in runs):
+            return str(self.gh_meta(pr).data.get("head_sha") or "")
+        return ""
+
+    def review_rounds(self, pr: int, counters: Counters) -> int:
+        total = self.gh_meta(pr).data.get("round", 0)
+        total = total if isinstance(total, int) else 0
+        base = counters.read(f"round-base-{pr}")
+        return max(0, total - base)
+
+    def ledger_blocking(self, pr: int, head: str) -> bool:
+        m = self.gh_meta(pr).data
+        if str(m.get("head_sha") or "") != head:
+            return False
+        runs = m.get("runs") or []
+        return any(r.get("verdict") not in ("approve", "error") for r in runs)
+
+    def review_all_green(self, pr: int, head: str) -> Meta:
+        """Returns the Meta (so callers can inspect provenance); .data['_all_green'] is the verdict."""
+        meta = self.gh_meta(pr)
+        m = meta.data
+        runs = m.get("runs") or []
+        green = (str(m.get("head_sha") or "") == head and len(runs) > 0
+                 and all(r.get("verdict") == "approve" for r in runs))
+        return Meta({**m, "_all_green": green}, meta.provenance)
+
+
+# ============================================================================
+# Survey — the shared read-only core. Classifies all open PRs per work-kind
+# without acting. The picker, `status`, and the TUI all consume this one object.
+# ============================================================================
+
+BUILD_FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 \{[^}]*\}-->")
+TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
+
+
+@dataclass(frozen=True)
+class PRInfo:
+    number: int
+    head_oid: str
+    head_ref: str
+    head_owner: str
+    head_repo: str
+    is_draft: bool
+    mergeable: str           # MERGEABLE | CONFLICTING | UNKNOWN
+    author: str
+    build_success: bool
+    build_failed: bool
+
+    @staticmethod
+    def from_json(d: dict) -> "PRInfo":
+        rollup = d.get("statusCheckRollup") or []
+        builds = [c for c in rollup if c.get("name") == "build"]
+        return PRInfo(
+            number=d["number"],
+            head_oid=d.get("headRefOid", ""),
+            head_ref=d.get("headRefName", ""),
+            head_owner=(d.get("headRepositoryOwner") or {}).get("login", ""),
+            head_repo=(d.get("headRepository") or {}).get("name", ""),
+            is_draft=bool(d.get("isDraft")),
+            mergeable=d.get("mergeable", "UNKNOWN"),
+            author=(d.get("author") or {}).get("login", ""),
+            build_success=any(c.get("conclusion") == "SUCCESS" for c in builds),
+            build_failed=any(c.get("conclusion") in BUILD_FAIL for c in builds),
+        )
+
+
+@dataclass
+class Candidate:
+    pr: int
+    head: str
+    reason: str = ""
+    attempts: int = 0
+    budget: int = 0
+    provenance: str = "fresh"
+
+
+@dataclass
+class WorkKind:
+    name: str
+    actionable: list[Candidate] = field(default_factory=list)
+    suppressed: list[Candidate] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.actionable)
+
+
+@dataclass
+class BumpStatus:
+    master_tip: Optional[str] = None
+    our_pin: Optional[str] = None
+    behind: bool = False
+    bump_pr_open: bool = False
+    attempts: int = 0
+    due: bool = False
+
+
+@dataclass
+class Survey:
+    worker_id: str
+    open_prs: list[PRInfo] = field(default_factory=list)
+    n_open_nondraft: int = 0
+    n_reviewable: int = 0
+    rebaseable: WorkKind = field(default_factory=lambda: WorkKind("rebase"))
+    reviewable: WorkKind = field(default_factory=lambda: WorkKind("review"))
+    needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
+    red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
+    bump: BumpStatus = field(default_factory=BumpStatus)
+    roadmap_focus: str = ""
+    n_mine_open: int = 0
+    roadmap_backpressure: bool = False
+    mergeable_now: list[Candidate] = field(default_factory=list)
+    abandon_eligible: list[Candidate] = field(default_factory=list)
+    dup_groups: dict[str, list[int]] = field(default_factory=dict)
+    next_auto_stage: Optional[str] = None
+    github_failed: bool = False
+    errors: list[str] = field(default_factory=list)
+
+    def kind(self, name: str) -> WorkKind:
+        return {"rebase": self.rebaseable, "review": self.reviewable,
+                "fix": self.needs_fix, "fix-ci": self.red_ci}[name]
+
+
+def mathlib_master_tip(gh: GitHub) -> Optional[str]:
+    return gh.api_jq("repos/leanprover-community/mathlib4/commits/master", ".sha") or None
+
+
+def our_mathlib_pin(gh: GitHub) -> Optional[str]:
+    import base64
+    content = gh.api_jq(f"repos/{TAUCETI}/contents/lake-manifest.json?ref=main", ".content")
+    if not content:
+        return None
+    try:
+        manifest = json.loads(base64.b64decode(content))
+    except Exception:
+        return None
+    for pkg in manifest.get("packages", []):
+        if pkg.get("name") == "mathlib":
+            return pkg.get("rev")
+    return None
+
+
+def has_human_activity(gh: GitHub, pr: int) -> bool:
+    """Fail-safe: True (treat as human-touched) on any API error or doubt, so we never auto-close a
+    PR a person cares about. True if a protective label, or a comment/review by a non-bot non-worker."""
+    d = gh.pr_view(pr, ["labels", "comments", "reviews"])
+    if d is None:
+        return True
+    labels = {(l.get("name") or "").lower() for l in (d.get("labels") or [])}
+    if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+        return True
+    for item in (d.get("comments") or []) + (d.get("reviews") or []):
+        login = (item.get("author") or {}).get("login", "")
+        if login and login != ME and not login.endswith("[bot]") and not login.startswith("app/"):
+            return True
+    return False
+
+
+def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
+           *, deep: bool = True) -> Survey:
+    """Classify every open PR per work-kind. Read-only — performs no actions.
+
+    `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
+    and the housekeeping passes always use deep=True.
+    """
+    sv = Survey(worker_id=cfg.wid, roadmap_focus=ROADMAP_FOCUS or "any")
+    try:
+        raw = gh.pr_list(["number", "headRefOid", "headRefName", "headRepositoryOwner",
+                          "headRepository", "isDraft", "statusCheckRollup", "author", "mergeable"])
+    except GitHubError as e:
+        sv.github_failed = True
+        sv.errors.append(str(e))
+        return sv
+    prs = [PRInfo.from_json(d) for d in raw]
+    sv.open_prs = prs
+    nondraft = [p for p in prs if not p.is_draft]
+    mine = [p for p in nondraft if p.author == ME]
+    sv.n_open_nondraft = len(nondraft)
+    sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
+    sv.n_mine_open = len(mine)
+    sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
+
+    # 1) rebase: ours, CONFLICTING, under budgets (review budget owns past-budget PRs).
+    for p in mine:
+        if p.mergeable != "CONFLICTING":
+            continue
+        c = Candidate(p.number, p.head_oid, "conflicting")
+        if deep and rs.review_rounds(p.number, counters) >= MAX_REVIEW_ROUNDS:
+            sv.rebaseable.suppressed.append(c); continue
+        c.attempts = counters.read(f"rebase-pr-{p.number}"); c.budget = MAX_REBASE_ATTEMPTS
+        (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
+
+    # 2) review: non-draft, build-green, current head not cleanly reviewed, under budgets.
+    for p in nondraft:
+        if not p.build_success:
+            continue
+        c = Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed")
+        if deep:
+            m = rs.gh_meta(p.number); c.provenance = m.provenance
+            if rs.ledger_clean_head(p.number) == p.head_oid:
+                continue  # already cleanly reviewed at this head
+            if rs.review_rounds(p.number, counters) >= MAX_REVIEW_ROUNDS:
+                sv.reviewable.suppressed.append(c); continue
+            c.attempts = counters.read(f"review-err-{p.number}"); c.budget = MAX_REVIEW_ERRORS
+            (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
+        else:
+            sv.reviewable.actionable.append(c)
+
+    if deep:
+        # 3) fix: ours, reviewed-at-head, latest rubric blocking, under budgets.
+        for p in mine:
+            if rs.ledger_head(p.number) != p.head_oid:
+                continue
+            if not rs.ledger_blocking(p.number, p.head_oid):
+                continue
+            c = Candidate(p.number, p.head_oid, "blocking review at head")
+            per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
+            per_pr = counters.read(f"fix-pr-{p.number}")
+            c.attempts, c.budget = per_head, MAX_FIX_ATTEMPTS
+            if per_head >= MAX_FIX_ATTEMPTS or per_pr >= MAX_FIX_PR_ATTEMPTS:
+                sv.needs_fix.suppressed.append(c)
+            else:
+                sv.needs_fix.actionable.append(c)
+
+    # 4) fix-ci: ours, build FAILED at head, under budgets.
+    for p in mine:
+        if not p.build_failed:
+            continue
+        c = Candidate(p.number, p.head_oid, "build failed at head")
+        per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
+        per_pr = counters.read(f"ci-pr-{p.number}")
+        c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
+        if per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
+            sv.red_ci.suppressed.append(c)
+        else:
+            sv.red_ci.actionable.append(c)
+
+    # 4.5) bump: mathlib master ahead of our pin, no bump/hopscotch PR open, under budget.
+    bump_open = any(p.head_ref.startswith(BUMP_BRANCH_PREFIX) or p.head_ref.startswith("hopscotch/")
+                    for p in nondraft)
+    tip = mathlib_master_tip(gh)
+    pin = our_mathlib_pin(gh)
+    sv.bump = BumpStatus(master_tip=tip, our_pin=pin, bump_pr_open=bump_open)
+    if tip and pin:
+        sv.bump.behind = tip != pin
+        sv.bump.attempts = counters.read(f"bump-{tip[:12]}")
+        sv.bump.due = (sv.bump.behind and not bump_open and sv.bump.attempts < MAX_BUMP_ATTEMPTS)
+
+    # Housekeeping classifications (author-scoped; need files/body). These drive merge/abandon/dedup.
+    if deep:
+        _classify_housekeeping(cfg, gh, rs, counters, sv)
+
+    sv.next_auto_stage = _next_auto_stage(sv)
+    return sv
+
+
+def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
+    try:
+        mine = gh.pr_list(["number", "headRefOid", "isDraft", "mergeable", "statusCheckRollup",
+                           "files", "body"], author=ME)
+    except GitHubError as e:
+        sv.errors.append(f"housekeeping list: {e}")
+        return
+    seen: dict[str, int] = {}
+    for d in sorted(mine, key=lambda x: x["number"]):
+        if d.get("isDraft"):
+            continue
+        pr, head = d["number"], d.get("headRefOid", "")
+        files = [f["path"] for f in (d.get("files") or [])]
+        rollup = d.get("statusCheckRollup") or []
+        build_green = any(c.get("name") == "build" and c.get("conclusion") == "SUCCESS" for c in rollup)
+        green_meta = rs.review_all_green(pr, head)
+        all_green = green_meta.data.get("_all_green", False)
+        # merge: all rubrics green at head, TauCeti/-only (+ root), MERGEABLE, build green.
+        if (all_green and d.get("mergeable") == "MERGEABLE" and build_green
+                and files and all(p.startswith("TauCeti/") or p == "TauCeti.lean" for p in files)):
+            sv.mergeable_now.append(Candidate(pr, head, "all rubrics green @ head, TauCeti/ only",
+                                              provenance=green_meta.provenance))
+        # abandon: not green, head IS the reviewed head, past budget, (human-activity checked lazily).
+        elif (not all_green and rs.ledger_head(pr) == head
+              and rs.review_rounds(pr, counters) >= MAX_REVIEW_ROUNDS):
+            if not has_human_activity(gh, pr):
+                sv.abandon_eligible.append(Candidate(pr, head, "review budget spent, no human activity",
+                                                     attempts=rs.review_rounds(pr, counters),
+                                                     budget=MAX_REVIEW_ROUNDS,
+                                                     provenance=green_meta.provenance))
+        # dedup: newer PR sharing a tauceti-target id with an older open one.
+        body = (d.get("body") or "").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+        mk = TARGET_MARKER_RE.search(body)
+        if mk:
+            mid = TARGET_ID_RE.search(mk.group(0))
+            if mid:
+                tid = mid.group(1)
+                if tid in seen:
+                    sv.dup_groups.setdefault(tid, [seen[tid]])
+                    sv.dup_groups[tid].append(pr)
+                else:
+                    seen[tid] = pr
+
+
+def _next_auto_stage(sv: Survey) -> Optional[str]:
+    if sv.rebaseable.actionable:
+        return "rebase"
+    if sv.reviewable.actionable:
+        return "review"
+    if sv.needs_fix.actionable:
+        return "fix"
+    if sv.red_ci.actionable:
+        return "fix-ci"
+    if sv.bump.due:
+        return "bump"
+    if not sv.roadmap_backpressure:
+        return "roadmap"
+    return None
+
+
+# ============================================================================
+# Round — the want-gated cascade over survey(). Pre-passes (merge/abandon/dedup)
+# always run (quota-free); then ONE work unit. Mirrors round.sh main().
+# ============================================================================
+
+def want(only: list[str], task: str) -> bool:
+    """Is this work-unit stage enabled? Empty `only` ⇒ everything (do-whatever-is-helpful)."""
+    return (not only) or (task in only)
+
+
+@dataclass
+class RoundOpts:
+    only: list[str]
+    agent: str            # auto|codex|claude|deepseek|minimax (already resolved)
+    work_model: str       # the concrete model to run (codex|claude|deepseek|minimax) — set by loop/quota
+    sandbox_host: bool    # True = --host (opt out of bubble)
+    dry_run: bool
+    no_pace: bool = False
+    quota_cmd: Optional[str] = None
+
+
+def _sandbox_for(stage: str, opts: RoundOpts) -> bool:
+    """True = bubble. Every model-running stage defaults to bubble; --host opts out."""
+    if not SANDBOX_DEFAULT.get(stage, False):
+        return False
+    return not opts.sandbox_host
+
+
+def run_round(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, opts: RoundOpts) -> int:
+    sv = survey(cfg, gh, rs, counters, deep=True)
+    if sv.github_failed:
+        raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
+
+    # Housekeeping pre-passes — quota-free, run in EVERY mode (land green PRs, retire stuck ones,
+    # de-dup). The worker is the only path that merges or retires PRs (CI-side merge is off).
+    prepass_merge(cfg, gh, rs, sv, opts.dry_run)
+    prepass_dedup(cfg, gh, sv, opts.dry_run)
+    prepass_abandon(cfg, gh, rs, sv, opts.dry_run)
+
+    log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
+
+    # The cascade: first actionable stage wins, does ONE unit, returns its rc.
+    for stage in ("rebase", "review", "fix", "fix-ci"):
+        if want(opts.only, stage) and sv.kind(stage).actionable:
+            c = sv.kind(stage).actionable[0]
+            return dispatch(stage, cfg, c, opts)
+    if want(opts.only, "bump") and sv.bump.due:
+        return dispatch("bump", cfg, Candidate(0, sv.bump.master_tip or "", "bump"), opts)
+    if want(opts.only, "roadmap"):
+        if sv.roadmap_backpressure:
+            raise NoProgress(f"roadmap: {sv.n_mine_open} open PRs (>= {MAX_OPEN_PRS}) — backpressure, not authoring")
+        return dispatch("roadmap", cfg, Candidate(0, "", sv.roadmap_focus), opts)
+
+    raise NoProgress(f"no eligible work this round under --only={','.join(opts.only) or '(all)'} "
+                     f"(housekeeping pre-passes ran)")
+
+
+def dispatch(stage: str, cfg: Config, c: Candidate, opts: RoundOpts) -> int:
+    sandbox = "bubble" if _sandbox_for(stage, opts) else "host"
+    if opts.dry_run:
+        target = f"#{c.pr}" if c.pr else (c.head[:12] if c.head else c.reason)
+        log(f"[dry-run] would {stage.upper()} {target}  agent={opts.work_model} sandbox={sandbox}")
+        return 0
+    # Real execution arrives with the agent (M8/M9), review-in-bubble (M9b), and pre-passes (M11).
+    raise Die(f"{stage}: real execution not yet wired (milestone 8+); use --dry-run")
+
+
+# Housekeeping pre-passes (real execution lands in M11; here they dry-run / no-op so the picker runs).
+def prepass_merge(cfg, gh, rs, sv: Survey, dry: bool) -> None:
+    for c in sv.mergeable_now:
+        if c.provenance in ("stale", "fetch_failed"):
+            log(f"merge: skip #{c.pr} — scoreboard provenance={c.provenance} (refuse to act on stale data)")
+            continue
+        log(f"[dry-run] would merge #{c.pr} ({c.reason})" if dry else f"merge: #{c.pr} (M11)")
+
+
+def prepass_dedup(cfg, gh, sv: Survey, dry: bool) -> None:
+    for tid, prs in sv.dup_groups.items():
+        for pr in prs[1:]:
+            log(f"[dry-run] would close duplicate #{pr} (target '{tid}', keep #{prs[0]})"
+                if dry else f"dup-sweep: #{pr} (M11)")
+
+
+def prepass_abandon(cfg, gh, rs, sv: Survey, dry: bool) -> None:
+    for c in sv.abandon_eligible:
+        if c.provenance in ("stale", "fetch_failed"):
+            log(f"abandon: skip #{c.pr} — provenance={c.provenance}")
+            continue
+        log(f"[dry-run] would abandon #{c.pr} ({c.reason})" if dry else f"abandon: #{c.pr} (M11)")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def add_work_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--loop", action="store_true", help="keep doing rounds (the driver); default is one round")
+    p.add_argument("--only", action="append", default=[], metavar="TASKS",
+                   help="restrict to these work units (comma list): " + ", ".join(ALLOWED_TASKS))
+    p.add_argument("--agent", choices=AGENTS, default=None,
+                   help="which agent to run (default: $TAUCETI_AGENT or auto)")
+    # Back-compat aliases for the agent choice.
+    g = p.add_mutually_exclusive_group()
+    for a in ("codex", "claude", "deepseek", "minimax"):
+        g.add_argument(f"--{a}", dest="agent_alias", action="store_const", const=a, help=argparse.SUPPRESS)
+    p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble for model modes)")
+    p.add_argument("--bubble", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op (now default)
+    p.add_argument("--no-pace", dest="no_pace", action="store_true", help="disable the quota pacer")
+    p.add_argument("--quota-cmd", default=os.environ.get("TAUCETI_QUOTA_CMD"),
+                   help="external command that decides agent availability (overrides the built-in pacer)")
+    p.add_argument("--worker-id", dest="worker_id", default=None, help="stable worker id (else 'default')")
+    p.add_argument("--isolate-home", dest="isolate_home", action="store_true",
+                   help="per-worker Claude/Codex auth state (needed for multi-worker)")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="survey + print the picker's decision; act on nothing")
+
+
+def parse_only(values: list[str]) -> list[str]:
+    """Flatten/validate --only (comma lists or repeats). Empty = the full cascade."""
+    tasks: list[str] = []
+    for v in values:
+        for tok in v.replace(" ", "").split(","):
+            if not tok:
+                continue
+            if tok not in ALLOWED_TASKS:
+                raise SystemExit(f"unknown --only task '{tok}' (valid: {', '.join(ALLOWED_TASKS)})")  # exit 1; argparse uses 2
+            tasks.append(tok)
+    return tasks
+
+
+def resolve_agent(args) -> str:
+    if getattr(args, "agent", None) and getattr(args, "agent_alias", None):
+        raise SystemExit("pass either --agent or a model alias (--codex/--claude/...), not both")
+    return (getattr(args, "agent", None) or getattr(args, "agent_alias", None)
+            or os.environ.get("TAUCETI_AGENT") or "auto")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="tauceti", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    w = sub.add_parser("work", help="do work: one round, or the driver loop with --loop")
+    add_work_flags(w)
+
+    s = sub.add_parser("status", help="read-only survey of available work + quota")
+    s.add_argument("--json", action="store_true", help="emit the survey as JSON")
+    s.add_argument("--worker-id", dest="worker_id", default=None)
+
+    sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
+
+    # Hidden internal subcommands.
+    r = sub.add_parser("_round", add_help=False)
+    add_work_flags(r)
+    hb = sub.add_parser("_heartbeat", add_help=False)
+    hb.add_argument("key")
+    hb.add_argument("--ppipe", type=int, default=None)
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cmd = args.cmd
+
+    if cmd is None:
+        return cmd_tui(args)
+    if cmd == "status":
+        return cmd_status(args)
+    if cmd in ("work", "_round"):
+        only = parse_only(getattr(args, "only", []))
+        agent = resolve_agent(args)
+        return cmd_work(args, only=only, agent=agent, one_round=(cmd == "_round"))
+    if cmd == "doctor":
+        return cmd_doctor(args)
+    if cmd == "_heartbeat":
+        return cmd_heartbeat(args)
+    parser.print_help()
+    return 64
+
+
+# --- command stubs (filled in by later milestones) ---------------------------
+
+def _sample(cands: list[Candidate], n: int = 3) -> str:
+    nums = [f"#{c.pr}" for c in cands]
+    head = " ".join(nums[:n])
+    return head + (f" +{len(nums) - n}" if len(nums) > n else "")
+
+
+def quota_line(snap: dict) -> str:
+    """One-line quota summary from a {provider: Provider} snapshot."""
+    parts = []
+    for name in ("codex", "claude"):
+        prov = snap.get(name)
+        if prov is None:
+            continue
+        if prov.error:
+            parts.append(f"{name} [yellow]?[/] ({prov.error})")
+        elif prov.available:
+            parts.append(f"{name} [green]✓[/] {prov.model}")
+        else:
+            why = prov.model or "over-pace/exhausted"
+            parts.append(f"{name} [red]✗[/] ({why})")
+    return "   ".join(parts) if parts else "quota: (not checked)"
+
+
+def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None) -> None:
+    from rich.table import Table
+    from rich.panel import Panel
+
+    if sv.github_failed:
+        console.print(Panel("[bold red]GitHub fetch failed[/] — survey unavailable.\n"
+                            + "\n".join(sv.errors), title="tauceti"))
+        return
+
+    header = (f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   "
+              f"open: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
+    if quota_snap is not None:
+        header += "\nquota: " + quota_line(quota_snap)
+    console.print(Panel(header, title="tauceti"))
+
+    t = Table(show_header=True, header_style="bold")
+    t.add_column("KIND"); t.add_column("READY", justify="right"); t.add_column("SAMPLE / NOTE")
+    for name in ("rebase", "review", "fix", "fix-ci"):
+        wk = sv.kind(name)
+        ready = str(wk.count) if wk.count else "—"
+        extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
+        t.add_row(name, ready, (_sample(wk.actionable) or "") + extra)
+    # bump
+    if sv.bump.due:
+        t.add_row("bump", "1", f"mathlib master {sv.bump.master_tip[:12] if sv.bump.master_tip else '?'} ahead of pin")
+    else:
+        note = "pin current with master" if sv.bump.master_tip and sv.bump.master_tip == sv.bump.our_pin else \
+               ("bump PR already open" if sv.bump.bump_pr_open else
+                ("over budget" if sv.bump.behind else "unknown"))
+        t.add_row("bump", "—", note)
+    # roadmap
+    if sv.roadmap_backpressure:
+        t.add_row("roadmap", "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})")
+    else:
+        t.add_row("roadmap", "∞", f"focus: {sv.roadmap_focus}")
+    console.print(t)
+
+    h = Table(show_header=True, header_style="bold dim", title="housekeeping (quota-free, every round)")
+    h.add_column("KIND"); h.add_column("READY", justify="right"); h.add_column("SAMPLE / NOTE")
+    h.add_row("merge", str(len(sv.mergeable_now)) or "—", _sample(sv.mergeable_now) or "—")
+    h.add_row("abandon", str(len(sv.abandon_eligible)) or "—", _sample(sv.abandon_eligible) or "—")
+    dups = [pr for group in sv.dup_groups.values() for pr in group[1:]]
+    h.add_row("dup-sweep", str(len(dups)) or "—", " ".join(f"#{p}" for p in dups[:3]) or "—")
+    console.print(h)
+
+    nxt = sv.next_auto_stage
+    console.print(f"\nNext auto round would: [bold]{nxt.upper() if nxt else 'NOTHING (no eligible work)'}[/]")
+
+
+def cmd_status(args) -> int:
+    cfg = Config.resolve(getattr(args, "worker_id", None))
+    gh = GitHub()
+    rs = ReviewState(cfg, gh)
+    counters = Counters(cfg)
+    sv = survey(cfg, gh, rs, counters, deep=True)
+    _, quota_snap = Quota(cfg).choose(None)
+
+    if getattr(args, "json", False):
+        out = {"survey": dataclasses.asdict(sv),
+               "quota": {k: dataclasses.asdict(v) for k, v in quota_snap.items()}}
+        print(json.dumps(out, indent=2, default=str))
+        return 1 if sv.github_failed else 0
+
+    from rich.console import Console
+    render_survey(sv, Console(), quota_snap)
+    return 1 if sv.github_failed else 0
+
+
+def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
+    cfg = Config.resolve(getattr(args, "worker_id", None))
+    if getattr(args, "loop", False) and not one_round:
+        raise SystemExit("tauceti work --loop: the driver loop lands in milestone 12 — one round works now")
+    gh = GitHub()
+    rs = ReviewState(cfg, gh)
+    counters = Counters(cfg)
+    # work_model: a forced/aliased agent runs directly; 'auto' is resolved by the pacer in the loop
+    # (milestone 12). For a single round, 'auto' shows as 'auto' in dry-run and is resolved at M12.
+    work_model = agent if agent != "auto" else "auto"
+    opts = RoundOpts(only=only, agent=agent, work_model=work_model,
+                     sandbox_host=getattr(args, "host", False), dry_run=getattr(args, "dry_run", False),
+                     no_pace=getattr(args, "no_pace", False), quota_cmd=getattr(args, "quota_cmd", None))
+    return run_round(cfg, gh, rs, counters, opts)   # NoProgress/Die propagate to main()'s handler
+
+
+def cmd_tui(args) -> int:
+    raise SystemExit("tauceti TUI: not yet implemented (milestone 13). Try `tauceti status` or `tauceti work`.")
+
+
+def cmd_doctor(args) -> int:
+    raise SystemExit("tauceti doctor: not yet implemented (milestone 9)")
+
+
+def cmd_heartbeat(args) -> int:
+    raise SystemExit("tauceti _heartbeat: not yet implemented (milestone 7)")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Die as e:
+        log(str(e))
+        sys.exit(1)
+    except NoProgress as e:
+        log(str(e))
+        sys.exit(EX_NOPROGRESS)
+    except KeyboardInterrupt:
+        sys.exit(130)
