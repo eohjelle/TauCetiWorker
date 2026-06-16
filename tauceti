@@ -21,10 +21,13 @@ call: gh, git, uvx tauceti-review, bubble, the agent CLIs (claude/codex/pi).
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
+import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -955,6 +958,397 @@ def _next_auto_stage(sv: Survey) -> Optional[str]:
 
 
 # ============================================================================
+# Round lifecycle — flock (one round per worker), signal handling, cleanup, and
+# the loop→child spawn with process-group teardown.
+#
+# Python's default close_fds=True means children never inherit the round.lock fd,
+# so round.sh's hand-managed `9>&-` fd-leak fix (commit 3e4828b) is automatic; we
+# also mark the lock fd non-inheritable as belt-and-suspenders. Running each round
+# as a child of the loop in its OWN session is what makes timeout teardown, the
+# cleanup-on-exit, and a SIGKILL-self-cleaning bubble behave like the shell.
+# ============================================================================
+
+class RoundContext:
+    """Holds the per-worker round lock for the life of a round, runs cleanup on any exit, and routes
+    SIGTERM→143 / SIGINT→130 through that cleanup (so a loop-sent SIGTERM still releases the lease)."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._fd: Optional[int] = None
+        self._cleanups: list = []
+        self._done = False
+
+    def __enter__(self) -> "RoundContext":
+        self.cfg.state.mkdir(parents=True, exist_ok=True)
+        path = self.cfg.state / "round.lock"
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+        os.set_inheritable(fd, False)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise Die(f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time")
+        self._fd = fd
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        atexit.register(self._cleanup)
+        return self
+
+    def add_cleanup(self, fn) -> None:
+        self._cleanups.append(fn)
+
+    def _cleanup(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        for fn in reversed(self._cleanups):   # LIFO: stop heartbeat, pop bubble, release claim
+            try:
+                fn()
+            except Exception as e:
+                log(f"cleanup step failed: {e}")
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def __exit__(self, *exc) -> bool:
+        self._cleanup()
+        return False
+
+
+def spawn_round(argv_tail: list[str]) -> subprocess.Popen:
+    """Spawn one round as a child in its OWN session (so the loop can kill the whole group). Invokes
+    the current interpreter directly on this file (NOT via the uv shebang) to avoid a uv wrapper
+    process between the loop and the round — sys.executable is already the uv-resolved interpreter."""
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_round", *argv_tail]
+    return subprocess.Popen(cmd, start_new_session=True)
+
+
+def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
+    """SIGTERM the round's process group, give it term_grace to clean up, then SIGKILL — the
+    `timeout --kill-after=30s` teardown, but reaching the whole group (agent + build daemons)."""
+    try:
+        pgid = os.getpgid(p.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        p.wait(term_grace)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+
+
+CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "claim.sh")
+
+
+class Claims:
+    """[COOP] branch claims + the [HARD] push-arbiter env. Mutating tasks take a branch/<pr> claim and
+    heartbeat it (dedup only; git-safe-push's branch CAS is the real guarantee). The heartbeat is a
+    detached child that dies with the parent via an inherited pipe (EOF when the parent goes, even on
+    SIGKILL), never runs the round's cleanup, and never holds the round.lock fd (pass_fds keeps only
+    the pipe; the lock fd is non-inheritable + closed by close_fds)."""
+
+    def __init__(self, cfg: Config, ctx: "RoundContext"):
+        self.cfg = cfg
+        self.ctx = ctx
+        self.held: Optional[str] = None
+        self._hb: Optional[subprocess.Popen] = None
+        self._hb_wfd: Optional[int] = None
+
+    def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
+        """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
+        (caller skips this PR — dedup). A claim error is non-fatal: proceed unclaimed (CAS still protects)."""
+        key = f"branch/{pr}"
+        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True).returncode
+        if rc == 1:
+            log(f"branch #{pr} claimed by another worker — skipping (COOP dedup)")
+            return False
+        os.environ["TAUCETI_PUSH_REF"] = refname
+        os.environ["TAUCETI_PUSH_EXPECT"] = head
+        os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{owner}/{repo}"
+        os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
+        if rc == 0:
+            self.held = key
+            os.environ["TAUCETI_CLAIM_KEY"] = key
+            self.ctx.add_cleanup(self.release)
+            self.start_heartbeat(key)
+        else:
+            log(f"claim acquire #{pr} errored (rc={rc}) — proceeding unclaimed (branch CAS still protects)")
+            os.environ.pop("TAUCETI_CLAIM_KEY", None)
+        return True
+
+    def start_heartbeat(self, key: str) -> None:
+        rfd, wfd = os.pipe()
+        os.set_inheritable(rfd, True)
+        cmd = [sys.executable, str(Path(__file__).resolve()), "_heartbeat", key, "--ppipe", str(rfd)]
+        env = {**os.environ, "TAUCETI_CLAIM_SH": CLAIM_SH, "CLAIM_TTL": str(CLAIM_TTL_S)}
+        self._hb = subprocess.Popen(cmd, pass_fds=[rfd], env=env)
+        os.close(rfd)            # parent keeps only the write end; its closure (or death) is the EOF signal
+        self._hb_wfd = wfd
+        self.ctx.add_cleanup(self.stop_heartbeat)
+
+    def stop_heartbeat(self) -> None:
+        if self._hb_wfd is not None:
+            try:
+                os.close(self._hb_wfd)   # EOF → the heartbeat child exits on its own
+            except OSError:
+                pass
+            self._hb_wfd = None
+        if self._hb is not None:
+            try:
+                self._hb.terminate()
+                self._hb.wait(5)
+            except Exception:
+                pass
+            self._hb = None
+
+    def release(self) -> None:
+        if self.held:
+            subprocess.run([CLAIM_SH, "release", self.held], capture_output=True)
+            self.held = None
+
+
+def cmd_heartbeat(args) -> int:
+    """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
+    lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext)."""
+    import select
+    key = args.key
+    ppipe = args.ppipe
+    while True:
+        if ppipe is not None:
+            r, _, _ = select.select([ppipe], [], [], CLAIM_HEARTBEAT_S)
+            if r:   # readable ⇒ EOF (we never write to the pipe) ⇒ parent gone
+                try:
+                    if os.read(ppipe, 1) == b"":
+                        return 0
+                except OSError:
+                    return 0
+        else:
+            time.sleep(CLAIM_HEARTBEAT_S)
+        if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
+            return 0   # lease lost → stop renewing so it can expire
+
+
+def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:
+    """Run one round as a child under a hard timeout; tear down the group on expiry. Used by the loop.
+    Maps a timed-out round to rc 124, a SIGKILL-after-grace to 137 (matching the shell's `timeout`)."""
+    p = spawn_round(argv_tail)
+    try:
+        return p.wait(timeout)
+    except subprocess.TimeoutExpired:
+        log(f"round timed out after {timeout}s — tearing down")
+        kill_round_group(p)
+        rc = p.returncode
+        return 137 if rc is not None and rc < 0 and -rc == signal.SIGKILL else 124
+    except KeyboardInterrupt:
+        kill_round_group(p)
+        raise
+
+
+# ============================================================================
+# Agents — prompt filling, the host checkout, and the byte-for-byte agent launch.
+# The host argv lists reproduce round.sh's run_agent exactly (the `( cd … ) 9>&-`
+# and `env -u` mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh /
+# git-safe-push / gh-safe-pr-create are put on the agent's PATH so it can push.
+# ============================================================================
+
+def fill_prompt(path: Path, **subs) -> str:
+    out = Path(path).read_text()
+    for k, v in subs.items():
+        out = out.replace(f"__{k}__", str(v))
+    return out
+
+
+def prepare_checkout(cfg: Config) -> bool:
+    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
+    co = cfg.checkout
+    if not (co / ".git").is_dir():
+        co.parent.mkdir(parents=True, exist_ok=True)
+        log(f"cloning {TAUCETI} → {co} (first run)")
+        if subprocess.run(["git", "clone", "-q", f"https://github.com/{TAUCETI}", str(co)]).returncode:
+            return False
+
+    def g(*a) -> int:
+        return subprocess.run(["git", "-C", str(co), *a]).returncode
+
+    if g("fetch", "-q", "origin"):
+        return False
+    if g("switch", "-q", "main"):
+        g("checkout", "-q", "-B", "main", "origin/main")
+    g("reset", "-q", "--hard", "origin/main")
+    g("clean", "-fdxq", "-e", ".lake")
+    return True
+
+
+def fetch_ref(repo: str, dir: Path) -> bool:
+    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+    if (dir / ".git").is_dir():
+        ok = (subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"]).returncode == 0
+              and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0)
+        subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"])
+        return ok
+    import shutil
+    shutil.rmtree(dir, ignore_errors=True)
+    dir.parent.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(["git", "clone", "-q", "--depth", "1", f"https://github.com/{repo}", str(dir)]).returncode == 0
+
+
+def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
+    """The exact argv + env for the host work agent (round.sh run_agent). HERE is on PATH so the agent
+    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
+    env = {**os.environ, "PATH": f"{HERE}:{os.environ.get('PATH', '')}"}
+    if work_model == "codex":
+        argv = ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+    elif work_model in OPENROUTER_MODELS:
+        argv = [PI_RUN, "openrouter", OPENROUTER_MODELS[work_model], "--prompt", prompt]
+    else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
+        env.pop("ANTHROPIC_API_KEY", None)
+        argv = ["claude", "-p", prompt, "--model", "opus", "--dangerously-skip-permissions"]
+    return argv, env
+
+
+def run_agent_host(cwd: Path, prompt: str, work_model: str) -> int:
+    argv, env = host_agent_argv(prompt, work_model)
+    if os.environ.get("TAUCETI_AGENT_ECHO"):
+        print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
+        return 0
+    return subprocess.run(argv, cwd=str(cwd), env=env).returncode
+
+
+def _shq(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+# ===== Bubble authoring path (default for model modes; --host opts out) =======
+# The checkout, lake build, and every git/gh call happen IN a repo-scoped bubble
+# container. GitHub goes through bubble's auth proxy (the host kim-em token never
+# enters); only the one credential the work model needs is seeded; no host config
+# crosses the boundary. Byte-for-byte the same agent invocation as round.sh.
+
+def bubble_name(cfg: Config) -> str:
+    return f"tauceti-worker-{cfg.wid}"
+
+
+def bubble_home(cfg: Config) -> Path:
+    env = os.environ.get("TAUCETI_BUBBLE_HOME")
+    return Path(env) if env else (cfg.home / ".cache" / "tauceti-worker" / cfg.wid / "bubble")
+
+
+def ensure_bubble_home(cfg: Config) -> dict:
+    """One-time hardening of the private bubble home (read-only shared Mathlib cache + per-round
+    overlay). Returns the env (with BUBBLE_HOME set) for bubble subprocesses."""
+    home = bubble_home(cfg)
+    env = {**os.environ, "BUBBLE_HOME": str(home)}
+    if (home / ".worker-init").exists():
+        return env
+    home.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["bubble", "security", "set", "shared-cache", "overlay"],
+                   env=env, capture_output=True)
+    (home / ".worker-init").touch()
+    return env
+
+
+def agent_cred_flags(work_model: str) -> list[str]:
+    """Bubble flags seeding ONLY the work model's credential; all config and other models' creds stay out."""
+    if work_model == "codex":
+        return ["--codex-credentials", "--no-codex-config", "--no-claude-credentials", "--no-claude-config"]
+    if work_model in OPENROUTER_MODELS:
+        return ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+    return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+
+
+def agent_inner_cmd(work_model: str) -> str:
+    """The command bubble runs INSIDE the container (bash -lc). Byte-for-byte round.sh's agent_inner_cmd:
+    the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force subscription auth."""
+    if work_model == "codex":
+        return ('env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --sandbox danger-full-access '
+                '--skip-git-repo-check "$(cat /opt/round/prompt.txt)"')
+    if work_model in OPENROUTER_MODELS:
+        return ('env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY="$(cat /opt/round/openrouter.key)" '
+                f'pi --provider openrouter --model {OPENROUTER_MODELS[work_model]} --print '
+                '"$(cat /opt/round/prompt.txt)"')
+    return ('env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
+            '--dangerously-skip-permissions --model opus')
+
+
+def _bubble_pop(cfg: Config, env: dict) -> None:
+    subprocess.run(["bubble", "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
+
+
+def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
+                  mounts: Optional[list[str]] = None) -> int:
+    """Open a fresh repo-scoped bubble for target, run the work model on prompt inside it, pop it."""
+    import shlex
+    cfg, wm = w.cfg, opts.work_model
+    if wm in OPENROUTER_MODELS and not os.environ.get("TAUCETI_ALLOW_OPENROUTER_BUBBLE"):
+        # The bubble image needs `pi` + openrouter.ai egress (kim-em/bubble#299); until then this fails
+        # at `pi: command not found`. Fail early with a clear pointer rather than after staging.
+        raise Die(f"--agent {wm} requires --host until kim-em/bubble#299 lands pi in the bubble image "
+                  f"(set TAUCETI_ALLOW_OPENROUTER_BUBBLE=1 to override once it has)")
+    env = ensure_bubble_home(cfg)
+    rounddir = cfg.state / "bubble-round"
+    import shutil
+    shutil.rmtree(rounddir, ignore_errors=True)
+    rounddir.mkdir(parents=True, exist_ok=True)
+    (rounddir / "prompt.txt").write_text(prompt)
+    # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
+    # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
+    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+        shutil.copy(HERE / f, rounddir / f)
+        os.chmod(rounddir / f, 0o755)
+    if wm in OPENROUTER_MODELS:   # OpenRouter key has no proxy — stage it 0600, mounted read-only
+        keyf = rounddir / "openrouter.key"
+        keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
+        os.chmod(keyf, 0o600)
+
+    _bubble_pop(cfg, env)   # clear any container a SIGKILLed prior round left behind
+
+    mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    for m in (mounts or []):
+        mount_flags += ["--mount", m]
+
+    # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
+    # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
+    # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
+    # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    tcenv = "env PATH=/opt/round:$PATH"
+    for var in ("TAUCETI_PUSH_REF", "TAUCETI_PUSH_EXPECT", "TAUCETI_PUSH_REMOTE",
+                "TAUCETI_TARGET_MARKER", "TAUCETI_REQUIRE_TARGET_MARKER"):
+        val = os.environ.get(var)
+        if val:
+            tcenv += f" {var}={shlex.quote(val)}"
+    command = f"{tcenv} {agent_inner_cmd(wm)}"
+
+    argv = ["bubble", "open", target, "--shell", "--local", "--name", bubble_name(cfg), "--ephemeral",
+            "--github-security", "allowlist-write-graphql", *mount_flags, *agent_cred_flags(wm),
+            "--command", command]
+
+    if os.environ.get("TAUCETI_AGENT_ECHO"):
+        print("BUBBLE " + " ".join(_shq(a) for a in argv))
+        return 0
+
+    w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))   # pop if we're killed mid-run
+    rc = subprocess.run(argv, env=env).returncode
+    _bubble_pop(cfg, env)   # don't rely on --ephemeral alone
+    return rc
+
+
+def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "RoundOpts") -> int:
+    raise Die("review-in-bubble lands in milestone 9b — use --host for now")
+
+
+# ============================================================================
 # Round — the want-gated cascade over survey(). Pre-passes (merge/abandon/dedup)
 # always run (quota-free); then ONE work unit. Mirrors round.sh main().
 # ============================================================================
@@ -967,62 +1361,194 @@ def want(only: list[str], task: str) -> bool:
 @dataclass
 class RoundOpts:
     only: list[str]
-    agent: str            # auto|codex|claude|deepseek|minimax (already resolved)
-    work_model: str       # the concrete model to run (codex|claude|deepseek|minimax) — set by loop/quota
+    agent: str            # auto|codex|claude|deepseek|minimax (the requested dial)
+    work_model: str       # the concrete model to run (codex|claude|deepseek|minimax), or 'auto' for dry-run
     sandbox_host: bool    # True = --host (opt out of bubble)
     dry_run: bool
     no_pace: bool = False
     quota_cmd: Optional[str] = None
 
+    @property
+    def agent_name(self) -> str:
+        return AGENT_NAMES.get(self.work_model, self.work_model)
 
-def _sandbox_for(stage: str, opts: RoundOpts) -> bool:
-    """True = bubble. Every model-running stage defaults to bubble; --host opts out."""
+
+@dataclass
+class Worker:
+    cfg: Config
+    gh: GitHub
+    rs: ReviewState
+    counters: Counters
+    rc: "RoundContext"
+    claims: "Claims"
+
+
+def _bubble(stage: str, opts: RoundOpts) -> bool:
+    """True = run this stage in bubble. Every model-running stage defaults to bubble; --host opts out."""
     if not SANDBOX_DEFAULT.get(stage, False):
         return False
     return not opts.sandbox_host
 
 
-def run_round(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, opts: RoundOpts) -> int:
-    sv = survey(cfg, gh, rs, counters, deep=True)
+def run_round(w: Worker, opts: RoundOpts) -> int:
+    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
 
     # Housekeeping pre-passes — quota-free, run in EVERY mode (land green PRs, retire stuck ones,
     # de-dup). The worker is the only path that merges or retires PRs (CI-side merge is off).
-    prepass_merge(cfg, gh, rs, sv, opts.dry_run)
-    prepass_dedup(cfg, gh, sv, opts.dry_run)
-    prepass_abandon(cfg, gh, rs, sv, opts.dry_run)
+    prepass_merge(w, sv, opts.dry_run)
+    prepass_dedup(w, sv, opts.dry_run)
+    prepass_abandon(w, sv, opts.dry_run)
 
     log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
 
-    # The cascade: first actionable stage wins, does ONE unit, returns its rc.
+    # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
+    # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
     for stage in ("rebase", "review", "fix", "fix-ci"):
-        if want(opts.only, stage) and sv.kind(stage).actionable:
-            c = sv.kind(stage).actionable[0]
-            return dispatch(stage, cfg, c, opts)
+        if not want(opts.only, stage):
+            continue
+        for c in sv.kind(stage).actionable:
+            rc = dispatch(stage, w, sv, c, opts)
+            if rc is not None:
+                return rc   # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
     if want(opts.only, "bump") and sv.bump.due:
-        return dispatch("bump", cfg, Candidate(0, sv.bump.master_tip or "", "bump"), opts)
+        rc = dispatch("bump", w, sv, Candidate(0, sv.bump.master_tip or "", "bump"), opts)
+        if rc is not None:
+            return rc
     if want(opts.only, "roadmap"):
         if sv.roadmap_backpressure:
             raise NoProgress(f"roadmap: {sv.n_mine_open} open PRs (>= {MAX_OPEN_PRS}) — backpressure, not authoring")
-        return dispatch("roadmap", cfg, Candidate(0, "", sv.roadmap_focus), opts)
+        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_focus), opts)
+        if rc is not None:
+            return rc
 
     raise NoProgress(f"no eligible work this round under --only={','.join(opts.only) or '(all)'} "
                      f"(housekeeping pre-passes ran)")
 
 
-def dispatch(stage: str, cfg: Config, c: Candidate, opts: RoundOpts) -> int:
-    sandbox = "bubble" if _sandbox_for(stage, opts) else "host"
+def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> Optional[int]:
+    """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
+    (caller tries the next candidate). Dry-run logs the intent and returns 0."""
+    bubble = _bubble(stage, opts)
     if opts.dry_run:
         target = f"#{c.pr}" if c.pr else (c.head[:12] if c.head else c.reason)
-        log(f"[dry-run] would {stage.upper()} {target}  agent={opts.work_model} sandbox={sandbox}")
+        log(f"[dry-run] would {stage.upper()} {target}  agent={opts.work_model} "
+            f"sandbox={'bubble' if bubble else 'host'}")
         return 0
-    # Real execution arrives with the agent (M8/M9), review-in-bubble (M9b), and pre-passes (M11).
-    raise Die(f"{stage}: real execution not yet wired (milestone 8+); use --dry-run")
+    fn = {"review": do_review, "fix": do_fix, "fix-ci": do_fix_ci, "rebase": do_rebase,
+          "bump": do_bump, "roadmap": do_roadmap}[stage]
+    return fn(w, sv, c, opts, bubble)
+
+
+# --- the work units (host path here; bubble path lands in M9) ---------------
+
+def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
+    pr, head = c.pr, c.head
+    reviewers = opts.work_model
+    if reviewers in ("auto", ""):
+        raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
+    errkey = f"review-err-{pr}"
+    nrnd = w.rs.review_rounds(pr, w.counters)
+    log(f"reviewing PR #{pr} @ {head[:12]} (review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget, reviewers={reviewers})")
+    if bubble:
+        rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
+    else:
+        rc = subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
+                             str(pr), "--store", str(w.cfg.store_dir), "--post",
+                             "--reviewer", reviewers, "--expect-head", head]).returncode
+    if rc == 0:
+        w.counters.write(errkey, 0)
+        w.rs.bust(pr)
+    else:
+        w.counters.incr(errkey)
+    return rc
+
+
+def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool,
+                *, prompt_file: str, label: str) -> Optional[int]:
+    """Shared shape for fix / fix-ci / rebase: take the branch claim, then run the agent against the PR
+    branch — in bubble (it checks out the PR inside the container) or on the host checkout."""
+    pr, head = c.pr, c.head
+    p = next((x for x in sv.open_prs if x.number == pr), None)
+    if p is None:
+        raise Die(f"{label}: PR #{pr} vanished from the survey")
+    if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
+        return None   # claimed elsewhere → caller tries the next candidate
+    prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name)
+    if bubble:
+        rc = run_in_bubble(w, f"{TAUCETI}/pull/{pr}", prompt, opts)   # bubble checks out the PR inside
+    else:
+        if not prepare_checkout(w.cfg):
+            log(f"checkout failed for #{pr} — skipping this attempt")
+            return 1
+        co = w.cfg.checkout
+        if subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co)).returncode:
+            log(f"gh pr checkout #{pr} failed — skipping this attempt")
+            return 1
+        rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
+        os.environ["TAUCETI_PUSH_EXPECT"] = (rev.stdout.strip() or head)   # CAS against what we checked out
+        rc = run_agent_host(co, prompt, opts.work_model)
+    if rc == 0:
+        w.rs.bust(pr)
+    return rc
+
+
+def do_fix(w, sv, c, opts, bubble) -> Optional[int]:
+    pr, head = c.pr, c.head
+    w.counters.incr(f"fix-{pr}-{head[:12]}")   # count up front (an un-checkout-able PR mustn't loop)
+    w.counters.incr(f"fix-pr-{pr}")
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix")
+
+
+def do_fix_ci(w, sv, c, opts, bubble) -> Optional[int]:
+    pr, head = c.pr, c.head
+    w.counters.incr(f"ci-{pr}-{head[:12]}")
+    w.counters.incr(f"ci-pr-{pr}")
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci")
+
+
+def do_rebase(w, sv, c, opts, bubble) -> Optional[int]:
+    w.counters.incr(f"rebase-pr-{c.pr}")
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase")
+
+
+def do_bump(w, sv, c, opts, bubble) -> int:
+    tip = c.head
+    branch = f"{BUMP_BRANCH_PREFIX}-{tip[:12]}"
+    w.counters.incr(f"bump-{tip[:12]}")
+    log(f"bump to mathlib master {tip[:12]} with {opts.agent_name} ({'bubble' if bubble else 'host'})")
+    prompt = fill_prompt(HERE / "prompts" / "bump.md", TARGET=tip, BRANCH=branch, AGENT=opts.agent_name)
+    if bubble:
+        return run_in_bubble(w, TAUCETI, prompt, opts)            # M9
+    if not prepare_checkout(w.cfg):
+        raise Die("checkout failed")
+    return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
+
+
+def do_roadmap(w, sv, c, opts, bubble) -> int:
+    focus = c.reason or "any"
+    refs = w.cfg.state / "refs"
+    if not fetch_ref(ROADMAP, refs / "roadmap"):
+        raise Die(f"fetch {ROADMAP} failed")
+    if not fetch_ref(REVIEW, refs / "review"):
+        raise Die(f"fetch {REVIEW} failed")
+    os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
+    log(f"roadmap round with {opts.agent_name} ({'bubble' if bubble else 'host'}; focus: {focus})")
+    if bubble:
+        return run_in_bubble(w, TAUCETI, fill_prompt(
+            HERE / "prompts" / "roadmap.md", FOCUS=focus, AGENT=opts.agent_name,
+            ROADMAP_DIR="/opt/roadmap", REVIEW_DIR="/opt/review"), opts,
+            mounts=[f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"])  # M9
+    if not prepare_checkout(w.cfg):
+        raise Die("checkout failed")
+    prompt = fill_prompt(HERE / "prompts" / "roadmap.md", FOCUS=focus, AGENT=opts.agent_name,
+                         ROADMAP_DIR=str(refs / "roadmap"), REVIEW_DIR=str(refs / "review"))
+    return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
 
 
 # Housekeeping pre-passes (real execution lands in M11; here they dry-run / no-op so the picker runs).
-def prepass_merge(cfg, gh, rs, sv: Survey, dry: bool) -> None:
+def prepass_merge(w: Worker, sv: Survey, dry: bool) -> None:
     for c in sv.mergeable_now:
         if c.provenance in ("stale", "fetch_failed"):
             log(f"merge: skip #{c.pr} — scoreboard provenance={c.provenance} (refuse to act on stale data)")
@@ -1030,14 +1556,14 @@ def prepass_merge(cfg, gh, rs, sv: Survey, dry: bool) -> None:
         log(f"[dry-run] would merge #{c.pr} ({c.reason})" if dry else f"merge: #{c.pr} (M11)")
 
 
-def prepass_dedup(cfg, gh, sv: Survey, dry: bool) -> None:
+def prepass_dedup(w: Worker, sv: Survey, dry: bool) -> None:
     for tid, prs in sv.dup_groups.items():
         for pr in prs[1:]:
             log(f"[dry-run] would close duplicate #{pr} (target '{tid}', keep #{prs[0]})"
                 if dry else f"dup-sweep: #{pr} (M11)")
 
 
-def prepass_abandon(cfg, gh, rs, sv: Survey, dry: bool) -> None:
+def prepass_abandon(w: Worker, sv: Survey, dry: bool) -> None:
     for c in sv.abandon_eligible:
         if c.provenance in ("stale", "fetch_failed"):
             log(f"abandon: skip #{c.pr} — provenance={c.provenance}")
@@ -1232,28 +1758,107 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     cfg = Config.resolve(getattr(args, "worker_id", None))
     if getattr(args, "loop", False) and not one_round:
         raise SystemExit("tauceti work --loop: the driver loop lands in milestone 12 — one round works now")
-    gh = GitHub()
-    rs = ReviewState(cfg, gh)
-    counters = Counters(cfg)
-    # work_model: a forced/aliased agent runs directly; 'auto' is resolved by the pacer in the loop
-    # (milestone 12). For a single round, 'auto' shows as 'auto' in dry-run and is resolved at M12.
-    work_model = agent if agent != "auto" else "auto"
-    opts = RoundOpts(only=only, agent=agent, work_model=work_model,
-                     sandbox_host=getattr(args, "host", False), dry_run=getattr(args, "dry_run", False),
-                     no_pace=getattr(args, "no_pace", False), quota_cmd=getattr(args, "quota_cmd", None))
-    return run_round(cfg, gh, rs, counters, opts)   # NoProgress/Die propagate to main()'s handler
+    dry = getattr(args, "dry_run", False)
+    no_pace = getattr(args, "no_pace", False)
+
+    with RoundContext(cfg) as ctx:   # one round per worker; cleanup + SIGTERM/SIGINT handling
+        # Lifecycle test hooks (no GitHub, no model, no mutation) — exercise lock / fd-leak / timeout.
+        hb = os.environ.get("TAUCETI_TEST_HEARTBEAT")
+        if hb:
+            Claims(cfg, ctx).start_heartbeat("branch/test")
+            log(f"[test] heartbeat started; holding {hb}s then exiting")
+            time.sleep(int(hb))
+            return 0
+        hold = os.environ.get("TAUCETI_TEST_HOLD")
+        if hold:
+            subprocess.Popen(["sleep", hold])   # grandchild; close_fds=True ⇒ must NOT inherit the lock fd
+            log(f"[test] spawned 'sleep {hold}' grandchild, round exiting immediately")
+            return 0
+        slp = os.environ.get("TAUCETI_TEST_SLEEP")
+        if slp:
+            log(f"[test] holding the lock and sleeping {slp}s")
+            time.sleep(int(slp))
+            return 0
+
+        work_model = resolve_work_model(cfg, agent, dry=dry, no_pace=no_pace)
+        gh = GitHub()
+        w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
+        opts = RoundOpts(only=only, agent=agent, work_model=work_model,
+                         sandbox_host=getattr(args, "host", False), dry_run=dry,
+                         no_pace=no_pace, quota_cmd=getattr(args, "quota_cmd", None))
+        if not dry:
+            preflight(cfg, opts)
+        return run_round(w, opts)   # NoProgress/Die propagate to main()'s handler
+
+
+def resolve_work_model(cfg: Config, agent: str, *, dry: bool, no_pace: bool) -> str:
+    """Turn the --agent dial into the concrete model to run. 'auto' consults the pacer (codex preferred,
+    opus fallback). OpenRouter agents are pay-per-token (no pacing). Dry-run leaves it symbolic."""
+    if dry:
+        return agent
+    if agent in OPENROUTER_MODELS:
+        return agent
+    if no_pace:
+        if agent == "auto":
+            raise SystemExit("--no-pace needs an explicit --agent (codex/claude); 'auto' can't choose without the pacer")
+        return agent
+    chosen, _snap = Quota(cfg).choose(None if agent == "auto" else agent)
+    if chosen is None:
+        raise NoProgress(f"no model under pace right now (agent={agent}) — nothing to run this round")
+    return chosen
 
 
 def cmd_tui(args) -> int:
     raise SystemExit("tauceti TUI: not yet implemented (milestone 13). Try `tauceti status` or `tauceti work`.")
 
 
+def _have(tool: str) -> bool:
+    import shutil
+    return shutil.which(tool) is not None
+
+
 def cmd_doctor(args) -> int:
-    raise SystemExit("tauceti doctor: not yet implemented (milestone 9)")
+    """Report which capabilities the environment can do, and suggest --host where bubble is missing."""
+    cfg = Config.resolve(getattr(args, "worker_id", None))
+    rows: list[tuple[str, bool, str]] = []
+    for t in ("gh", "git", "jq", "uvx"):
+        rows.append((t, _have(t), "required" if t in ("gh", "git") else
+                     ("review engine" if t == "uvx" else "claim.sh needs it")))
+    gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
+    rows.append(("gh auth", gh_auth, "logged in as kim-em"))
+    rows.append(("lake", _have("lake"), "host authoring (--host) builds with it"))
+    rows.append(("bubble", _have("bubble"), "default sandbox; without it pass --host"))
+    rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
+    # Quota credentials (read-only).
+    rows.append(("codex creds", (cfg.home / ".codex" / "auth.json").exists(), "~/.codex/auth.json"))
+    rows.append(("claude creds", (cfg.home / ".claude" / ".credentials.json").exists(),
+                 "~/.claude/.credentials.json"))
+    bad = 0
+    print(f"tauceti doctor — worker '{cfg.wid}'")
+    for name, ok, note in rows:
+        mark = "ok " if ok else "MISSING"
+        if not ok and name in ("gh", "git", "gh auth"):
+            bad += 1
+        print(f"  [{mark:7}] {name:14} {note}")
+    if not _have("bubble"):
+        print("  note: bubble missing → every model mode needs --host (the host path still works).")
+    return 1 if bad else 0
 
 
-def cmd_heartbeat(args) -> int:
-    raise SystemExit("tauceti _heartbeat: not yet implemented (milestone 7)")
+def preflight(cfg: Config, opts: "RoundOpts") -> None:
+    """Fail a round early if its chosen mode can't run, rather than partway through."""
+    for t in ("gh", "git"):
+        if not _have(t):
+            raise Die(f"preflight: missing '{t}' on PATH")
+    if want(opts.only, "review") and not _have("uvx"):
+        raise Die("preflight: review needs 'uvx' on PATH (the tauceti-review engine)")
+    needs_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
+    needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s))
+    if needs_bubble and not _have("bubble"):
+        raise Die("preflight: bubble is the default for model modes but is not on PATH — pass --host, "
+                  "or install kim-em/bubble")
+    if needs_host_build and not _have("lake") and not opts.dry_run:
+        raise Die("preflight: --host authoring needs an elan/lake toolchain on PATH (or drop --host)")
 
 
 if __name__ == "__main__":
