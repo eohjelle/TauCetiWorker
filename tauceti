@@ -1287,15 +1287,19 @@ def _bubble_pop(cfg: Config, env: dict) -> None:
 
 
 def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
-                  mounts: Optional[list[str]] = None) -> int:
-    """Open a fresh repo-scoped bubble for target, run the work model on prompt inside it, pop it."""
+                  mounts: Optional[list[str]] = None, *,
+                  inner_cmd: Optional[str] = None, cred_model: Optional[str] = None) -> int:
+    """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
+    work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
+    something else in the same sandbox (e.g. the review engine — see review_in_bubble)."""
     import shlex
     cfg, wm = w.cfg, opts.work_model
-    if wm in OPENROUTER_MODELS and not os.environ.get("TAUCETI_ALLOW_OPENROUTER_BUBBLE"):
+    cred_model = cred_model or wm
+    if cred_model in OPENROUTER_MODELS and not os.environ.get("TAUCETI_ALLOW_OPENROUTER_BUBBLE"):
         # The bubble image needs `pi` + openrouter.ai egress (kim-em/bubble#299); until then this fails
         # at `pi: command not found`. Fail early with a clear pointer rather than after staging.
-        raise Die(f"--agent {wm} requires --host until kim-em/bubble#299 lands pi in the bubble image "
-                  f"(set TAUCETI_ALLOW_OPENROUTER_BUBBLE=1 to override once it has)")
+        raise Die(f"--agent {cred_model} requires --host until kim-em/bubble#299 lands pi in the bubble "
+                  f"image (set TAUCETI_ALLOW_OPENROUTER_BUBBLE=1 to override once it has)")
     env = ensure_bubble_home(cfg)
     rounddir = cfg.state / "bubble-round"
     import shutil
@@ -1328,10 +1332,10 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    command = f"{tcenv} {agent_inner_cmd(wm)}"
+    command = f"{tcenv} {inner_cmd or agent_inner_cmd(wm)}"
 
     argv = ["bubble", "open", target, "--shell", "--local", "--name", bubble_name(cfg), "--ephemeral",
-            "--github-security", "allowlist-write-graphql", *mount_flags, *agent_cred_flags(wm),
+            "--github-security", "allowlist-write-graphql", *mount_flags, *agent_cred_flags(cred_model),
             "--command", command]
 
     if os.environ.get("TAUCETI_AGENT_ECHO"):
@@ -1345,7 +1349,16 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
 
 
 def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "RoundOpts") -> int:
-    raise Die("review-in-bubble lands in milestone 9b — use --host for now")
+    """Run the tauceti-review engine INSIDE bubble — defense in depth over the engine's own read-only-
+    tool clean room. UNTESTED: needs an Incus-capable host (see docs/BUBBLE_TESTING.md). Integration
+    unknowns to validate there: (1) the bubble image must have `uvx` (uv); (2) reviewing a community
+    FORK PR must work through the repo-scoped proxy (base-repo PR API); (3) the reviewer model's
+    credential is seeded via agent_cred_flags(reviewers). The store is container-local + ephemeral
+    (the GitHub scoreboard is the source of truth, re-read via gh_meta next round)."""
+    inner = (f"uvx --from git+https://github.com/{REVIEW} tauceti-review {pr} "
+             f"--store /tmp/tauceti-review-store --post --reviewer {reviewers} --expect-head {head}")
+    # target is the PR so bubble checks it out; prompt unused by the engine.
+    return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, inner_cmd=inner, cred_model=reviewers)
 
 
 # ============================================================================
