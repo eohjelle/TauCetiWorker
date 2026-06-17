@@ -3,3 +3,11 @@
 /checkouts/
 /state/
 /logs/
+
+# Python bytecode (tauceti is a single-file script; tests import it).
+__pycache__/
+*.pyc
+
+# Build artifacts
+/dist/
+*.egg-info/
