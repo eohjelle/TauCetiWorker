@@ -1,209 +1,180 @@
 # Tau Ceti Worker
 
-`tauceti` is an autonomous worker that keeps the
-[TauCeti](https://github.com/FormalFrontier/TauCeti) Lean library moving forward
-on your Claude Max / Codex subscriptions. It runs unattended: each round it picks
-the single most useful thing to do right now — land a green PR, review an open
-one, fix a PR a review flagged, bump Mathlib, or author a new PR against the
-roadmap — does exactly that one thing, and sleeps until quota allows the next
-round.
+`tauceti` keeps the [TauCeti](https://github.com/FormalFrontier/TauCeti) Lean
+library moving, on your Claude Max / Codex subscriptions. Run it with no command
+and you get a dashboard of the work the queue needs right now: PRs to review,
+fixes a review asked for, a Mathlib bump that needs adapting, roadmap targets.
+From there you launch whatever you want. Pin a worker to one kind of work with
+`--only` (a reviewer, an author, a fixer), or hand the whole thing to `--loop`
+and let it pick the most useful job each round until you stop it.
 
-It's one self-contained program (`tauceti`, a single Python file run via
-[`uv`](https://docs.astral.sh/uv/)). Run it with **no command** for a dashboard
-of available work plus a launcher; `tauceti work` does the work; `tauceti status`
-prints the same survey for scripts.
-
-> The worker is wired to one deployment: it acts as `kim-em` on
-> `FormalFrontier/TauCeti`. The repo/owner are not configurable knobs — this is
-> an operator's tool for that project, not a general framework.
-
-## What one round does
-
-Every round performs **one** unit of work, chosen in strict priority order. The
-first applicable step wins; the rest wait for a later round.
-
-| # | Step | What it does |
-|---|------|--------------|
-| 0 | **Housekeeping** | *(always, quota-free)* Merge every PR already green-lit by review (and forward Lake-pin bumps re-validated by `check-bump` at merge time); close PRs that spent their whole review budget without going green; close duplicate roadmap PRs. CI-side merge is intentionally off, so the worker is the only thing that lands or retires PRs. |
-| 1 | **Rebase** | Resolve a conflicting PR of ours (usually the root `TauCeti.lean` import line, after a sibling merged first). |
-| 2 | **Review** | Review an open PR whose current head is green but not yet reviewed, via the `tauceti-review` CLI. |
-| 3 | **Fix** | Address the findings on one of our PRs whose latest review requests changes (🟡) or blocks (⛔) — fix the code, or contest a wrong finding on its thread. |
-| 4 | **Fix CI** | Green a PR of ours whose `build` check has failed at head (it can't be reviewed until it builds). |
-| 5 | **Bump** | If Mathlib `master` has moved past our pin and no bump PR is open, bump `lean-toolchain` + `lake-manifest.json` to master and fix whatever breaks in `TauCeti/`. |
-| 6 | **Roadmap** | Otherwise, start a new PR advancing a [roadmap](https://github.com/FormalFrontier/TauCetiRoadmap) target. |
-
-A GitHub API failure **aborts** the round rather than being read as "nothing to
-do" — a transient outage never silently falls through to authoring.
+It runs as your authenticated `gh` account: you set up `gh auth`, and the worker
+acts as that account (and treats `kim-em`'s PRs as "ours"). The repo is hardwired
+to `FormalFrontier/TauCeti`. This is an operator's tool for that project, not a
+general framework.
 
 ## Quickstart
 
+Install it as a tool, no clone needed:
+
 ```bash
-./tauceti                  # dashboard of available work + a launcher (the default view)
-./tauceti status           # the same survey, non-interactive (add --json for scripts)
-./tauceti work             # do whatever is most helpful — exactly one round, then exit
-./tauceti work --loop      # the driver: round after round, pacing itself against quota
+uv tool install git+https://github.com/kim-em/TauCetiWorker.git
+
+tauceti                            # the dashboard: see the available work, launch it
+tauceti status                     # the same survey, non-interactive (--json for scripts)
+tauceti work --only review         # one round of a specific kind of work, then exit
+tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / roadmap / ...)
+tauceti work --loop                # fully automatic: keep picking the most useful job
 ```
 
-`tauceti` is a single file with a [PEP 723](https://peps.python.org/pep-0723/)
-header; the `uv` shebang resolves its one dependency (`rich`, for the dashboard)
-on first run. Press Ctrl-C to stop the current round and exit. Per-round output
-from the loop lands in `logs/<worker-id>/`.
+From a clone of this repo you can also just run `./tauceti` (it's a single `uv`
+script), and every command above works the same. Either way, Ctrl-C stops the
+current round and exits, and `tauceti doctor` checks your environment and tells
+you what's missing.
 
-Run `./tauceti doctor` first to check the environment (tools, bubble, quota
-credentials); it tells you exactly what's missing and when to pass `--host`.
+## What a round does
+
+A round does exactly one unit of work: the first of these that applies.
+
+| Step | What it does |
+|------|--------------|
+| **Rebase** | Resolve one of our conflicting PRs (usually the root `TauCeti.lean` import line, after a sibling merged first). |
+| **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. |
+| **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
+| **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
+| **Bump** | Adapt a red `hopscotch/lkg-bump` PR (the review bot opens those to move Mathlib forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
+| **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/FormalFrontier/TauCetiRoadmap) target. |
+
+Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
+the worker. A GitHub API failure aborts the round rather than reading as "nothing
+to do", so a transient outage never falls through to authoring.
 
 ## Modes
 
-Three independent dials. Leave them at their defaults and the worker does
-whatever is most helpful, on whatever subscription has quota. Turn any of them and
-you get a focused worker. They combine freely.
+There are three dials: which work (`--only`), which agent (`--agent`), and where
+it runs (`--host`). They're independent, so combine them however you like.
 
-### 1. What work — `--only` (default: the whole cascade)
+### What work: `--only`
 
-By default a round walks the full priority cascade above and does the first
-applicable step. `--only <task>[,<task>...]` confines it to certain kinds of work:
+With no `--only`, a round walks the whole cascade and does the first job that
+applies. `--only <task>[,<task>...]` pins it to particular kinds:
 
 ```bash
-./tauceti work --loop --only review        # a reviewer: only review open PRs
-./tauceti work --loop --only roadmap       # an author: only open new roadmap PRs
-./tauceti work --loop --only fix,fix-ci    # a maintainer: only tend to our own PRs
-./tauceti work --loop --only bump          # only keep us current with Mathlib master
-./tauceti work --loop --only merge         # a janitor: only land/abandon/dedup (no model)
+tauceti work --loop --only review     # only review open PRs
+tauceti work --loop --only roadmap    # only open new roadmap PRs
+tauceti work --loop --only fix,fix-ci # only tend to our own PRs
+tauceti work --loop --only bump       # only adapt broken hopscotch bump PRs
 ```
 
-Valid tasks are the step names: `rebase`, `review`, `fix`, `fix-ci`, `bump`,
-`roadmap`, and `merge`. The **housekeeping pre-passes always run** in every mode
-— a focused worker still lands green PRs and clears stuck/duplicate ones — so the
-queue stays healthy no matter what each worker is pinned to. `--only merge` is the
-special case: it names *housekeeping only*, drives no model, and skips the quota
-wait entirely — a cheap janitor to run alongside model-spending workers.
+The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
 
-### 2. Which agent — `--agent` (default: auto)
+### Which agent: `--agent`
 
-`--agent` is orthogonal to `--only`, so any kind of work can run on any agent:
+`--agent` is independent of `--only`, so any kind of work can run on any agent:
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` *(default)* | Codex preferred (to spare the scarcer Opus), Opus fallback | subscription, paced |
+| `auto` (default) | Codex preferred, Opus fallback | subscription, paced |
 | `codex` | Codex only | subscription, paced |
 | `claude` | Opus only | subscription, paced |
-| `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | **pay-per-token** (`OPENROUTER_API_KEY`) |
-| `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | **pay-per-token** (`OPENROUTER_API_KEY`) |
+| `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
+| `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
-The old `--codex` / `--claude` / `--deepseek` / `--minimax` flags still work as
-aliases. A configured default can be set with `TAUCETI_AGENT`. The OpenRouter
-agents are pay-per-token, so there is **no auto-dispatch** — they run only when
-named (the flag is the budget gate). Override a model id with `DEEPSEEK_MODEL` /
-`MINIMAX_MODEL`; point at a non-default `pi` runner with `PI_RUN`.
+Set a default with `TAUCETI_AGENT`. The OpenRouter agents are pay-per-token, so
+they never run on their own; you have to ask for them by name. Override their
+model ids with `DEEPSEEK_MODEL` / `MINIMAX_MODEL`, and point at a non-default `pi`
+runner with `PI_RUN`.
 
-### 3. Where it runs — bubble by default, `--host` to opt out
+### Where it runs: bubble, or `--host`
 
-Every model-running mode — `rebase`, `fix`, `fix-ci`, `bump`, `roadmap`, **and
-`review`** — runs its agent inside the [`bubble`](https://github.com/kim-em/bubble)
-sandbox by default: a repo-scoped container where the host `kim-em` token never
-enters (git/gh go through bubble's auth proxy), only the one credential the model
-needs is seeded, and no host config crosses the boundary. Pass `--host` to opt out
-(faster, but the agent has the host's full credentials and network) — for
-trusted/local runs.
+Every round runs its agent inside a [`bubble`](https://github.com/kim-em/bubble)
+sandbox by default. That's a repo-scoped container: your `gh` token never enters
+it (git and gh go through bubble's auth proxy), only the one credential the agent
+needs is seeded, and none of your host config crosses the boundary. That matters
+most for review, where the agent reads untrusted PRs.
 
-Bubble needs a working **Incus** runtime; `tauceti doctor` reports whether it's
-available, and without it you pass `--host`. See [Sandboxing](#sandboxing).
+`--host` opts out and runs the agent directly on the host. It's faster, but the
+agent has your full credentials and network, so keep it for trusted or local
+runs. Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime;
+if you don't have one, `tauceti doctor` says so and you run with `--host`. You
+don't have to install bubble yourself, `tauceti` fetches it with `uvx` when it
+isn't already on your `PATH`.
 
-### Combining
+## Pacing against quota
 
-```bash
-./tauceti work --loop                       # auto agent, all work
-./tauceti work --loop --only roadmap --codex # a Codex-only roadmap author
-./tauceti work --loop --only fix --host     # a host-side fixer (no bubble)
-./tauceti work --loop --only merge          # a quota-free janitor
-./tauceti work --only review --host         # one host-side review round, then exit
-```
+`tauceti` paces itself against your subscription quota with no setup. It reads the
+credential files the official CLIs already maintain (`~/.claude/.credentials.json`,
+`~/.codex/auth.json`) and queries each provider's usage endpoint. The rule is
+"keep usage under elapsed time": a provider is available while `used% ≤ elapsed%`
+on both its 5-hour and its weekly window. Auto mode prefers Codex (to spare the
+scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
+can't read usage, it treats the provider as unavailable rather than guessing it's
+free.
 
-## Quota: the self-contained pacer
+`--ignore-quota` turns the pacer off (then pass an explicit `--agent`).
+`--quota-cmd <cmd>` (or `TAUCETI_QUOTA_CMD`) swaps in your own pacer instead: it's
+run as `<cmd> <agent>`, and its first line of stdout is the model to run now, or
+empty for "wait".
 
-`tauceti` paces itself with **no dependency on any external scripts** — it reads
-the standard credential files the official CLIs already maintain
-(`~/.claude/.credentials.json`, `~/.codex/auth.json`) and queries each provider's
-usage endpoint directly. The rule is "keep usage below elapsed time": a provider
-is available only while `used% ≤ elapsed%` on **both** its session (5-hour) and
-weekly windows. Auto mode prefers Codex (to spare the scarcer Opus), falls back to
-Opus, and sleeps when neither is under pace. Missing or unparseable usage reads as
-*unavailable* (fail closed), never as free quota.
+## Inside the sandbox
 
-`--ignore-quota` disables the gate (then name an explicit `--agent`). `--quota-cmd
-<cmd>` (or `TAUCETI_QUOTA_CMD`) replaces the built-in pacer with an external
-command — the escape hatch for a custom or multi-account scheme: it's run as
-`<cmd> <agent>` and its first stdout token is the model to run now (or empty for
-"none available").
+In a bubble round the checkout, `lake build`, and every git/gh call happen inside
+the container:
 
-## Sandboxing
+- GitHub traffic goes through bubble's auth proxy, scoped to
+  `FormalFrontier/TauCeti`. A push or API call outside that repo is rejected by
+  the proxy, not just flagged by CI later.
+- Only the one credential the agent needs is seeded. The other models'
+  credentials, and all your host config (`CLAUDE.md`, skills), stay out.
+- Review runs the `tauceti-review` engine inside the container too, offline: the
+  engine, the roadmap, and the review store are mounted in, and it runs on the
+  image's `python3` with no PyPI or cross-repo fetch. The only traffic crossing
+  the proxy is the TauCeti clone, the PR API, and the scoreboard post.
+- The shared Mathlib cache is an overlay, so one round can't poison a later build,
+  and the container is ephemeral.
 
-In a bubble round the checkout, `lake build`, and every `git`/`gh` call happen
-**inside** a repo-scoped container:
+The sandbox itself lives at [kim-em/bubble](https://github.com/kim-em/bubble).
 
-- **GitHub** — the host token never enters; all traffic goes through bubble's auth
-  proxy, scoped to `FormalFrontier/TauCeti`, so a push or API call outside that
-  repo is rejected by the proxy, not merely flagged by CI afterward.
-- **Credentials** — only the one credential the work model needs is seeded
-  (`--codex-credentials` / `--claude-credentials`, or the `OPENROUTER_API_KEY`
-  mounted read-only for the OpenRouter agents). The others, and all host config
-  (CLAUDE.md, skills), stay out.
-- **Isolation** — a worker-private `BUBBLE_HOME` (override via `$TAUCETI_BUBBLE_HOME`)
-  and `--local` keep a round from inheriting ambient mounts or a remote/cloud
-  default; the shared Mathlib cache is an overlay so one round can't poison a
-  later build. The container is `--ephemeral` and explicitly popped on teardown.
+> OpenRouter agents under bubble need `pi` and openrouter.ai egress in the bubble
+> image ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)). Until
+> that lands, run `--agent deepseek|minimax` with `--host`.
 
-**Review** runs the `tauceti-review` engine inside bubble too, offline: the engine,
-the roadmap, and the persistent review store are pre-staged as host→container
-mounts and run with the image's `python3` (no PyPI/uvx, no cross-repo fetch), so
-the only traffic crossing the proxy is the TauCeti code clone + PR API + scoreboard
-post — a hard container boundary around a model reading untrusted PR content. `--host`
-falls back to host-side review (the engine's own read-only-tool clean room).
-
-> OpenRouter agents under bubble need `pi` + openrouter.ai egress in the image
-> ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)); until that
-> lands, `--agent deepseek|minimax` requires `--host` (it fails early otherwise).
-
-## Running many workers on one host
+## Many workers at once
 
 Each worker namespaces its state, checkout, review store, and logs by id, so
-copies on one host don't collide:
+several can share a host:
 
 ```bash
-./tauceti work --loop --worker-id alice --isolate-home --only review --host
-./tauceti work --loop --worker-id bob   --isolate-home --only roadmap
+tauceti work --loop --worker-id alice --isolate-home --only review
+tauceti work --loop --worker-id bob   --isolate-home --only roadmap
 ```
 
-`--worker-id` pins a stable name; `--isolate-home` gives each worker its own HOME
-(symlinking the read-only Claude tool surface from yours, copying the mutable
-auth in once) so their credential refreshes don't race. Coordination between
-workers is through GitHub: the per-PR scoreboard comment is the shared review
-state, a create-only push arbiter (`git-safe-push` / `gh-safe-pr-create`)
-serializes writes, and `claim.sh` provides cooperative de-contention — so adding
-workers grows throughput without two of them clobbering each other.
+`--worker-id` pins a stable name. `--isolate-home` gives each worker its own
+`$HOME` (symlinking your read-only Claude tool surface, copying the mutable auth
+in once) so their credential refreshes don't race. The workers coordinate through
+GitHub, not through each other: the per-PR scoreboard comment is the shared review
+state, `git-safe-push` / `gh-safe-pr-create` compare-and-swap so no one clobbers
+another's push, and `claim.sh` hands out branches. Add workers and throughput goes
+up.
 
-## Prerequisites
+## What you need
 
-On `PATH`, logged in to the subscriptions you want used:
+- Always: `gh` (logged in as the account the worker should act as), `git`, `uv`,
+  and `jq`.
+- Bubble (the default sandbox): a working Incus runtime. `tauceti` fetches the
+  bubble CLI itself.
+- `--host` authoring: an `elan`/`lake` toolchain on the host.
+- The agents you want: `codex` and/or `claude` logged in, and for
+  `--agent deepseek|minimax`, `pi` plus an exported `OPENROUTER_API_KEY`.
 
-- **Always:** `gh` (as `kim-em`), `git`, `jq`, and `uv`/`uvx`.
-- **Reviewing:** the `tauceti-review` engine runs via `uvx`.
-- **Sandbox (default for authoring):** [`bubble`](https://github.com/kim-em/bubble)
-  and a working Incus runtime; the Lean toolchain lives in the container image.
-- **`--host` authoring:** an `elan`/`lake` toolchain on the host.
-- **Subscription agents:** `claude` (Claude Code, Opus) and/or `codex` (ChatGPT) on
-  the host, logged in.
-- **`--agent deepseek|minimax`:** the [`pi`](https://github.com/badlogic/pi-mono)
-  agent on `PATH` and `OPENROUTER_API_KEY` **exported**.
+`tauceti doctor` checks all of this.
 
-`./tauceti doctor` checks all of this and tells you what's missing.
+## What's in the repo
 
-## What lives here
-
-- `tauceti` — the single-file program (the whole worker).
-- `claim.sh`, `git-safe-push`, `gh-safe-pr-create` — the agent-facing coordination
-  wrappers; the agents invoke these on `PATH` inside a round, so they stay shell.
-- `prompts/*.md` — the per-task agent prompts.
-- `tests/` — `parity_selectors.py` (the survey's selectors), `lifecycle.sh`
-  (lock / signals / timeout / fd handling), `agent_cmds.py` (agent command lines).
-- `checkouts/`, `state/`, `logs/` are runtime-only and git-ignored.
+- `tauceti`: the worker, one Python file ([PEP 723](https://peps.python.org/pep-0723/);
+  `uv` resolves its one dependency, `rich`).
+- `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
+  these on `PATH` inside a round, so they stay shell.
+- `prompts/*.md`: the per-task agent prompts.
+- `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`.
+- `checkouts/`, `state/`, `logs/`: runtime only, git-ignored.
