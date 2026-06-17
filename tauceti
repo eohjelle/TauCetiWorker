@@ -1699,6 +1699,8 @@ def build_parser() -> argparse.ArgumentParser:
     hb = sub.add_parser("_heartbeat", add_help=False)
     hb.add_argument("key")
     hb.add_argument("--ppipe", type=int, default=None)
+    ep = sub.add_parser("_egress-probe", add_help=False)
+    ep.add_argument("--worker-id", dest="worker_id", default=None)
     return p
 
 
@@ -1719,6 +1721,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_doctor(args)
     if cmd == "_heartbeat":
         return cmd_heartbeat(args)
+    if cmd == "_egress-probe":
+        return cmd_egress_probe(args)
     parser.print_help()
     return 64
 
@@ -1843,6 +1847,27 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         if not dry:
             preflight(cfg, opts)
         return run_round(w, opts)   # NoProgress/Die propagate to main()'s handler
+
+
+def cmd_egress_probe(args) -> int:
+    """Open a review-posture bubble (same flags as review_in_bubble) and assert the network boundary:
+    the TauCeti-scoped proxy is reachable but arbitrary egress is denied. This is the property that makes
+    a tool-using reviewer safe — re-run it whenever the bubble image / security policy changes, and once
+    review gains tool use. Prints PROXY_OK + EGRESS_BLOCKED on success; tests/egress.sh asserts both."""
+    cfg = Config.resolve(getattr(args, "worker_id", None))
+    # set +e so a non-zero curl (the blocked case) doesn't abort the script before we print the verdict.
+    probe = ("sh -lc 'set +e; "
+             "if gh auth token >/dev/null 2>&1 && gh api /repos/FormalFrontier/TauCeti >/dev/null 2>&1; "
+             "then echo PROXY_OK; else echo PROXY_FAIL; fi; "
+             "if curl -sS --max-time 10 -o /dev/null https://example.com 2>/dev/null; "
+             "then echo EGRESS_LEAK; else echo EGRESS_BLOCKED; fi'")
+    with RoundContext(cfg) as ctx:
+        gh = GitHub()
+        w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
+        opts = RoundOpts(only=["review"], agent="claude", work_model="claude",
+                         sandbox_host=False, dry_run=False)
+        # No mounts; cred_model=claude just satisfies bubble's credential flags (the probe runs no model).
+        return run_in_bubble(w, TAUCETI, "", opts, inner_cmd=probe, cred_model="claude")
 
 
 def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
