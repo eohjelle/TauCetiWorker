@@ -98,22 +98,16 @@ named (the flag is the budget gate). Override a model id with `DEEPSEEK_MODEL` /
 
 ### 3. Where it runs — bubble by default, `--host` to opt out
 
-The authoring/fixing modes (`rebase`, `fix`, `fix-ci`, `bump`, `roadmap`) run the
-work agent inside the [`bubble`](https://github.com/kim-em/bubble) sandbox by
-default: a repo-scoped container where the host `kim-em` token never enters
-(git/gh go through bubble's auth proxy), only the one credential the work model
+Every model-running mode — `rebase`, `fix`, `fix-ci`, `bump`, `roadmap`, **and
+`review`** — runs its agent inside the [`bubble`](https://github.com/kim-em/bubble)
+sandbox by default: a repo-scoped container where the host `kim-em` token never
+enters (git/gh go through bubble's auth proxy), only the one credential the model
 needs is seeded, and no host config crosses the boundary. Pass `--host` to opt out
 (faster, but the agent has the host's full credentials and network) — for
 trusted/local runs.
 
 Bubble needs a working **Incus** runtime; `tauceti doctor` reports whether it's
-available, and without it you pass `--host`. See [Sandboxing](#sandboxing) and
-[`docs/BUBBLE_TESTING.md`](docs/BUBBLE_TESTING.md).
-
-> **Review sandboxing is being finalized** — see `docs/BUBBLE_TESTING.md` for the
-> current state. Run review with `--host` until that lands; the `tauceti-review`
-> engine isolates each reviewer itself (its own credential, no host config,
-> read-only tools, throwaway HOME).
+available, and without it you pass `--host`. See [Sandboxing](#sandboxing).
 
 ### Combining
 
@@ -159,16 +153,16 @@ In a bubble round the checkout, `lake build`, and every `git`/`gh` call happen
   default; the shared Mathlib cache is an overlay so one round can't poison a
   later build. The container is `--ephemeral` and explicitly popped on teardown.
 
-Review sandboxing (running `tauceti-review` itself under containment) is in
-progress — `docs/BUBBLE_TESTING.md` tracks it; until it lands, `--host` review is
-the supported path (the engine has its own read-only-tool clean room).
+**Review** runs the `tauceti-review` engine inside bubble too, offline: the engine,
+the roadmap, and the persistent review store are pre-staged as host→container
+mounts and run with the image's `python3` (no PyPI/uvx, no cross-repo fetch), so
+the only traffic crossing the proxy is the TauCeti code clone + PR API + scoreboard
+post — a hard container boundary around a model reading untrusted PR content. `--host`
+falls back to host-side review (the engine's own read-only-tool clean room).
 
 > OpenRouter agents under bubble need `pi` + openrouter.ai egress in the image
 > ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)); until that
 > lands, `--agent deepseek|minimax` requires `--host` (it fails early otherwise).
-
-Validating the bubble paths needs an Incus-equipped machine — the checklist is
-[`docs/BUBBLE_TESTING.md`](docs/BUBBLE_TESTING.md), with `--host` as the fallback.
 
 ## Running many workers on one host
 
@@ -212,6 +206,4 @@ On `PATH`, logged in to the subscriptions you want used:
 - `prompts/*.md` — the per-task agent prompts.
 - `tests/` — `parity_selectors.py` (the survey's selectors), `lifecycle.sh`
   (lock / signals / timeout / fd handling), `agent_cmds.py` (agent command lines).
-- `docs/BUBBLE_TESTING.md` — the checklist for validating the bubble paths on an
-  Incus-equipped machine.
 - `checkouts/`, `state/`, `logs/` are runtime-only and git-ignored.
