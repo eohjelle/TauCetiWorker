@@ -1,11 +1,11 @@
 # Tau Ceti Worker
 
 `tauceti` keeps the [TauCeti](https://github.com/FormalFrontier/TauCeti) Lean
-library moving, on your Claude Max / Codex subscriptions. Run it with no command
+library moving, using a "bring your own agent" approach. Run it with no command
 and you get a dashboard of the work the queue needs right now: PRs to review,
 fixes a review asked for, a Mathlib bump that needs adapting, roadmap targets.
 From there you launch whatever you want. Pin a worker to one kind of work with
-`--only` (a reviewer, an author, a fixer), or hand the whole thing to `--loop`
+`--only` (a reviewer, a fixer, an author), or hand the whole thing to `--loop`
 and let it pick the most useful job each round until you stop it.
 
 It runs as your authenticated `gh` account: you set up `gh auth`, the worker acts
@@ -42,7 +42,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. |
 | **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
-| **Bump** | Adapt a red `hopscotch/lkg-bump` PR (the review bot opens those to move Mathlib forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
+| **Bump** | Adapt a red `hopscotch/lkg-bump` PR (the [hopscotch bot](https://github.com/leanprover-community/hopscotch) opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/FormalFrontier/TauCetiRoadmap) target. |
 
 Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
