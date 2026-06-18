@@ -66,6 +66,10 @@ MAX_FIX_ATTEMPTS = 3        # per-head: stop re-running the fixer on a commit it
                             # heads, review-budget-spent (8 rounds) is the convergence stop.
 MAX_REVIEW_ROUNDS = 8       # lifetime review budget per PR; past this we stop re-reviewing it
 MAX_REVIEW_ERRORS = 3       # give up re-trying a PR whose review keeps erroring (transient infra)
+MAX_REVIEW_CONTESTS = 10    # per-PR lifetime cap on author-contest re-reviews (no-bar: anyone may
+                            # reply, so this bounds spend; separate from the review-round budget)
+MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't starve the PR's budget
+REPLY_LEASE_TTL = 300       # seconds an in-flight contest-dispatch lease suppresses a re-fire
 MAX_CI_ATTEMPTS = 3         # per-head: stop trying to green a red-CI head
 MAX_CI_PR_ATTEMPTS = 5      # per-PR lifetime backstop for red-CI fixing
 MAX_REBASE_ATTEMPTS = 3     # per-PR: stop trying to rebase a conflicting PR
@@ -844,10 +848,48 @@ class ReviewState:
         return ""
 
     def review_rounds(self, pr: int, counters: Counters) -> int:
-        total = self.gh_meta(pr).data.get("round", 0)
-        total = total if isinstance(total, int) else 0
+        # Prefer full_rounds (full review passes; excludes reply/contest rounds) so an author's
+        # back-and-forth never eats the review-round budget; fall back to the raw round count. Guard
+        # each against a null/str meta value (an old or malformed scoreboard) rather than coercing
+        # it to 0, which would silently reset the budget.
+        m = self.gh_meta(pr).data
+        total = m.get("full_rounds")
+        if not isinstance(total, int):
+            total = m.get("round", 0)
+        if not isinstance(total, int):
+            total = 0
         base = counters.read(f"round-base-{pr}")
         return max(0, total - base)
+
+    def newest_contest_reply(self, pr: int):
+        """The newest author CONTEST reply on this PR's rubric threads, or None. A contest reply has
+        its `in_reply_to_id` pointing at a thread root carrying a `<!--tauceti-rubric:NAME-->`
+        marker. Our own comments are dropped by MARKER, never by author login: a contest answer
+        carries `tauceti-reply:` and a root carries `tauceti-rubric:`, so both are skipped, while a
+        human contest (even one sharing the worker's login) is never wrongly dropped. "Newest" is by
+        the monotonic comment `id` (not the second-resolution timestamp, which can't separate two
+        replies in one second). Returns {'id', 'rubric'} of the newest such reply."""
+        rcs = self.gh.review_comments(pr)
+        if not rcs:
+            return None
+        roots = {}
+        for c in rcs:
+            if c.get("in_reply_to_id") is None:
+                mk = re.search(r"tauceti-rubric:([a-z][a-z-]*?)\s*-->", c.get("body") or "")
+                if mk:
+                    roots[c["id"]] = mk.group(1)
+        best = None
+        for c in rcs:
+            rubric = roots.get(c.get("in_reply_to_id"))
+            if not rubric:
+                continue
+            body = c.get("body") or ""
+            if "tauceti-reply:" in body or "tauceti-rubric:" in body:
+                continue
+            cid = c.get("id") or 0
+            if best is None or cid > best["id"]:
+                best = {"id": cid, "rubric": rubric}
+        return best
 
     def ledger_blocking(self, pr: int, head: str) -> bool:
         m = self.gh_meta(pr).data
@@ -917,6 +959,7 @@ class Candidate:
     attempts: int = 0
     budget: int = 0
     provenance: str = "fresh"
+    contest: str = ""        # set to the contested rubric when this is an author-contest re-review
 
 
 @dataclass
@@ -987,19 +1030,54 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
         c.attempts = counters.read(f"rebase-pr-{p.number}"); c.budget = MAX_REBASE_ATTEMPTS
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
-    # 2) review: non-draft, build-green, current head not cleanly reviewed, under budgets.
+    # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
+    #    or an errored round → normal round-budgeted review), OR a fresh author CONTEST reply landed
+    #    since the last review at a clean head (→ contest path: bypasses the review-round budget so a
+    #    maxed-out PR can still be answered, but bounded by the contest caps).
     for p in nondraft:
         if not p.build_success:
             continue
-        c = Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed")
-        if deep:
-            m = rs.gh_meta(p.number); c.provenance = m.provenance
-            if rs.ledger_clean_head(p.number) == p.head_oid:
-                continue  # already cleanly reviewed at this head
+        if not deep:
+            sv.reviewable.actionable.append(
+                Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed"))
+            continue
+        m = rs.gh_meta(p.number)
+        if rs.ledger_clean_head(p.number) != p.head_oid:
+            # normal review path: the head moved or the last round errored.
+            c = Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed",
+                          provenance=m.provenance)
             if rs.review_rounds(p.number, counters) >= MAX_REVIEW_ROUNDS:
                 sv.reviewable.suppressed.append(c); continue
-            c.attempts = counters.read(f"review-err-{p.number}"); c.budget = MAX_REVIEW_ERRORS
-            (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
+            c = dataclasses.replace(c, attempts=counters.read(f"review-err-{p.number}"),
+                                    budget=MAX_REVIEW_ERRORS)
+            (sv.reviewable.suppressed if c.attempts >= c.budget
+             else sv.reviewable.actionable).append(c)
+            continue
+        # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
+        # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
+        # reply with a higher id is one no review round has answered yet — precise (monotonic id),
+        # with no second-resolution ambiguity, and self-clearing (the contest round advances
+        # replies_through past it).
+        reply = rs.newest_contest_reply(p.number)
+        if not reply:
+            continue
+        through = m.data.get("replies_through")
+        through = through if isinstance(through, int) else 0
+        if reply["id"] <= through:
+            continue  # already adjudicated by some review round
+        # An in-flight dispatch lease suppresses a re-fire in the window before the new scoreboard
+        # lands; stale leases (a crashed dispatch) expire so the contest is retried.
+        lease = counters.read(f"review-reply-lease-{p.number}")
+        if lease and (int(time.time()) - lease) < REPLY_LEASE_TTL:
+            continue
+        rubric = reply["rubric"]
+        c = Candidate(p.number, p.head_oid, f"author contest on {rubric}", provenance=m.provenance,
+                      contest=rubric,
+                      attempts=counters.read(f"review-contest-{p.number}"), budget=MAX_REVIEW_CONTESTS)
+        if (counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
+                or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
+                or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS):
+            sv.reviewable.suppressed.append(c)
         else:
             sv.reviewable.actionable.append(c)
 
@@ -1785,8 +1863,16 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
     if reviewers in ("auto", ""):
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
-    nrnd = w.rs.review_rounds(pr, w.counters)
-    log(f"  review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget @ {head[:12]}, reviewers={reviewers}")
+    leasekey = f"review-reply-lease-{pr}"
+    if c.contest:
+        # Lease the in-flight contest so a re-survey before the new scoreboard lands does not re-fire
+        # it. The engine auto-detects the contest from the thread reply (no extra flag); a contest-
+        # only round is recorded as a reply round, so it does not consume the review-round budget.
+        w.counters.write(leasekey, int(time.time()))
+        log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
+    else:
+        nrnd = w.rs.review_rounds(pr, w.counters)
+        log(f"  review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget @ {head[:12]}, reviewers={reviewers}")
     if bubble:
         rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
     else:
@@ -1804,11 +1890,22 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"{w.cfg.store_dir / 'outbox'} (the merge gate can't see this round until they "
                 f"land); a later round retries the drain")
             w.counters.incr(errkey)
+            if c.contest:
+                w.counters.write(leasekey, 0)  # release the lease; the contest retries next round
             return srv
         w.counters.write(errkey, 0)
+        if c.contest:
+            # The engine advanced replies_through in the new scoreboard (the durable per-reply
+            # watermark); rs.bust below re-fetches it, so this contest won't re-fire. Just bump the
+            # contest caps and release the lease.
+            w.counters.incr(f"review-contest-{pr}")
+            w.counters.incr(f"review-contest-{pr}-{c.contest}")
+            w.counters.write(leasekey, 0)
         w.rs.bust(pr)
     else:
         w.counters.incr(errkey)
+        if c.contest:
+            w.counters.write(leasekey, 0)  # release the lease; the contest retries next round
     return rc
 
 
