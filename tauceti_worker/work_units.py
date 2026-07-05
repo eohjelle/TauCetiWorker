@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 from .agents import (
     fetch_ref,
     fill_prompt,
+    host_agent_argv,
     prepare_checkout,
     review_in_bubble,
     run_agent_host,
@@ -26,6 +28,7 @@ from .constants import (
     AGENT_NAMES,
     CONTEST_CLAIM_TTL,
     MAX_OPEN_PRS,
+    OPENROUTER_MODELS,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
@@ -208,6 +211,22 @@ def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool:
     return False
 
 
+def _host_agent_binary(stage: str, model: str) -> str | None:
+    """The executable a HOST `stage` must resolve on PATH to run `model` (None ⇒ nothing to gate).
+
+    A review round shells the review engine, which gates on a literal `codex`/`claude`/`pi` via its own
+    shutil.which (TauCetiReview runner/cli.py) and ignores TAUCETI_CLAUDE_CMD / PI_RUN. Every other model
+    stage launches via host_agent_argv, so preflight the EXACT argv[0] it will exec — which honours a
+    custom TAUCETI_CLAUDE_CMD wrapper or PI_RUN path, so we neither miss a real gap nor false-block a
+    working custom launcher."""
+    if stage == "review":
+        if model in OPENROUTER_MODELS:
+            return "pi"
+        return {"codex": "codex", "claude": "claude"}.get(model)
+    argv, _ = host_agent_argv("", model)
+    return argv[0] if argv else None
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
@@ -219,6 +238,22 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
+    # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
+    # review engine rejects `--reviewer codex` and do_review counts it as a PER-PR review error — so a
+    # machine-wide outage marches PRs one-by-one to the "needs a human" escalation cap. Catch it HERE,
+    # before launch, as a loud self-healing pause (NoProgress ⇒ backoff, no counter bump): every PR
+    # would hit the identical failure, so it must not be charged to any single PR's error budget.
+    if not bubble:
+        binname = _host_agent_binary(stage, opts.work_model)
+        if binname and shutil.which(binname) is None:
+            warn_red(
+                f"agent '{opts.work_model}' needs the `{binname}` CLI on PATH, but it is not "
+                f"resolvable on this host — pausing this round. This is machine-wide (every PR would "
+                f"hit it), so it is NOT charged to any PR's review-error budget. Restore `{binname}` on "
+                f"the worker's PATH and the loop resumes on its own."
+            )
+            raise NoProgress(f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host")
     fn = {
         "review": do_review,
         "fix": do_fix,
