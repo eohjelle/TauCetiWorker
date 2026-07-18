@@ -7,7 +7,7 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
   git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
   ```
 - Resolve every conflict on its merits:
-  - **`TauCeti.lean` (the root import list)** is now auto-managed — it is regenerated and committed automatically on `main` after each merge, and PRs no longer hand-edit it, so it should NOT appear among your conflicts. If it somehow does, do not hand-merge the import lines: take `main`'s version (or regenerate it) rather than reconstructing it by hand.
+  - **`TauCeti.lean` (the root module)** is intentionally empty — the lakefile's glob builds every module without it, and PRs do not edit it, so it should NOT appear among your conflicts. If it somehow does, do not hand-merge: take `main`'s version rather than reconstructing anything by hand.
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
 - Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
 
