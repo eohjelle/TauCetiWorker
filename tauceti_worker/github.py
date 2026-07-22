@@ -18,6 +18,10 @@ from .constants import (
     CONTEST_CLAIM_EMOJI,
     GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
+    REVIEW_INPROGRESS_COLOR,
+    REVIEW_INPROGRESS_DESC,
+    REVIEW_INPROGRESS_LABEL,
+    STATUS_LABELS,
     TAUCETI,
 )
 
@@ -432,6 +436,46 @@ class GitHub:
             return True
         p = self._gh(["api", "-X", "DELETE", f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions/{rid}"])
         return p.returncode == 0
+
+    def set_review_inprogress_label(self, pr: int) -> bool:
+        """Best-effort: make `review-in-progress` the sole pipeline-status label on `pr`.
+
+        The five STATUS_LABELS are mutually exclusive. TauCeti CI owns and derives the other four;
+        this worker owns only `review-in-progress`, set here while it runs the engine on `pr`. CI's
+        label sink preserves it while the PR is awaiting review and clears it on any real transition
+        (a new commit, the posted scoreboard, a merge), so we never remove it ourselves — a crash
+        mid-review self-heals on the next CI event.
+
+        We add our label AND remove the other four in the same `gh pr edit`, so exactly one status
+        label is present the instant the round begins: the worker's own add does not trigger CI, so we
+        can't rely on CI to drop the previous label in time. Only labels actually present are removed
+        (a `--remove-label` of an absent label errors), and the label is created first (idempotent, CI
+        creates it on demand too) so `--add-label` can't 404 on a PR that has only carried CI labels.
+
+        Returns False on any hiccup and never raises: a status label is cosmetic next to the review."""
+        try:
+            self._gh(
+                [
+                    "label",
+                    "create",
+                    REVIEW_INPROGRESS_LABEL,
+                    "--repo",
+                    self.repo,
+                    "--color",
+                    REVIEW_INPROGRESS_COLOR,
+                    "--description",
+                    REVIEW_INPROGRESS_DESC,
+                    "--force",
+                ]
+            )
+            present = {lbl.get("name") for lbl in (self.pr_view(pr, ["labels"]) or {}).get("labels", [])}
+            args = ["pr", "edit", str(pr), "--repo", self.repo, "--add-label", REVIEW_INPROGRESS_LABEL]
+            for lbl in STATUS_LABELS:
+                if lbl != REVIEW_INPROGRESS_LABEL and lbl in present:
+                    args += ["--remove-label", lbl]
+            return self._gh(args).returncode == 0
+        except Exception:
+            return False
 
 
 def _parse_retry_after(raw: str | None) -> float | None:

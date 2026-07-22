@@ -32,6 +32,7 @@ from .constants import (
     OPENROUTER_MODELS,
     REVIEW,
     REVIEW_DAILY_CAP,
+    REVIEW_INPROGRESS_LABEL,
     ROADMAP,
     SANDBOX_DEFAULT,
     TAUCETI,
@@ -309,6 +310,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
     else:
         nrnd = w.rs.review_rounds(pr, w.counters)
         log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers} (CI retires at the cap)")
+    # Best-effort: flag the PR review-in-progress for its pipeline-status label while the engine runs.
+    # CI clears it on the next real transition (the scoreboard this round posts, or a new commit), so a
+    # crash before that self-heals; a failed set just leaves CI's awaiting-review label in place.
+    if not w.gh.set_review_inprogress_label(pr):
+        log(f"  review #{pr}: could not set {REVIEW_INPROGRESS_LABEL} label (best-effort; leaving CI's)")
     try:
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)

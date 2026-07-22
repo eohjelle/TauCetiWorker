@@ -115,6 +115,18 @@ COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its
 # expiry, so the engine's TTL value stays its own concern.
 REVIEW_INPROGRESS_RE = re.compile(r"<!--tauceti-review-in-progress (.*?)-->", re.S)
 
+# PR pipeline status labels. Exactly one sits on every open PR so its stage is visible at a glance in
+# the PR list. TauCeti CI (scripts/pr_status/labels.py) owns and derives four of them from GitHub truth;
+# this worker owns only REVIEW_INPROGRESS_LABEL, which do_review sets best-effort while it runs the
+# engine. CI's label sink treats that label as an overlay on `awaiting-review`: it preserves it while the
+# PR is awaiting review and clears it on any real transition (a new commit, the posted scoreboard, a
+# merge), so the worker never has to remove it — a crash mid-review self-heals on the next CI event. The
+# colour/description mirror the CI sink so the label reads the same however it is first created.
+STATUS_LABELS = ["awaiting-CI", "awaiting-review", "review-in-progress", "awaiting-author", "ready-to-merge"]
+REVIEW_INPROGRESS_LABEL = "review-in-progress"
+REVIEW_INPROGRESS_COLOR = "a371f7"
+REVIEW_INPROGRESS_DESC = "A review agent is actively reviewing (best-effort, set by the worker)"
+
 
 # Agents.
 OPENROUTER_MODELS = {
