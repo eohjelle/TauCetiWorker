@@ -145,25 +145,33 @@ def _format_stream_event(ev: dict) -> list[str]:
     return lines
 
 
-def _stream_render(argv: list[str], cwds: str | None, env: dict) -> int:
-    """Run the agent with stdout piped through _format_stream_event, so --stream shows the agent's
-    narration and commands live instead of buffering to the end. Non-JSON lines (e.g. bubble's own
-    setup output) pass through unchanged."""
+def _stream_run(argv: list[str], cwds: str | None, env: dict, logf: Path, render: bool) -> int:
+    """Run the agent under --stream: pipe its stdout through, showing it live on the terminal AND
+    teeing what's shown to a durable per-round logfile. For claude (render=True) we format the
+    stream-json events into narration + commands; for codex/pi (render=False) the text passes through
+    as-is (as do non-JSON lines like bubble's own setup output). Claude Code separately keeps the full
+    event transcript under ~/.claude/projects, so deep debugging is covered even though this view is
+    the readable subset."""
     import json
 
+    logf.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
         argv, cwd=cwds, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
-    for raw in proc.stdout or []:
-        line = raw.rstrip("\n")
-        try:
-            ev = json.loads(line)
-        except (ValueError, TypeError):
-            if line:
-                print(line, flush=True)  # not an event (bubble setup, warnings, …) — show as-is
-            continue
-        for out in _format_stream_event(ev):
-            print(out, flush=True)
+    with open(logf, "w") as fh:
+        for raw in proc.stdout or []:
+            line = raw.rstrip("\n")
+            if render:
+                try:
+                    shown = _format_stream_event(json.loads(line))
+                except (ValueError, TypeError):
+                    shown = [line] if line else []  # not an event (bubble setup, warnings, …)
+            else:
+                shown = [line] if line else []
+            for out in shown:
+                print(out, flush=True)
+                fh.write(out + "\n")
+            fh.flush()
     return proc.wait()
 
 
@@ -172,16 +180,16 @@ def run_agent_proc(
 ) -> int:
     """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
     by default we redirect it to a timestamped file under logdir and print only the path, so the round
-    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live instead — for claude
-    (stream_render) we format its stream-json events into readable narration + commands; other agents
-    inherit the terminal. On a non-zero exit we always tail the log so failures aren't silent."""
+    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live AND still keep that
+    per-round logfile: for claude (stream_render) we format its stream-json events into readable
+    narration + commands, for codex/pi we tee the text through. On a non-zero non-stream exit we tail
+    the log so failures aren't silent."""
     cwds = str(cwd) if cwd is not None else None
-    if os.environ.get("TAUCETI_STREAM"):
-        if stream_render:
-            return _stream_render(argv, cwds, env)
-        return subprocess.run(argv, cwd=cwds, env=env).returncode
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    if os.environ.get("TAUCETI_STREAM"):
+        log(f"{label}: streaming live (also logging to {logf})")
+        return _stream_run(argv, cwds, env, logf, render=stream_render)
     log(f"{label}: output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
         rc = subprocess.run(argv, cwd=cwds, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
