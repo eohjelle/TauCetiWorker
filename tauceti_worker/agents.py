@@ -432,6 +432,10 @@ def run_in_bubble(
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
+    # All bubble-specific Lake config (TauCeti artifact-cache endpoints + toggles) lives in this
+    # one file; the round sources it (below) so the agent's `lake cache get` / `lake build` reuse
+    # prebuilt oleans and only changed modules recompile. Nothing Lake-specific is hardcoded here.
+    shutil.copy(HERE / "scripts" / "bubble-lake.env", rounddir / "bubble-lake.env")
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -465,7 +469,9 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    command = f"{tcenv} {inner_cmd or agent_inner_cmd(wm)}"
+    # Source the one-file bubble Lake config (materializes the cache-service TOML + exports the
+    # LAKE_* toggles) before the agent runs, so `lake cache get`/`lake build` reuse cached oleans.
+    command = f". /opt/round/bubble-lake.env; {tcenv} {inner_cmd or agent_inner_cmd(wm)}"
 
     argv = [
         *bubble_cmd(),

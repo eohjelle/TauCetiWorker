@@ -19,6 +19,7 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 ## Verify before pushing (all three MUST pass, after the merge/rebase)
 ```
 lake exe cache get
+lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own oleans: recompile only your changed modules
 lake build
 lake exe axioms
 ```

@@ -8,6 +8,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
   ```
   lake exe cache get
+  lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own oleans: recompile only changed modules
   lake build
   lake exe axioms
   lake exe module-system
@@ -29,6 +30,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
 ```
 lake exe cache get
+lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own oleans: recompile only changed modules
 lake build
 lake exe axioms
 lake exe module-system
