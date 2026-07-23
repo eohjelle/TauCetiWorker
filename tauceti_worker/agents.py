@@ -95,6 +95,8 @@ def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
         env.pop("ANTHROPIC_API_KEY", None)
         base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
         argv = [*base, "-p", prompt, "--model", "opus", "--dangerously-skip-permissions"]
+        if os.environ.get("TAUCETI_STREAM"):  # emit live events for _stream_render to format
+            argv += ["--output-format", "stream-json", "--verbose"]
     return argv, env
 
 
@@ -103,16 +105,80 @@ def run_agent_host(cwd: Path, prompt: str, work_model: str, logdir: Path) -> int
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{work_model}")
+    return run_agent_proc(
+        argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{work_model}",
+        stream_render=_agent_streams_json(work_model),
+    )
 
 
-def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None) -> int:
+def _agent_streams_json(work_model: str) -> bool:
+    """True for the claude agent, which we run under --stream with --output-format stream-json and
+    render live. codex / pi already print readable text, so they stream via an inherited terminal."""
+    return work_model != "codex" and work_model not in OPENROUTER_MODELS
+
+
+def _format_stream_event(ev: dict) -> list[str]:
+    """Render one claude stream-json event as display lines: the agent's narration text and the
+    commands it runs (tool_use). Thinking, tool results, and bookkeeping events are dropped — this is
+    a "what is it doing" view, not the full transcript."""
+    if not isinstance(ev, dict) or ev.get("type") != "assistant":
+        return []
+    lines: list[str] = []
+    for b in (ev.get("message") or {}).get("content", []) or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            txt = (b.get("text") or "").strip()
+            if txt:
+                lines.append(txt)
+        elif b.get("type") == "tool_use":
+            name = b.get("name") or "tool"
+            inp = b.get("input") or {}
+            arg = (
+                inp.get("command") or inp.get("file_path") or inp.get("path")
+                or inp.get("pattern") or inp.get("url") or ""
+            )
+            arg = " ".join(str(arg).split())
+            if len(arg) > 300:
+                arg = arg[:300] + "…"
+            lines.append(f"$ {arg}" if name == "Bash" else f"[{name}] {arg}".rstrip())
+    return lines
+
+
+def _stream_render(argv: list[str], cwds: str | None, env: dict) -> int:
+    """Run the agent with stdout piped through _format_stream_event, so --stream shows the agent's
+    narration and commands live instead of buffering to the end. Non-JSON lines (e.g. bubble's own
+    setup output) pass through unchanged."""
+    import json
+
+    proc = subprocess.Popen(
+        argv, cwd=cwds, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    for raw in proc.stdout or []:
+        line = raw.rstrip("\n")
+        try:
+            ev = json.loads(line)
+        except (ValueError, TypeError):
+            if line:
+                print(line, flush=True)  # not an event (bubble setup, warnings, …) — show as-is
+            continue
+        for out in _format_stream_event(ev):
+            print(out, flush=True)
+    return proc.wait()
+
+
+def run_agent_proc(
+    argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None, stream_render: bool = False
+) -> int:
     """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
     by default we redirect it to a timestamped file under logdir and print only the path, so the round
-    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
-    On a non-zero exit we always tail the log so failures aren't silent."""
+    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live instead — for claude
+    (stream_render) we format its stream-json events into readable narration + commands; other agents
+    inherit the terminal. On a non-zero exit we always tail the log so failures aren't silent."""
     cwds = str(cwd) if cwd is not None else None
     if os.environ.get("TAUCETI_STREAM"):
+        if stream_render:
+            return _stream_render(argv, cwds, env)
         return subprocess.run(argv, cwd=cwds, env=env).returncode
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
@@ -387,9 +453,10 @@ def agent_inner_cmd(work_model: str) -> str:
             f"pi --provider openrouter --model {shlex.quote(OPENROUTER_MODELS[work_model])} --print "
             '"$(cat /opt/round/prompt.txt)"'
         )
+    stream = " --output-format stream-json --verbose" if os.environ.get("TAUCETI_STREAM") else ""
     return (
         'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
-        "--dangerously-skip-permissions --model opus"
+        f"--dangerously-skip-permissions --model opus{stream}"
     )
 
 
@@ -533,7 +600,7 @@ def run_in_bubble(
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
-            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}", stream_render=_agent_streams_json(wm))
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode
     finally:
