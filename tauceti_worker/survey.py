@@ -26,6 +26,7 @@ from .constants import (
     MAX_REVIEW_ERRORS,
     REVIEW_DAILY_CAP,
     TAUCETI,
+    STATUS_LABELS,
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, can_push, me
@@ -83,6 +84,7 @@ class PRInfo:
     build_failed: bool
     author_is_bot: bool = False  # a GitHub App / bot author (e.g. the review bot's bump PRs)
     title: str = ""
+    labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -122,6 +124,7 @@ class PRInfo:
             author_is_bot=bool((d.get("author") or {}).get("is_bot")),
             build_success=bool(build_states) and all(s == "SUCCESS" for s in build_states),
             build_failed=any(s in BUILD_FAIL for s in build_states),
+            labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
         )
 
 
@@ -153,6 +156,14 @@ class Survey:
     open_prs: list[PRInfo] = field(default_factory=list)
     n_open_nondraft: int = 0
     n_reviewable: int = 0
+    # Open non-draft PRs bucketed by the STATUS_LABELS pipeline, in that fixed order: (label, total,
+    # mine) where `mine` is the subset authored by the worker's own GitHub identity. Drives the
+    # per-round "open PRs" line; a zero bucket is still listed so the columns line up round to round.
+    status_labels: list[tuple[str, int, int]] = field(default_factory=list)
+    # Open non-draft PRs carrying NONE of the STATUS_LABELS — normally zero (CI keeps every PR
+    # labelled). Surfaced on the line only when nonzero, so a stalled labeller (which would otherwise
+    # drain every bucket to zero and read as "no open PRs") shows up instead of vanishing.
+    n_status_unlabeled: int = 0
     rebaseable: WorkKind = field(default_factory=lambda: WorkKind("rebase"))
     reviewable: WorkKind = field(default_factory=lambda: WorkKind("review"))
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
@@ -193,6 +204,19 @@ class Survey:
             "bump": self.bump,
         }[name]
 
+    def status_label_line(self) -> str:
+        """One-line breakdown of open non-draft PRs by status label: 'N label (M mine), N label (M),
+        ...'. Each entry pairs the total carrying that label with the subset the worker itself authored;
+        the first entry spells out 'mine' so the trailing parenthesized numbers read unambiguously. A
+        PR may carry several status labels (counted in each), so the totals need not sum to the PR
+        count; a nonzero unlabeled tail flags PRs the labeller missed."""
+        parts = []
+        for i, (label, total, mine) in enumerate(self.status_labels):
+            parts.append(f"{total} {label} ({mine} mine)" if i == 0 else f"{total} {label} ({mine})")
+        if self.n_status_unlabeled:
+            parts.append(f"{self.n_status_unlabeled} unlabeled")
+        return ", ".join(parts)
+
 
 def _review_rounds_today(store_dir: Path, pr: int) -> int | None:
     """Count this PR's review rounds recorded TODAY (UTC) in the worker's LOCAL engine ledger — the exact
@@ -213,6 +237,24 @@ def _review_rounds_today(store_dir: Path, pr: int) -> int | None:
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     rounds = (((d.get("prs") or {}).get(str(pr)) or {}).get("rounds")) or []
     return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
+
+
+def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tuple[str, int, int]], int]:
+    """Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order). Returns
+    (buckets, unlabeled) where each bucket is (label, total, mine) — total carrying that label, and the
+    subset authored by `me_login` — and `unlabeled` counts PRs with none of the status labels. A PR
+    with several status labels is counted in each bucket, so the totals need not partition the PRs.
+    Shared by survey() and its test so there is one bucketing rule, not two."""
+    buckets = [
+        (
+            label,
+            sum(1 for p in nondraft if label in p.labels),
+            sum(1 for p in nondraft if label in p.labels and p.author == me_login),
+        )
+        for label in STATUS_LABELS
+    ]
+    unlabeled = sum(1 for p in nondraft if not any(label in p.labels for label in STATUS_LABELS))
+    return buckets, unlabeled
 
 
 def spread_candidates(candidates: list, rng=random) -> list:
@@ -310,6 +352,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
                 "statusCheckRollup",
                 "author",
                 "mergeable",
+                "labels",
             ]
         )
     except GitHubError as e:
@@ -334,6 +377,9 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)
     sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
+    # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
+    # total with the subset this identity authored, for the per-round "open PRs" line.
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login)
 
     # 1) rebase: tended (ours or bot-authored), CONFLICTING, under the per-PR rebase-attempt budget.
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
