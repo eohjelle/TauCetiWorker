@@ -375,42 +375,16 @@ def bubble_home(cfg: Config) -> Path:
     return Path(env) if env else (cfg.home / ".cache" / "tauceti-worker" / cfg.wid / "bubble")
 
 
-def _ensure_lake_cache_hosts_allowed(config_toml: Path) -> None:
-    """Add the host(s) referenced in scripts/bubble-lake.env to bubble's network allowlist, so the
-    in-container `lake cache get` can reach TauCeti's Lake artifact cache. The endpoints live in ONE
-    place (bubble-lake.env); we parse the host out of them here rather than duplicating the URL.
-
-    Idempotent, and runs on every ensure_bubble_home() call (not just first init) so an already-
-    hardened bubble home picks it up too. bubble's config merge REPLACES the allowlist (it does not
-    extend it), so we edit the existing config.toml in place — `bubble security set` has already
-    populated it with the default github hosts, which this keeps intact."""
-    import re
-
-    if not config_toml.exists():
-        return
-    hosts = re.findall(r"https?://([A-Za-z0-9.-]+)", (HERE / "scripts" / "bubble-lake.env").read_text())
-    text = config_toml.read_text()
-    missing = [h for h in dict.fromkeys(hosts) if h not in text]
-    if not missing:
-        return
-    inserted = "".join(f'"{h}", ' for h in missing)
-    new = re.sub(r"(allowlist\s*=\s*\[)", r"\1" + inserted, text, count=1)
-    if new != text:
-        config_toml.write_text(new)
-
-
 def ensure_bubble_home(cfg: Config) -> dict:
     """One-time hardening of the private bubble home (read-only shared Mathlib cache + per-round
-    overlay), plus keeping the TauCeti Lake-cache host egress-allowed. Returns the env (with
-    BUBBLE_HOME set) for bubble subprocesses."""
+    overlay). Returns the env (with BUBBLE_HOME set) for bubble subprocesses."""
     home = bubble_home(cfg)
     env = {**os.environ, "BUBBLE_HOME": str(home)}
-    if not (home / ".worker-init").exists():
-        home.mkdir(parents=True, exist_ok=True)
-        subprocess.run([*bubble_cmd(), "security", "set", "shared-cache", "overlay"], env=env, capture_output=True)
-        (home / ".worker-init").touch()
-    # Idempotent every call so an existing bubble home (already past .worker-init) picks it up too.
-    _ensure_lake_cache_hosts_allowed(home / "config.toml")
+    if (home / ".worker-init").exists():
+        return env
+    home.mkdir(parents=True, exist_ok=True)
+    subprocess.run([*bubble_cmd(), "security", "set", "shared-cache", "overlay"], env=env, capture_output=True)
+    (home / ".worker-init").touch()
     return env
 
 
@@ -533,10 +507,6 @@ def run_in_bubble(
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
-    # All bubble-specific Lake config (TauCeti artifact-cache endpoints + toggles) lives in this
-    # one file; the round sources it (below) so the agent's `lake cache get` / `lake build` reuse
-    # prebuilt oleans and only changed modules recompile. Nothing Lake-specific is hardcoded here.
-    shutil.copy(HERE / "scripts" / "bubble-lake.env", rounddir / "bubble-lake.env")
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -570,9 +540,7 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    # Source the one-file bubble Lake config (materializes the cache-service TOML + exports the
-    # LAKE_* toggles) before the agent runs, so `lake cache get`/`lake build` reuse cached oleans.
-    command = f". /opt/round/bubble-lake.env; {tcenv} {inner_cmd or agent_inner_cmd(wm)}"
+    command = f"{tcenv} {inner_cmd or agent_inner_cmd(wm)}"
 
     argv = [
         *bubble_cmd(),

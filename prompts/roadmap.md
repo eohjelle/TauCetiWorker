@@ -34,7 +34,6 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 ## Verify before pushing (all three MUST pass)
 ```
 lake exe cache get
-lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own oleans: recompile only your changed modules
 lake build
 lake exe axioms
 ```

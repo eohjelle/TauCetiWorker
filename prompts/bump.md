@@ -7,7 +7,6 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 ## Reproduce and adapt
 ```
 lake exe cache get
-lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own oleans: recompile only your changed modules
 lake build
 lake exe axioms
 ```
@@ -23,7 +22,6 @@ lake exe axioms
 ## Verify before pushing (all three MUST pass)
 ```
 lake exe cache get
-lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own oleans: recompile only your changed modules
 lake build
 lake exe axioms
 ```
