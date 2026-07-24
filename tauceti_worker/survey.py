@@ -25,9 +25,10 @@ from .constants import (
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
     MAX_REVIEW_ERRORS,
     REVIEW_DAILY_CAP,
+    TAUCETI,
     TAUCETI_OWNER,
 )
-from .github import GitHub, GitHubError, me
+from .github import GitHub, GitHubError, can_push, me
 from .review_state import Meta, ReviewState
 
 # ============================================================================
@@ -268,6 +269,18 @@ def fix_disposition(meta: Meta, head: str, build_success: bool, blocking: bool, 
     return ("actionable", "")
 
 
+_can_push_canonical: bool | None = None
+
+
+def _tends_first_party_bot_prs() -> bool:
+    """Whether this identity can push to the base repo, so it should tend first-party bot PRs (whose
+    branches live there). Cached once known; an unknown fails open and is retried next round."""
+    global _can_push_canonical
+    if _can_push_canonical is None:
+        _can_push_canonical = can_push(TAUCETI)
+    return _can_push_canonical is not False
+
+
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
     """Classify every open PR per work-kind. Read-only — performs no actions.
 
@@ -312,9 +325,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     # bot automation — a bot-authored PR whose head branch lives in the base repo (the review bot's
     # bump PRs). Requiring the head in-repo keeps the worker off a fork or an external/unrelated bot's
     # branch (which it either can't push to, or shouldn't touch); a human contributor's PR is neither
-    # ours nor a first-party bot's, so it is left alone. Roadmap backpressure still counts only `mine`:
-    # it bounds how many PRs WE author, which a bot's PRs don't.
-    tended = [p for p in nondraft if p.author == me_login or (p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
+    # ours nor a first-party bot's, so it is left alone. The bot clause additionally requires push access
+    # to the base repo: a contributor can't push to those branches, so tending them only wastes a round.
+    # Roadmap backpressure still counts only `mine`: it bounds how many PRs WE author, not a bot's.
+    tend_bot = _tends_first_party_bot_prs()
+    tended = [p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)
