@@ -39,6 +39,24 @@ shim that runs the `tauceti_worker` package), and every command above works the 
 current round and exits, and `tauceti doctor` checks your environment and tells
 you what's missing.
 
+### Docker deployment
+
+From the repository root:
+
+> If `docker compose` is unavailable, use `docker-compose` in the commands below.
+
+```bash
+docker compose build
+docker compose run --rm auth gh auth login --git-protocol https
+docker compose run --rm auth codex login --device-auth
+docker compose run --rm auth claude auth login
+docker compose up -d
+docker compose logs -f tauceti claude-refresh codex-refresh
+```
+
+See the [Docker deployment guide](docs/docker.md) for requirements, updates, storage,
+credential handling, and security details.
+
 ### The dashboard
 
 Bare `tauceti` opens an interactive dashboard ([Textual](https://textual.textualize.io/)).
@@ -374,7 +392,10 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
   `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
   `tauceti` console script (`tauceti_worker.cli:cli_main`).
 - `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
-  these on `PATH` inside a round, so they stay shell. (The wheel bundles them into the package.)
+  these on `PATH` inside a round, so they stay shell. `oauth_refresh_loop.py` and
+  `docker-entrypoint` support the Docker deployment. (The wheel bundles this directory
+  into the package.)
+- `Dockerfile` and `compose.yaml`: the unattended, persistent Docker deployment.
 - `prompts/*.md`: the per-task agent prompts.
 - `tests/`: plain `python3 tests/<name>.py` scripts (`dashboard.py` runs under `uv run`), driven
   by `tests/run-all`; plus `lifecycle.sh`. Each loads the package and exercises one concern.
