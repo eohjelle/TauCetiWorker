@@ -235,6 +235,8 @@ def test_normal_view_and_safe_push() -> None:
     cfg, remote, pr_oid = make_fixture("normal")
     co = cfg.checkout
     old_expect = os.environ.get("TAUCETI_PUSH_EXPECT")
+    old_identity = tc.agents.git_author_identity
+    tc.agents.git_author_identity = lambda: ("tauceti-test", "12345+tauceti-test@users.noreply.github.com")
     os.environ["TAUCETI_PUSH_EXPECT"] = pr_oid
     try:
         check("normal trusted-base staging succeeds", tc.agents.stage_trusted_base_config(cfg))
@@ -293,6 +295,15 @@ def test_normal_view_and_safe_push() -> None:
         # The next round removes its registered detached view, returns to current main, and retains
         # .lake. A second PR staging proves stale worktree metadata cannot poison later rounds.
         check("next-round prepare_checkout succeeds", tc.agents.prepare_checkout(cfg))
+        check(
+            "next-round checkout uses the authenticated GitHub author name",
+            git(co, "config", "--local", "--get", "user.name").stdout.strip() == "tauceti-test",
+        )
+        check(
+            "next-round checkout uses the authenticated GitHub noreply email",
+            git(co, "config", "--local", "--get", "user.email").stdout.strip()
+            == "12345+tauceti-test@users.noreply.github.com",
+        )
         check("next-round clears trusted build routing", "TAUCETI_TRUSTED_BUILD" not in os.environ)
         check("next-round removes the old detached view", not (cfg.state / "trusted-build").exists())
         check("next-round checkout lands on main", git(co, "branch", "--show-current").stdout.strip() == "main")
@@ -310,6 +321,7 @@ def test_normal_view_and_safe_push() -> None:
             os.environ.pop("TAUCETI_PUSH_EXPECT", None)
         else:
             os.environ["TAUCETI_PUSH_EXPECT"] = old_expect
+        tc.agents.git_author_identity = old_identity
         tc.agents._clear_trusted_build(cfg)
         shutil.rmtree(co.parent, ignore_errors=True)
 

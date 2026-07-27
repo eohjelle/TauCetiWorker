@@ -29,7 +29,7 @@ from .constants import (
     ROADMAP,
     TAUCETI,
 )
-from .github import me
+from .github import git_author_identity, me
 from .paths import HERE
 from .quota import (
     _claude_keychain_creds_interactive,
@@ -256,6 +256,15 @@ def stage_trusted_base_config(cfg: Config, *, preserve_pr_pins: bool = False) ->
     return True
 
 
+def configure_checkout_git_identity(checkout: Path) -> bool:
+    """Link this checkout's Git author identity to the account authenticated with ``gh``."""
+    name, email = git_author_identity()
+    for key, value in (("user.name", name), ("user.email", email)):
+        if subprocess.run(["git", "-C", str(checkout), "config", "--local", key, value]).returncode:
+            return False
+    return True
+
+
 def prepare_checkout(cfg: Config) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
     co = cfg.checkout
@@ -270,6 +279,8 @@ def prepare_checkout(cfg: Config) -> bool:
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
+    if not configure_checkout_git_identity(co):
+        return False
     if g("fetch", "-q", "origin"):
         return False
     # -f discards a prior round's leftover edits and lands us on main in one step; a plain
