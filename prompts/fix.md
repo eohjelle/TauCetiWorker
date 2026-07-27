@@ -5,6 +5,12 @@ You are addressing AI code review on pull request #__PR__ of TauCetiProject/TauC
   - `gh pr view __PR__ --repo TauCetiProject/TauCeti --json comments`
   - `gh api "/repos/TauCetiProject/TauCeti/pulls/__PR__/comments?per_page=100"` (the per-rubric review threads; each root carries a `<!--tauceti-rubric:NAME-->` marker, and the finding text + suggested fix).
 - The blocking rubrics are the ones marked ⛔ (block) or 🟡 (changes requested) on the scoreboard. The other rubrics are already ✅ approved — note which ones.
+- Before editing or running Lean, bring this writable PR branch up to date:
+  ```
+  git fetch origin
+  git rebase origin/main
+  ```
+  Resolve any conflicts without discarding either main's changes or the PR's intent.
 
 ## Do not regress what is already green
 The scoreboard shows several rubrics already approved (✅). A re-review re-runs the rubrics you touched, so a change that fixes one blocker but degrades an approved rubric will turn that rubric red and the PR will not converge — this is the single most common reason a nearly-done PR is eventually abandoned. So:

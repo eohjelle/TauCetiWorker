@@ -454,6 +454,15 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
   `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
   bubble image; you only need it on the host for host-mode rounds).
 
+For host authoring, credential HOME isolation leaves Elan in its original
+`ELAN_HOME`. Before model launch, the worker verifies that ordinary `lake` is
+available in the agent's login shell, resets the persistent checkout to current
+main, and restores Mathlib plus TauCeti's public Lake artifacts. The agent then
+uses that same checkout, `.lake`, and cache environment while working normally
+on the PR branch. Maintenance prompts make rebasing that writable branch onto
+current main the agent's responsibility; the worker does not substitute a different Lake
+configuration. `tauceti doctor` shows the Lake path seen by the agent shell.
+
 `tauceti doctor` checks all of this.
 
 ## What's in the repo

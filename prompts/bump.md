@@ -3,6 +3,12 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 ## The pins are the point — keep them
 - The bumped `lake-manifest.json` / `lean-toolchain` on this branch ARE the change under review. Do NOT revert them, do NOT re-pin to an older Mathlib, do NOT touch the lakefile. Your job is to make `TauCeti/` build against the Mathlib the bot pinned.
 - If the new pin is genuinely unworkable (e.g. a Mathlib change that can't be adapted without a redesign), stop and report that, rather than reverting the bump or gutting the library.
+- Before building, bring this writable PR branch up to date:
+  ```
+  git fetch origin
+  git rebase origin/main
+  ```
+  Resolve conflicts without losing the forward pin changes that this PR exists to test.
 
 ## Reproduce and adapt
 ```

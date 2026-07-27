@@ -4,7 +4,7 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 - Fetch and integrate the latest `main`:
   ```
   git fetch origin
-  git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
+  git rebase origin/main
   ```
 - Resolve every conflict on its merits:
   - **`TauCeti.lean` (the root module)** is intentionally empty — the lakefile's glob builds every module without it, and PRs do not edit it, so it should NOT appear among your conflicts. If it somehow does, do not hand-merge: take `main`'s version rather than reconstructing anything by hand.
@@ -27,7 +27,12 @@ Iterate until green. Never push red — a botched conflict resolution that build
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
-- Commit the merge/resolution (if `git merge` left a merge commit, keep its default message; otherwise `<type>: <subject>`, ending the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
+- Finish every conflicted commit with `git add ...` and `GIT_EDITOR=true git rebase --continue`.
+  Rebase reuses the original commit messages, so do not create an extra commit merely to record the
+  rebase.
+- If verification requires additional changes after the rebase, commit those fixes (message
+  `<type>: <subject>`, imperative present; end the body with
+  `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push with the project's safe wrapper — and ONLY the wrapper:
   ```
   git-safe-push

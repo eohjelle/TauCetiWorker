@@ -56,7 +56,7 @@ print("[OK ] claude env drops ANTHROPIC_API_KEY")
 a, env = tc.host_agent_argv(P, "deepseek")
 check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"], "--prompt", P])
 
-# PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
+# PATH must prepend HERE so the agent resolves the safe Git wrappers and claim.sh.
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 

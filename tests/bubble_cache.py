@@ -143,9 +143,11 @@ w = SimpleNamespace(cfg=cfg)
 opts = SimpleNamespace(work_model="claude")
 saved_home = tc.agents.ensure_bubble_home
 saved_pop = tc.agents._bubble_pop
+old_elan_home = os.environ.get("ELAN_HOME")
 tc.agents.ensure_bubble_home = lambda _cfg: dict(os.environ)
 tc.agents._bubble_pop = lambda _cfg, _env: None
 os.environ["TAUCETI_AGENT_ECHO"] = "1"
+os.environ["ELAN_HOME"] = "/host-only/shared-elan"
 try:
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -160,6 +162,10 @@ try:
     check("work round does not expose the upstream domain directly", "--allow-domain" not in work_argv)
     check("work round runs both cache commands", "lake exe cache get" in work_argv and "lake cache get" in work_argv)
     check("work round stages no competing Lake config", not (cfg.state / "bubble-round" / "lake-cache.toml").exists())
+    check(
+        "Bubble uses its own Elan rather than forwarding the host installation",
+        "ELAN_HOME" not in work_argv and "/host-only/shared-elan" not in work_argv,
+    )
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -170,6 +176,10 @@ try:
     check("review/probe command is not wrapped in a build", "lake exe cache get" not in review_argv)
 finally:
     os.environ.pop("TAUCETI_AGENT_ECHO", None)
+    if old_elan_home is None:
+        os.environ.pop("ELAN_HOME", None)
+    else:
+        os.environ["ELAN_HOME"] = old_elan_home
     tc.agents.ensure_bubble_home = saved_home
     tc.agents._bubble_pop = saved_pop
     shutil.rmtree(tmp, ignore_errors=True)

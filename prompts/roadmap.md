@@ -9,7 +9,7 @@ You are authoring a new pull request to TauCetiProject/TauCeti, an AIs-welcome L
   Everything else in `__ONLY__` is fair game. If the list above is `none`, there are no outstanding claims to avoid. These are cooperative claims registered by others; pick something genuinely distinct, not a near-variant of a claimed target.
 - **Avoid duplicating open work.** List the PRs already in flight and read their titles and descriptions: `gh pr list --repo TauCetiProject/TauCeti --state open --limit 100 --json number,title,headRefName,body`. Also skim recently MERGED PRs (`--state merged`) so you build on, rather than repeat, what already landed. Do NOT pick a target an open or merged PR already covers or substantially overlaps (the same definition, the same roadmap item, or a near-identical API). Within `__ONLY__`, prefer the lowest-hanging target not yet taken; if every easy one is in flight, pick a genuine prerequisite none of them supply. When in doubt that your idea is distinct, choose something else.
 - Read the review rubrics you'll be judged against under `__REVIEW_DIR__/rubrics/*.md` (provided read-only): scope, correctness, reuse, attribution, api-design, generality, placement, naming, documentation, proof-quality, deprecation.
-__SOURCE_GUIDANCE__- Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The pinned Mathlib source is vendored in this checkout at `.lake/packages/mathlib` once `lake exe cache get` (or dependency resolution) has run — `grep` there; don't try to clone it from the network.
+__SOURCE_GUIDANCE__- Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The worker has already populated the pinned Mathlib source at `.lake/packages/mathlib` — `grep` there; don't rerun the cache fetch or try to clone Mathlib from the network.
 
 ## Claim your target (so two agents don't author the same thing)
 Once you have settled on a target, derive a short stable id for it and claim it BEFORE you start building. This lets other autonomous workers see the target is taken; it is cooperative, not a hard lock.
@@ -31,15 +31,15 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 - Aim for ~150–400 lines of genuine, non-vacuous content. Smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions; a `≃ₜ`-valued def is `...Homeomorph`, not `...Equiv`; never `@[simp]` a variable-head lemma; never silence a linter.
 - Must build green AND pass the axiom audit (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`).
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing (both MUST pass)
+The worker fetched the Mathlib cache before launching you; do not repeat `lake exe cache get`.
 ```
-lake exe cache get
 lake build
 lake exe axioms
 ```
 If `lake build` is red, FIX IT or pick a smaller target. Never push red.
 
-**Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** Run both commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`): the branch is pushed there, and the PR is opened from your fork to `TauCetiProject/TauCeti:main`. You do not need write access to the canonical repo. (The wrappers are already configured to push to your fork — just run them.)
