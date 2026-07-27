@@ -26,9 +26,9 @@ For each finding, judge whether it is actually correct:
 
 ## Verify before pushing (all three MUST pass)
 ```
-"${TAUCETI_LAKE:-lake}" exe cache get
-"${TAUCETI_LAKE:-lake}" build
-"${TAUCETI_LAKE:-lake}" exe axioms
+lake exe cache get
+lake build
+lake exe axioms
 ```
 Iterate until green. Never push red.
 

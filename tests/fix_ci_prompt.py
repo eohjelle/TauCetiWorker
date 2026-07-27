@@ -19,7 +19,8 @@ def check(name, ok):
 final_heading = "## Final gate before pushing"
 check("prompt has an explicit final-gate section", final_heading in PROMPT)
 diagnosis, final_gate = PROMPT.split(final_heading, 1)
-lake = '"${TAUCETI_LAKE:-lake}"'
+lake = "lake"
+lint = "lake env bash scripts/lint-env.sh"
 
 # Logs must drive diagnosis before any local Lean work, and local iteration should stay targeted.
 log_i = diagnosis.find("gh run view <run-id>")
@@ -36,7 +37,7 @@ check(
         for cmd in (
             f"{lake} exe axioms",
             f"{lake} exe module-system",
-            '"${TAUCETI_TRUSTED_RUN:-env}" bash scripts/lint-env.sh',
+            lint,
         )
     ),
 )
@@ -49,7 +50,7 @@ commands = [
     f"{lake} build --iofail",
     f"{lake} exe axioms",
     f"{lake} exe module-system",
-    '"${TAUCETI_TRUSTED_RUN:-env}" bash scripts/lint-env.sh',
+    lint,
 ]
 positions = [final_gate.find(f"\n{cmd}\n") for cmd in commands]
 check("final gate contains the complete CI command sequence", all(i >= 0 for i in positions))
@@ -59,10 +60,10 @@ check(
 )
 check("final gate uses CI's fail-on-info build mode", f"\n{lake} build\n" not in final_gate)
 check(
-    "every Lake command uses the host-safe absolute launcher",
-    "TAUCETI_LAKE" in diagnosis and "TAUCETI_LAKE" in final_gate,
+    "prompt does not expose host-routing implementation variables",
+    "TAUCETI_LAKE" not in PROMPT and "TAUCETI_TRUSTED_RUN" not in PROMPT,
 )
-check("lint runs through the trusted-main launcher on host", "TAUCETI_TRUSTED_RUN" in final_gate)
+check("lint runs inside Lake's environment", f"\n{lint}\n" in final_gate)
 check(
     "complete suite is explicitly reserved for the final gate",
     "complete CI suite only here" in final_gate and "Only after the targeted failure is fixed" in final_gate,
@@ -79,17 +80,15 @@ check(
 )
 check("lint guidance no longer declares the branch likely stale", "likely behind main" not in PROMPT)
 
-# Every authoring prompt must use the absolute host launcher. Bubble gets the same prompt and falls
-# back to ordinary `lake`, so this also pins the shared-prompt compatibility contract.
+# Every authoring prompt uses ordinary `lake`; host routing is supplied outside the prompt while
+# Bubble continues to use its native Lake installation.
 for prompt_name in ("fix.md", "fix-ci.md", "bump.md", "rebase.md", "roadmap.md"):
     prompt = (REPO / "prompts" / prompt_name).read_text()
-    command_lines = [
-        line.strip() for line in prompt.splitlines() if line.strip().startswith(("lake ", '"${TAUCETI_LAKE'))
-    ]
-    check(f"{prompt_name} uses the host-safe Lake launcher", lake in prompt)
+    command_lines = [line.strip() for line in prompt.splitlines() if line.strip().startswith("lake ")]
+    check(f"{prompt_name} contains a plain Lake command", bool(command_lines))
     check(
-        f"{prompt_name} has no bare Lake command",
-        all(line.startswith(lake) for line in command_lines),
+        f"{prompt_name} does not expose host-routing implementation variables",
+        "TAUCETI_LAKE" not in prompt and "TAUCETI_TRUSTED_RUN" not in prompt,
     )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

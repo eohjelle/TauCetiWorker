@@ -2,9 +2,10 @@
 """Host authoring must preflight Lake in the environment and login shell the agent actually receives.
 
 The parent worker can resolve a different PATH from an agent command run through the user's login shell,
-so shutil.which("lake") is not an adequate gate. Host authoring must configure its Lake cache first,
-then prove through the login shell that the agent's Lake shim resolves a real executable with that final
-environment. Review does not compile and must do neither. `tauceti doctor` must identify this explicitly.
+so shutil.which("lake") is not an adequate gate. Host authoring must configure its Lake cache first, then
+prove through the login shell that plain `lake` resolves exactly to the worker shim and that the shim
+resolves a real backend with that final environment. Review does not compile and must do neither.
+`tauceti doctor` must identify the shim-to-backend chain explicitly.
 
 Exit 0 = every case agrees; 1 = a mismatch."""
 
@@ -74,6 +75,7 @@ if callable(probe_helper):
             bool(helper_calls)
             and helper_calls[-1][0][:2] == ["/the/login-shell", "-lc"]
             and "command -v lake" in helper_calls[-1][0][2]
+            and f"= {REPO / 'scripts' / 'lake'} ]" in helper_calls[-1][0][2]
             and "TAUCETI_LAKE_RESOLVE_ONLY=1" in helper_calls[-1][0][2]
             and str(REPO / "scripts" / "lake") in helper_calls[-1][0][2],
         )
@@ -110,6 +112,8 @@ with tempfile.TemporaryDirectory() as real_td:
     real_keys = (
         "PATH",
         "TAUCETI_REAL_LAKE",
+        "TAUCETI_LAKE",
+        "TAUCETI_TRUSTED_RUN",
         "LAKE_CONFIG",
         "LAKE_CACHE_DIR",
         "LAKE_ARTIFACT_CACHE",
@@ -120,6 +124,8 @@ with tempfile.TemporaryDirectory() as real_td:
     try:
         os.environ["PATH"] = f"{fake_bin}:/usr/bin:/bin"
         os.environ["TAUCETI_REAL_LAKE"] = "/definitely/missing/stale-lake"
+        os.environ.pop("TAUCETI_LAKE", None)
+        os.environ.pop("TAUCETI_TRUSTED_RUN", None)
         replace(tc.agents, "_host_shell", lambda: str(fake_shell), real_saved)
         replace(tc.cli, "_have", lambda _tool: True, real_saved)
         tc.cli.preflight(real_cfg, opts(["fix"]))
@@ -128,6 +134,28 @@ with tempfile.TemporaryDirectory() as real_td:
         check(
             "successful real preflight hands discovered Lake to the agent",
             handed_env.get("TAUCETI_REAL_LAKE") == str(fake_lake),
+        )
+        check(
+            "host agent receives no prompt-facing Lake launchers",
+            "TAUCETI_LAKE" not in handed_env and "TAUCETI_TRUSTED_RUN" not in handed_env,
+        )
+
+        bypass_shell = real_root / "bypass-login-shell"
+        bypass_shell.write_text(
+            f'#!/bin/sh\n[ "$1" = "-lc" ] || exit 90\nPATH="{fake_bin}:/usr/bin:/bin" exec /bin/bash -c "$2"\n'
+        )
+        bypass_shell.chmod(0o755)
+        replace(tc.agents, "_host_shell", lambda: str(bypass_shell), real_saved)
+        bypassed = probe_helper("lake", env=tc.agents.host_agent_env())
+        check("real probe rejects plain Lake bypassing the worker shim", bypassed is None)
+        try:
+            tc.cli.preflight(real_cfg, opts(["fix"]))
+            bypass_error = ""
+        except tc.Die as exc:
+            bypass_error = str(exc)
+        check(
+            "preflight rejects a login shell that bypasses the shim before model launch",
+            "resolve exactly" in bypass_error and "worker shim" in bypass_error,
         )
     finally:
         restore(real_saved)
@@ -163,10 +191,19 @@ with tempfile.TemporaryDirectory() as td:
         "PATH": "/operator/bin:/usr/bin",
     }
     base_marker = "inherited-by-agent"
-    tested_env_keys = (*base_agent_env, *cache_env, "TAUCETI_TEST_AGENT_ENV", "TAUCETI_REAL_LAKE")
+    tested_env_keys = (
+        *base_agent_env,
+        *cache_env,
+        "TAUCETI_TEST_AGENT_ENV",
+        "TAUCETI_REAL_LAKE",
+        "TAUCETI_LAKE",
+        "TAUCETI_TRUSTED_RUN",
+    )
     saved_agent_env = {key: os.environ.get(key, _MISSING) for key in tested_env_keys}
     os.environ.update(base_agent_env)
     os.environ["TAUCETI_TEST_AGENT_ENV"] = base_marker
+    os.environ.pop("TAUCETI_LAKE", None)
+    os.environ.pop("TAUCETI_TRUSTED_RUN", None)
 
     saved = []
     calls = []
@@ -234,10 +271,14 @@ with tempfile.TemporaryDirectory() as td:
             received.get("TAUCETI_TEST_AGENT_ENV") == base_marker,
         )
         _, launched_env = tc.agents.host_agent_argv("", "claude")
-        exact_agent_keys = ("PATH", "HOME", "ELAN_HOME", "TAUCETI_LAKE", "TAUCETI_TRUSTED_RUN", *cache_env)
+        exact_agent_keys = ("PATH", "HOME", "ELAN_HOME", *cache_env)
         check(
             "preflight probes the exact PATH/HOME/Elan/Lake environment passed to the host agent",
             all(key in received and received[key] == launched_env.get(key) for key in exact_agent_keys),
+        )
+        check(
+            "TauCeti injects no prompt-facing launchers into preflight or agent",
+            all(key not in received and key not in launched_env for key in ("TAUCETI_LAKE", "TAUCETI_TRUSTED_RUN")),
         )
 
         # 2) The inverse disagreement: parent which() says Lake is absent, but the login shell resolves it.
@@ -277,8 +318,8 @@ with tempfile.TemporaryDirectory() as td:
         check("host review does not probe the login shell for Lake", not any(call[0] == "login" for call in calls))
 
         # 4) Doctor must make the distinction visible. Parent PATH says yes, agent shell says no; its Lake
-        # row must still be MISSING and explicitly name the agent shell. Doctor only describes the cache
-        # env and must not materialize it.
+        # row must still be MISSING and explicitly name the required shim. On success it prints the exact
+        # shim -> backend chain. Doctor only describes the cache env and must not materialize it.
         calls.clear()
         parent_lake["present"] = True
         login_result["path"] = None
@@ -297,6 +338,25 @@ with tempfile.TemporaryDirectory() as td:
         lake_lines = [line for line in doctor_lines if "lake (agent shell)" in line.lower()]
         check("doctor explicitly labels Lake as an agent-shell check", bool(lake_lines))
         check("doctor reports failed agent-shell Lake as MISSING", bool(lake_lines) and "MISSING" in lake_lines[0])
+        check(
+            "doctor failure names the required plain-Lake shim",
+            bool(lake_lines) and str(REPO / "scripts" / "lake") in lake_lines[0],
+        )
+
+        calls.clear()
+        login_result["path"] = "/shared/elan/bin/lake"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            tc.cli.cmd_doctor(SimpleNamespace())
+        doctor_lines = output.getvalue().splitlines()
+        lake_lines = [line for line in doctor_lines if "lake (agent shell)" in line.lower()]
+        check(
+            "doctor reports the verified shim-to-backend chain",
+            bool(lake_lines)
+            and "ok" in lake_lines[0].lower()
+            and str(REPO / "scripts" / "lake") in lake_lines[0]
+            and "→ /shared/elan/bin/lake" in lake_lines[0],
+        )
         check("doctor does not materialize host cache configuration", not any(call[0] == "configure" for call in calls))
     finally:
         restore(saved)

@@ -201,7 +201,16 @@ def assert_trusted_view(cfg: SimpleNamespace, *, bump: bool) -> Path:
     # Use host_agent_argv's actual environment handoff, then invoke the packaged command path with a
     # fake Lake. This pins trusted-view inheritance and exact argument forwarding without Lean.
     fake_lake = cfg.state / "fake-real-lake"
-    write(fake_lake, '#!/bin/sh\nprintf "cwd=%s\\n" "$PWD"\nprintf "arg=%s\\n" "$@"\n')
+    write(
+        fake_lake,
+        "#!/bin/sh\n"
+        'if [ "$1" = env ]; then\n'
+        "  shift\n"
+        '  exec "$@"\n'
+        "fi\n"
+        'printf "cwd=%s\\n" "$PWD"\n'
+        'printf "arg=%s\\n" "$@"\n',
+    )
     fake_lake.chmod(0o755)
     _, env = tc.agents.host_agent_argv("", "codex")
     env["TAUCETI_REAL_LAKE"] = str(fake_lake)
@@ -210,9 +219,15 @@ def assert_trusted_view(cfg: SimpleNamespace, *, bump: bool) -> Path:
     check("host agent inherits trusted-build routing", env.get("TAUCETI_TRUSTED_BUILD") == str(build))
     check("agent Lake shim runs the real command from the trusted view", lines[:1] == [f"cwd={build}"])
     check("agent Lake shim forwards every argument", lines[1:] == ["arg=build", "arg=--iofail"])
-    trusted_script = run(env["TAUCETI_TRUSTED_RUN"], "bash", "scripts/lint-env.sh", cwd=co, env=env)
-    check("host agent inherits the trusted-script launcher", env["TAUCETI_TRUSTED_RUN"].endswith("/trusted-run"))
-    check("trusted-script launcher executes current-main tooling", trusted_script.stdout.strip() == "trusted-main-lint")
+    trusted_script = run(
+        REPO / "scripts/lake",
+        "env",
+        "bash",
+        "scripts/lint-env.sh",
+        cwd=co,
+        env=env,
+    )
+    check("Lake shim executes current-main tooling", trusted_script.stdout.strip() == "trusted-main-lint")
     return build
 
 

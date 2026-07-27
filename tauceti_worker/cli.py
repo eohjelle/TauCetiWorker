@@ -607,11 +607,13 @@ def cmd_doctor(args) -> int:
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
-    lake_path = host_login_shell_which("lake", env={**host_agent_env(), **host_lake_env(cfg)})
-    lake_note = f"host authoring probes `{_host_shell()} -lc`"
-    if lake_path:
-        lake_note += f" → {lake_path}"
-    rows.append(("lake (agent shell)", lake_path is not None, lake_note))
+    lake_shim = str(HERE / "scripts" / "lake")
+    lake_backend = host_login_shell_which("lake", env={**host_agent_env(), **host_lake_env(cfg)})
+    if lake_backend:
+        lake_note = f"`{_host_shell()} -lc`: {lake_shim} → {lake_backend}"
+    else:
+        lake_note = f"`{_host_shell()} -lc`: plain lake must resolve to {lake_shim} → real Lake"
+    rows.append(("lake (agent shell)", lake_backend is not None, lake_note))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("codex creds", _safe_exists(cfg.home / ".codex" / "auth.json"), "~/.codex/auth.json"))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
@@ -647,10 +649,12 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
         lake_path = host_login_shell_which("lake", env=host_agent_env())
         if lake_path is None:
             raise Die(
-                "preflight: host authoring (the default) needs `lake` in the agent command login shell "
-                f"(`{_host_shell()} -lc`), but the worker's Lake shim cannot resolve a real Lake there. "
-                "Configure Elan for that shell (or pass --bubble to build inside the sandbox instead). "
-                "`tauceti doctor` shows this probe."
+                "preflight: plain `lake` in the agent command login shell "
+                f"(`{_host_shell()} -lc`) must resolve exactly to the worker shim "
+                f"{HERE / 'scripts' / 'lake'}, and that shim must resolve a real Lake backend. "
+                "Login-shell startup may be rewriting PATH; configure it to preserve the worker's "
+                "scripts prefix and Elan toolchain (or pass --bubble instead). "
+                "`tauceti doctor` shows the required shim → backend chain."
             )
         os.environ["TAUCETI_REAL_LAKE"] = lake_path
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
@@ -729,8 +733,8 @@ def cli_main() -> int:
 
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
-    can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "lake", "trusted-run"):
+    can run git-safe-push / gh-safe-pr-create / claim.sh / lake on PATH. Cheap and idempotent."""
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "lake"):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

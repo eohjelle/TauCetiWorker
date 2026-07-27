@@ -316,10 +316,6 @@ def host_agent_env() -> dict[str, str]:
     return {
         **os.environ,
         "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}",
-        # Login-shell startup files are allowed to rewrite PATH. Prompts use these absolute shims so
-        # trusted build routing does not depend on the scripts/ prefix surviving that rewrite.
-        "TAUCETI_LAKE": str(HERE / "scripts" / "lake"),
-        "TAUCETI_TRUSTED_RUN": str(HERE / "scripts" / "trusted-run"),
     }
 
 
@@ -534,11 +530,15 @@ def host_login_shell_which(tool: str, env: dict | None = None) -> str | None:
         probe_env.pop("TAUCETI_REAL_LAKE", None)
     quoted_tool = shlex.quote(tool)
     if tool == "lake":
-        # Agent prompts invoke the absolute shim because login startup files may rewrite PATH. In the
-        # same login shell, prove both that ordinary Lake is resolvable and that the shim can resolve
-        # the real executable from the post-startup PATH it will actually inherit.
+        # Plain ``lake`` is the agent-facing contract. Prove that login startup did not rewrite PATH
+        # around the worker shim, then ask that exact shim for the real backend it would execute.
         wrapper = str(HERE / "scripts" / "lake")
-        command = f"command -v {quoted_tool} >/dev/null || exit 1; TAUCETI_LAKE_RESOLVE_ONLY=1 {shlex.quote(wrapper)}"
+        quoted_wrapper = shlex.quote(wrapper)
+        command = (
+            f"tauceti_lake=$(command -v {quoted_tool}) || exit 1; "
+            f'[ "$tauceti_lake" = {quoted_wrapper} ] || exit 126; '
+            f"TAUCETI_LAKE_RESOLVE_ONLY=1 {quoted_wrapper}"
+        )
     else:
         command = f"command -v {quoted_tool}"
     try:
@@ -577,7 +577,9 @@ def _run_host_login_command(argv: list[str], *, cwd: Path, env: dict) -> subproc
 def fetch_host_lake_caches(cfg: Config) -> None:
     """Fetch Mathlib plus TauCeti's public artifacts for the currently active trusted build view."""
     env = host_agent_env()
-    lake = env["TAUCETI_LAKE"]
+    # Worker-owned setup does not rely on prompt/PATH resolution. The agent itself uses plain ``lake``
+    # only after preflight has proved that its login shell resolves that name to this same shim.
+    lake = str(HERE / "scripts" / "lake")
 
     mathlib = _run_host_login_command([lake, "exe", "cache", "get"], cwd=cfg.checkout, env=env)
     if mathlib.returncode:

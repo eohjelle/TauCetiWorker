@@ -25,6 +25,7 @@ LAKE_KEYS = (
     "LAKE_ARTIFACT_CACHE",
     "LAKE_RESTORE_ARTIFACTS",
 )
+LAUNCHER_KEYS = ("TAUCETI_LAKE", "TAUCETI_TRUSTED_RUN")
 
 
 def check(name, ok):
@@ -53,10 +54,12 @@ def temp_cfg(root: Path):
 
 # The host owns the service configuration.  It must not fall back to the isolated HOME's ~/.lake,
 # and later shells spawned by the model must see the exact same settings used by the trusted fetch.
-saved_lake_env = {key: os.environ.get(key) for key in LAKE_KEYS}
+saved_lake_env = {key: os.environ.get(key) for key in (*LAKE_KEYS, *LAUNCHER_KEYS)}
 try:
     for key in LAKE_KEYS:
         os.environ[key] = f"/stale/operator/value/{key}"
+    for key in LAUNCHER_KEYS:
+        os.environ.pop(key, None)
     with tempfile.TemporaryDirectory() as td:
         cfg = temp_cfg(Path(td))
         env = tc.configure_host_lake_cache(cfg)
@@ -90,7 +93,10 @@ try:
 
         _, agent_env = tc.host_agent_argv("PROMPT", "codex")
         check("host agent inherits every Lake cache variable", all(agent_env.get(key) == env[key] for key in LAKE_KEYS))
-        check("host agent inherits an absolute Lake launcher", Path(agent_env.get("TAUCETI_LAKE", "")).is_absolute())
+        check(
+            "host agent uses the transparent plain-Lake contract",
+            "TAUCETI_LAKE" not in agent_env and "TAUCETI_TRUSTED_RUN" not in agent_env,
+        )
 finally:
     restore_env(saved_lake_env)
 
@@ -172,6 +178,10 @@ check(
 check(
     "cache commands run through a login shell",
     all(len(argv) >= 3 and argv[-2] == "-lc" for _, argv, _, _ in calls),
+)
+check(
+    "worker-owned cache fetch invokes the absolute Lake shim",
+    all(str(REPO / "scripts" / "lake") in argv[-1] for _, argv, _, _ in calls),
 )
 
 # A transient Mathlib outage gets one retry.  Once the retry succeeds, the TauCeti fetch still follows.

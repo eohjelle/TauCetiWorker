@@ -7,11 +7,11 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Start with those logs before running an expensive local build. Identify the failing step, module, and
   declaration from CI, then reproduce only the smallest relevant command:
   - For an elaboration/build failure, run
-    `"${TAUCETI_LAKE:-lake}" build TauCeti.<Module>` (or
-    `"${TAUCETI_LAKE:-lake}" env lean TauCeti/Path/To/Module.lean`).
+    `lake build TauCeti.<Module>` (or
+    `lake env lean TauCeti/Path/To/Module.lean`).
   - For an audit or lint failure, run only the failing check:
-    `"${TAUCETI_LAKE:-lake}" exe axioms`, `"${TAUCETI_LAKE:-lake}" exe module-system`, or
-    `"${TAUCETI_TRUSTED_RUN:-env}" bash scripts/lint-env.sh`.
+    `lake exe axioms`, `lake exe module-system`, or
+    `lake env bash scripts/lint-env.sh`.
 - Iterate with that targeted module/check command while fixing it. Do not repeatedly run the complete CI
   suite during diagnosis; it is the final gate below.
 - If `lint-env` flags a declaration that is NOT in your diff, do not assume the branch is merely stale.
@@ -33,11 +33,11 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Final gate before pushing (run the complete CI suite only here)
 Only after the targeted failure is fixed, run all of these together as the final gate:
 ```
-"${TAUCETI_LAKE:-lake}" exe cache get
-"${TAUCETI_LAKE:-lake}" build --iofail
-"${TAUCETI_LAKE:-lake}" exe axioms
-"${TAUCETI_LAKE:-lake}" exe module-system
-"${TAUCETI_TRUSTED_RUN:-env}" bash scripts/lint-env.sh
+lake exe cache get
+lake build --iofail
+lake exe axioms
+lake exe module-system
+lake env bash scripts/lint-env.sh
 ```
 If this gate exposes another failure, return to the smallest targeted command, fix it, then rerun the
 complete gate. A green `lake build` alone is NOT enough — the `build` check also fails on an axiom-audit,

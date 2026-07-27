@@ -44,7 +44,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint scripts/lake scripts/trusted-run tests/*.sh tests/run-all
+        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint scripts/lake tests/*.sh tests/run-all
 
   build:
     runs-on: ubuntu-latest
@@ -65,12 +65,16 @@ jobs:
           uv pip install --python /tmp/smoke/bin/python dist/*.whl
           /tmp/smoke/bin/tauceti --help
           cd /tmp && /tmp/smoke/bin/python -P - <<'PY'
+          import os
           import pathlib
           import tauceti_worker.__main__ as m
           base = pathlib.Path(m.__file__).parent
           assert (base / "prompts").is_dir(), "prompts/ missing from the installed wheel"
           assert (base / "scripts").is_dir(), "scripts/ missing from the installed wheel"
-          print("bundled prompts/ and scripts/ present")
+          lake = base / "scripts" / "lake"
+          assert lake.is_file(), "scripts/lake missing from the installed wheel"
+          assert os.access(lake, os.X_OK), "scripts/lake was not made executable"
+          print("bundled prompts/ and executable scripts/lake present")
           PY
 
   docker:

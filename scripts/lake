@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Host-agent Lake shim. Prompts invoke it by absolute path because login startup files may rewrite
-# PATH. It resolves the real Lake executable from that login shell's PATH, then enters the detached
+# Host-agent Lake shim. The host agent's PATH routes ordinary `lake` commands here transparently.
+# It resolves the real Lake executable from the login shell's PATH, then enters the detached
 # trusted-main build view when one is active. Bubble does not use this shim.
 set -euo pipefail
 
@@ -71,9 +71,6 @@ if [[ -n ${TAUCETI_TRUSTED_BUILD:-} ]]; then
       fi
       cp -p -- "$pr_checkout/$pin" "$TAUCETI_TRUSTED_BUILD/$pin"
     done
-  fi
-  if [[ ${TAUCETI_LAKE_SYNC_ONLY:-} == 1 ]]; then
-    exit 0
   fi
   cd -- "$TAUCETI_TRUSTED_BUILD"
 fi
