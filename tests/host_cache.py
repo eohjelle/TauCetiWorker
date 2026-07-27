@@ -74,6 +74,7 @@ try:
         )
         check("Lake cache path is absolute", cache_path.is_absolute())
         check("Lake cache is checkout-local", cache_path == cfg.checkout / ".lake" / "cache")
+        check("fresh host-cache preflight leaves the clone target absent", not cfg.checkout.exists())
         check("Lake artifact cache is enabled", env["LAKE_ARTIFACT_CACHE"] == "true")
         check("Lake restores artifacts during later builds", env["LAKE_RESTORE_ARTIFACTS"] == "true")
         check("public config selects TauCeti service", 'cache.defaultService = "tauceti-public"' in config)
@@ -97,6 +98,12 @@ try:
             "host agent uses the transparent plain-Lake contract",
             "TAUCETI_LAKE" not in agent_env and "TAUCETI_TRUSTED_RUN" not in agent_env,
         )
+
+        # prepare_host_authoring calls the same setup again once prepare_checkout has cloned the
+        # repository. At that point materialize the checkout-local cache as before.
+        (cfg.checkout / ".git").mkdir(parents=True)
+        tc.configure_host_lake_cache(cfg)
+        check("host cache materializes after the checkout exists", cache_path.is_dir())
 finally:
     restore_env(saved_lake_env)
 

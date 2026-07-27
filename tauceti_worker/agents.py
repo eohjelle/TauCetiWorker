@@ -507,7 +507,13 @@ def configure_host_lake_cache(cfg: Config) -> dict[str, str]:
     )
     try:
         cfg.state.mkdir(parents=True, exist_ok=True)
-        Path(env["LAKE_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        # cli.preflight() calls this before dispatch has prepared a first-run checkout, solely so its
+        # login-shell probe and the eventual agent share one environment.  Do not create .lake/cache
+        # in that fresh clone target: git clone refuses an existing nonempty destination.
+        # prepare_host_authoring() calls us again after prepare_checkout(), at which point the cache
+        # directory can be materialized safely.
+        if (cfg.checkout / ".git").is_dir():
+            Path(env["LAKE_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
         config_path = Path(env["LAKE_CONFIG"])
         if not config_path.exists() or config_path.read_text() != config:
             config_path.write_text(config)
