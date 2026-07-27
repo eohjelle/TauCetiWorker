@@ -120,13 +120,18 @@ def run_checks(data, label):
         [p.number for p in prs if is_tended(p) and p.build_failed and not p.head_ref.startswith("bump-mathlib/")],
     )
 
-    # bump: a bump-mathlib PR whose authoritative build is red and trusted bump validator is green.
+    # bump: a tended bump-mathlib PR whose authoritative build is red and trusted bump validator is green.
     check(
         "bump (bump-mathlib)",
-        '.[] | select(.headRefName|startswith("bump-mathlib/")) '
+        '.[] | select(%s) | select(.headRefName|startswith("bump-mathlib/")) '
         "| select(%s | any($b[]; . | IN(%s))) "
-        '| select(%s | ($g|length)>0 and (all($g[]; .=="SUCCESS")))' % (BUILD_STATES, fail_set, BUMP_GUARD_STATES),
-        [p.number for p in prs if p.head_ref.startswith("bump-mathlib/") and p.build_failed and p.bump_guard_success],
+        '| select(%s | ($g|length)>0 and (all($g[]; .=="SUCCESS")))'
+        % (tended, BUILD_STATES, fail_set, BUMP_GUARD_STATES),
+        [
+            p.number
+            for p in prs
+            if is_tended(p) and p.head_ref.startswith("bump-mathlib/") and p.build_failed and p.bump_guard_success
+        ],
     )
 
     return fails

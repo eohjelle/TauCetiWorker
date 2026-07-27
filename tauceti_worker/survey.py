@@ -357,7 +357,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     nondraft = [p for p in prs if not p.is_draft]
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
-    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci): its own, plus FIRST-PARTY
+    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci/bump): its own, plus FIRST-PARTY
     # bot automation — a bot-authored PR whose head branch lives in the base repo (the review bot's
     # bump PRs). Requiring the head in-repo keeps the worker off a fork or an external/unrelated bot's
     # branch (which it either can't push to, or shouldn't touch); a human contributor's PR is neither
@@ -521,13 +521,13 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         else:
             sv.red_ci.actionable.append(c)
 
-    # 5) bump: a bump-mathlib PR whose build is RED and whose required bump-guard status is green —
+    # 5) bump: a tended bump-mathlib PR whose build is RED and whose required bump-guard status is green —
     #    mathlib moved out from under the last-known-good bump and TauCeti/ needs adapting. CI overlays
     #    PR pins only after its trusted validator posts that status; an invalid/pending bump must never
     #    be executed on the host. We adapt validated bumps; we never author one (the bot owns opening
     #    them, CI owns merging green ones). This is the bump-specific CI-fixer: fix-ci defers every
     #    bump branch here (rebase still owns conflicts and fix still owns review findings).
-    for p in nondraft:
+    for p in tended:
         if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
             continue
         c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
