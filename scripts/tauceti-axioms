@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Run the changed-module axiom audit from the matching TauCeti feature branch
+# without requiring that branch to be installed in the target checkout.
+set -euo pipefail
+
+SOURCE="repos/eohjelle/TauCeti/contents/scripts/Axioms.lean?ref=codex%2Fnative-scoped-checks"
+
+if ! repo_root=$(git rev-parse --show-toplevel); then
+  echo "tauceti-axioms: run this from a TauCeti checkout" >&2
+  exit 2
+fi
+if [ ! -f "$repo_root/lakefile.toml" ] || [ ! -d "$repo_root/TauCeti" ]; then
+  echo "tauceti-axioms: $repo_root is not a TauCeti checkout" >&2
+  exit 2
+fi
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tauceti-axioms.XXXXXX")
+cleanup() {
+  rm -rf -- "$tmpdir"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+source_file="$tmpdir/Axioms.lean"
+gh api -H "Accept: application/vnd.github.raw" "$SOURCE" >"$source_file"
+
+cd "$repo_root"
+lake env lean --run "$source_file" "$@"

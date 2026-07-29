@@ -464,10 +464,10 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 - `tauceti`: a small PEP 723 `uv` shim ([PEP 723](https://peps.python.org/pep-0723/)) so
   `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
   `tauceti` console script (`tauceti_worker.cli:cli_main`).
-- `scripts/`: `claim.sh`, `git-safe-push`, and `gh-safe-pr-create`. These are
-  placed on the agents' `PATH` inside a round. `oauth_refresh_loop.py` and
-  `docker-entrypoint` support the Docker deployment. (The wheel bundles this directory
-  into the package.)
+- `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`, and the temporary
+  `tauceti-axioms` / `tauceti-lint-env` feature-branch adapters. These are placed on
+  the agents' `PATH` inside a round. `oauth_refresh_loop.py` and `docker-entrypoint`
+  support the Docker deployment. (The wheel bundles this directory into the package.)
 - `Dockerfile` and `compose.yaml`: the unattended, persistent Docker deployment.
 - `prompts/*.md`: the per-task agent prompts.
 - `tests/`: plain `python3 tests/<name>.py` scripts (`dashboard.py` runs under `uv run`), driven

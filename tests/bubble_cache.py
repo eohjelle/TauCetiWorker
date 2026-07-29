@@ -160,6 +160,13 @@ try:
     check("work round does not expose the upstream domain directly", "--allow-domain" not in work_argv)
     check("work round runs both cache commands", "lake exe cache get" in work_argv and "lake cache get" in work_argv)
     check("work round stages no competing Lake config", not (cfg.state / "bubble-round" / "lake-cache.toml").exists())
+    check(
+        "work round stages scoped-check wrappers",
+        all(
+            os.access(cfg.state / "bubble-round" / name, os.X_OK)
+            for name in ("tauceti-axioms", "tauceti-lint-env")
+        ),
+    )
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):

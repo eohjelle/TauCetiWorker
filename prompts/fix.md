@@ -28,8 +28,8 @@ For each finding, judge whether it is actually correct:
 ```
 lake exe cache get
 lake build
-lake exe axioms --changed-from origin/main
-lake env bash scripts/lint-env.sh --changed-from origin/main
+tauceti-axioms --changed-from origin/main
+tauceti-lint-env --changed-from origin/main
 ```
 Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
 declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.

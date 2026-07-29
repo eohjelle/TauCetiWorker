@@ -44,7 +44,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint tests/*.sh tests/run-all
+        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/tauceti-axioms scripts/tauceti-lint-env scripts/docker-entrypoint tests/*.sh tests/run-all
 
   build:
     runs-on: ubuntu-latest
@@ -70,6 +70,8 @@ jobs:
           base = pathlib.Path(m.__file__).parent
           assert (base / "prompts").is_dir(), "prompts/ missing from the installed wheel"
           assert (base / "scripts").is_dir(), "scripts/ missing from the installed wheel"
+          assert (base / "scripts" / "tauceti-axioms").is_file(), "tauceti-axioms missing from the installed wheel"
+          assert (base / "scripts" / "tauceti-lint-env").is_file(), "tauceti-lint-env missing from the installed wheel"
           print("bundled prompts/ and scripts/ present")
           PY
 

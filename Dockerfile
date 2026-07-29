@@ -60,6 +60,7 @@ COPY tauceti_worker ./tauceti_worker
 RUN install -m 0755 scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
     && chmod 0755 tauceti scripts/claim.sh scripts/gh-safe-pr-create scripts/git-safe-push \
+        scripts/tauceti-axioms scripts/tauceti-lint-env \
     && ./tauceti --help >/dev/null \
     && git config --system user.name "TauCeti Worker" \
     && git config --system user.email "tauceti-worker@users.noreply.github.com" \

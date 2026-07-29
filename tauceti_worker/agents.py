@@ -902,9 +902,15 @@ def run_in_bubble(
     shutil.rmtree(rounddir, ignore_errors=True)
     rounddir.mkdir(parents=True, exist_ok=True)
     (rounddir / "prompt.txt").write_text(prompt)
-    # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
-    # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
-    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+    # Stage the write and scoped-check wrappers: mounted read-only at /opt/round and put on PATH
+    # inside the container. The agent's ONLY push path remains the branch-CAS git-safe-push.
+    for f in (
+        "git-safe-push",
+        "gh-safe-pr-create",
+        "claim.sh",
+        "tauceti-axioms",
+        "tauceti-lint-env",
+    ):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
