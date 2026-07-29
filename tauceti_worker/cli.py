@@ -172,8 +172,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--stream",
         action="store_true",
-        help="stream the agent's (noisy) conversation log to the terminal; "
-        "default redirects it to a file under logs/ and prints the path (or $TAUCETI_STREAM=1)",
+        help="stream the agent's formatted activity transcript to the terminal; "
+        "default writes that same transcript under logs/ and prints the path (or $TAUCETI_STREAM=1)",
     )
     p.add_argument(
         "--roadmap-only",

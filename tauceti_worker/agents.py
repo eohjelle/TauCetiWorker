@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
+from .agent_logs import AgentLogRenderer
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -384,9 +385,10 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
         # such as enterprise model providers, MCP servers, and notification hooks.
         env.pop("OPENAI_API_KEY", None)  # Codex rounds are paced against ChatGPT subscription usage
-        argv = ["codex", "exec", "--model", profile.model]
+        argv = ["codex", "exec", "--json", "--model", profile.model]
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
+        argv += ["-c", 'model_reasoning_summary="detailed"']
         argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
@@ -396,7 +398,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         argv = [*base, "-p", prompt, "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
-        argv += ["--dangerously-skip-permissions"]
+        argv += ["--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
     return argv, env
 
 
@@ -406,27 +408,69 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{profile.provider}")
+    return run_agent_proc(
+        argv,
+        env=env,
+        cwd=cwd,
+        logdir=logdir,
+        label=f"agent-{profile.provider}",
+        provider=profile.provider,
+    )
 
 
-def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None) -> int:
-    """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
-    by default we redirect it to a timestamped file under logdir and print only the path, so the round
-    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
-    On a non-zero exit we always tail the log so failures aren't silent."""
+def _run_agent_output(
+    argv: list[str],
+    *,
+    cwd: str | None,
+    env: dict,
+    provider: str | None,
+    output,
+) -> int:
+    """Run one agent and incrementally normalize its merged stdout/stderr."""
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    renderer = AgentLogRenderer(provider)
+    for raw_line in proc.stdout:
+        for rendered in renderer.render_line(raw_line):
+            print(rendered, file=output, flush=True)
+    return proc.wait()
+
+
+def run_agent_proc(
+    argv: list[str],
+    *,
+    env: dict,
+    logdir: Path,
+    label: str,
+    cwd: Path | None = None,
+    provider: str | None = None,
+) -> int:
+    """Run an agent through the same readable transcript pipeline for files and ``--stream``.
+
+    Codex/Claude commands request structured JSONL, which is rendered as narration, bounded tool
+    inputs/results, compact file-change summaries, failures, and the final response. Non-JSON setup
+    output and other providers pass through unchanged. On a non-zero exit we still tail the logfile
+    so failures are not silent.
+    """
     cwds = str(cwd) if cwd is not None else None
-    # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
-    # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
-    # Codex then treats it as additional prompt input and waits forever for EOF.
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL).returncode
+        return _run_agent_output(argv, cwd=cwds, env=env, provider=provider, output=sys.stdout)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     log(f"{label}: output → {logf}  (run with --stream to watch live)")
-    with open(logf, "ab") as f:
-        rc = subprocess.run(
-            argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT
-        ).returncode
+    with open(logf, "a", encoding="utf-8", buffering=1) as f:
+        rc = _run_agent_output(argv, cwd=cwds, env=env, provider=provider, output=f)
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         try:
@@ -778,8 +822,11 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     if profile.provider == "codex":
         effort_config = f'model_reasoning_effort="{profile.effort}"'
         effort = f" -c {shlex.quote(effort_config)}" if profile.effort else ""
+        summary_config = 'model_reasoning_summary="detailed"'
+        summary = f" -c {shlex.quote(summary_config)}"
         return (
-            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {shlex.quote(profile.model)}{effort} "
+            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --json --model "
+            f"{shlex.quote(profile.model)}{effort}{summary} "
             '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
         )
     if profile.provider in OPENROUTER_MODELS:
@@ -791,7 +838,8 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     effort = f" --effort {shlex.quote(profile.effort)}" if profile.effort else ""
     return (
         'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
-        f"--model {shlex.quote(profile.model)}{effort} --dangerously-skip-permissions"
+        f"--model {shlex.quote(profile.model)}{effort} --output-format stream-json --verbose "
+        "--dangerously-skip-permissions"
     )
 
 
@@ -1005,7 +1053,7 @@ def run_in_bubble(
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
-            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}", provider=wm)
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode
     finally:

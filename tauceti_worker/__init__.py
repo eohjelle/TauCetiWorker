@@ -24,6 +24,7 @@ import sys  # noqa: F401
 import time  # noqa: F401
 
 from . import (
+    agent_logs,
     agents,
     cli,
     config,
@@ -41,7 +42,22 @@ from . import (
 
 # Flatten each submodule's public + private top-level names into the package namespace, in
 # dependency order, so the entire former single-module surface is reachable as tauceti_worker.<NAME>.
-_MODULES = (paths, constants, config, github, quota, review_state, survey, round, agents, work_units, loop, tui, cli)
+_MODULES = (
+    paths,
+    constants,
+    config,
+    github,
+    quota,
+    review_state,
+    survey,
+    round,
+    agent_logs,
+    agents,
+    work_units,
+    loop,
+    tui,
+    cli,
+)
 for _m in _MODULES:
     for _k, _v in vars(_m).items():
         if not _k.startswith("__"):

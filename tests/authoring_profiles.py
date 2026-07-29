@@ -40,7 +40,7 @@ try:
     check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
     default_host, _ = tc.host_agent_argv("PROMPT", codex)
     default_bubble = tc.agent_inner_cmd(codex)
-    check("default Codex host launch is direct", default_host[:3], ["codex", "exec", "--model"])
+    check("default Codex host launch is direct", default_host[:4], ["codex", "exec", "--json", "--model"])
     check("default Codex host launch prefers Sol", "gpt-5.6-sol" in default_host, True)
     check("default Codex host launch carries one model", "gpt-5.6-terra" in default_host, False)
     check("default Codex bubble launch is direct", "codex exec" in default_bubble, True)

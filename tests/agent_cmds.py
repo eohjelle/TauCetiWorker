@@ -5,7 +5,6 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -31,10 +30,13 @@ check(
     [
         "codex",
         "exec",
+        "--json",
         "--model",
         "gpt-5.6-sol",
         "-c",
         'model_reasoning_effort="high"',
+        "-c",
+        'model_reasoning_summary="detailed"',
         "--sandbox",
         "danger-full-access",
         "--skip-git-repo-check",
@@ -48,7 +50,19 @@ a, env = tc.host_agent_argv(P, "claude")
 check(
     "claude",
     a,
-    ["claude", "-p", P, "--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"],
+    [
+        "claude",
+        "-p",
+        P,
+        "--model",
+        "claude-opus-5",
+        "--effort",
+        "high",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ],
 )
 assert "ANTHROPIC_API_KEY" not in env, "claude env must drop ANTHROPIC_API_KEY (bills the Max plan)"
 print("[OK ] claude env drops ANTHROPIC_API_KEY")
@@ -62,10 +76,19 @@ print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 
 # Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
 # stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.
-saved_run = tc.agents.subprocess.run
+saved_popen = tc.agents.subprocess.Popen
 saved_stream = os.environ.get("TAUCETI_STREAM")
 calls = []
-tc.agents.subprocess.run = lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=0)
+
+
+class FakeProc:
+    stdout = ()
+
+    def wait(self):
+        return 0
+
+
+tc.agents.subprocess.Popen = lambda *a, **k: calls.append(k) or FakeProc()
 try:
     with tempfile.TemporaryDirectory() as td:
         os.environ["TAUCETI_STREAM"] = "1"
@@ -75,7 +98,7 @@ try:
         tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test")
         check("logged agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
 finally:
-    tc.agents.subprocess.run = saved_run
+    tc.agents.subprocess.Popen = saved_popen
     if saved_stream is None:
         os.environ.pop("TAUCETI_STREAM", None)
     else:
@@ -121,6 +144,9 @@ check(
         "claude-opus-5",
         "--effort",
         "high",
+        "--output-format",
+        "stream-json",
+        "--verbose",
         "--dangerously-skip-permissions",
     ],
 )
@@ -129,7 +155,19 @@ a, _ = tc.host_agent_argv(P, "claude")
 check(
     "claude override blank falls back",
     a,
-    ["claude", "-p", P, "--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"],
+    [
+        "claude",
+        "-p",
+        P,
+        "--model",
+        "claude-opus-5",
+        "--effort",
+        "high",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ],
 )
 tc.agents.CLAUDE_CMD = _saved
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
@@ -151,12 +189,16 @@ def _m9():
     eq(
         "inner codex",
         tc.agent_inner_cmd("codex"),
-        'env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"',
+        "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --json --model gpt-5.6-sol "
+        "-c 'model_reasoning_effort=\"high\"' -c 'model_reasoning_summary=\"detailed\"' "
+        '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"',
     )
     eq(
         "inner claude",
         tc.agent_inner_cmd("claude"),
-        'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" --dangerously-skip-permissions --model opus',
+        'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
+        "--model claude-opus-5 --effort high --output-format stream-json --verbose "
+        "--dangerously-skip-permissions",
     )
     eq(
         "inner deepseek",

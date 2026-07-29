@@ -225,9 +225,12 @@ bubble yourself, `tauceti` fetches it with `uvx` when it isn't already on your `
 (`--host` used to be how you opted out of the sandbox. The host is now the default,
 so the flag is a no-op that just warns; pass `--bubble` for the sandbox.)
 
-The agent's conversation transcript is noisy, so by default a round redirects it
-to a timestamped file under `logs/` and prints the path (tailing it if the agent
-exits non-zero). Pass `--stream` to watch it live on the terminal instead.
+By default, a round writes a readable, timestamped agent transcript under
+`logs/` and prints the path (tailing it if the agent exits non-zero). Codex and
+Claude use their structured event streams so the transcript includes narration,
+tool calls and bounded results, failures, compact file-change summaries, and the
+final response without repeated full diffs or hidden chain-of-thought. Pass
+`--stream` to send that same formatted transcript to the terminal live instead.
 
 ## Pacing against quota
 
