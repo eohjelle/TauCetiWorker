@@ -86,6 +86,7 @@ RUN_STDLIB=(
   safe_exists.py
   scoreboard_trust.py
   shared_build_caches.py
+  scoped_check_prompts.py
   source_argument.py
   spread_candidates.py
   ssl_cert_file.py
