@@ -31,15 +31,18 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 - Aim for ~150–400 lines of genuine, non-vacuous content. Smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions; a `≃ₜ`-valued def is `...Homeomorph`, not `...Equiv`; never `@[simp]` a variable-head lemma; never silence a linter.
 - Must build green AND pass the axiom audit (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`).
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing
 ```
 lake exe cache get
 lake build
-lake exe axioms
+lake exe axioms --changed-from origin/main
+lake env bash scripts/lint-env.sh --changed-from origin/main
 ```
-If `lake build` is red, FIX IT or pick a smaller target. Never push red.
+Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
+declarations in changed modules; CI runs their repository-wide forms. If `lake build` is red, FIX IT
+or pick a smaller target. Never push red.
 
-**Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** Run the commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`): the branch is pushed there, and the PR is opened from your fork to `TauCetiProject/TauCeti:main`. You do not need write access to the canonical repo. (The wrappers are already configured to push to your fork — just run them.)
@@ -56,4 +59,5 @@ You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`)
   Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 
 ## Report
-End with a concise summary: the target you chose and why it was lowest-hanging, the file(s) added and line count, the exact `lake build` / `lake exe axioms` result lines (proving green + axiom-clean), and the PR number/URL. Do not claim green unless you saw it.
+End with a concise summary: the target you chose and why it was lowest-hanging, the file(s) added and
+line count, and the PR number/URL.

@@ -16,13 +16,16 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
-## Verify before pushing (all three MUST pass, after the merge/rebase)
+## Verify before pushing (after the merge/rebase)
 ```
 lake exe cache get
 lake build
-lake exe axioms
+lake exe axioms --changed-from origin/main
+lake env bash scripts/lint-env.sh --changed-from origin/main
 ```
-Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
+Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
+declarations in changed modules; CI runs their repository-wide forms. Iterate until green — a botched
+conflict resolution that builds red is worse than the conflict.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -36,4 +39,4 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which files conflicted, how you resolved each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary of which files conflicted and how you resolved each.

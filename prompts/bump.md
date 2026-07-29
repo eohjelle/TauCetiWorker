@@ -8,7 +8,6 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 ```
 lake exe cache get
 lake build
-lake exe axioms
 ```
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 - For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
@@ -19,13 +18,15 @@ lake exe axioms
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing
 ```
 lake exe cache get
 lake build
-lake exe axioms
+lake exe axioms --changed-from origin/main
+lake env bash scripts/lint-env.sh --changed-from origin/main
 ```
-Iterate until green. Never push red.
+Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
+declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -39,4 +40,4 @@ Iterate until green. Never push red.
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke `TauCeti/`, how you adapted each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary of which Mathlib changes broke `TauCeti/` and how you adapted each.

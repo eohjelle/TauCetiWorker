@@ -4,17 +4,20 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
-- Reproduce locally — this is the source of truth, not the log alone. The single `build` check bundles
-  the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
-  ```
-  lake exe cache get
-  lake build
-  lake exe axioms
-  lake exe module-system
-  bash scripts/lint-env.sh
-  ```
-  If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
-  overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
+- Start with those logs before running an expensive local build. Identify the failing step, module, and
+  declaration from CI, then reproduce only the smallest relevant command:
+  - For an elaboration/build failure, run
+    `lake build TauCeti.<Module>` (or
+    `lake env lean TauCeti/Path/To/Module.lean`).
+  - For an axiom or lint failure, run only the corresponding changed-module check:
+    `lake exe axioms --changed-from origin/main` or
+    `lake env bash scripts/lint-env.sh --changed-from origin/main`.
+  - For a module-system failure, run `lake exe module-system`.
+- Iterate with that targeted command while fixing the failure. Do not repeatedly run the final gate
+  during diagnosis.
+- If `lint-env` flags a declaration that is NOT in your diff, investigate whether a new global `simp`
+  lemma, instance, import, or attribute in your diff changed the environment seen by that declaration.
+  CI remains the repository-wide backstop for uncommon non-local effects.
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
@@ -26,16 +29,18 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
-## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
+## Verify before pushing
 ```
 lake exe cache get
 lake build
-lake exe axioms
+lake exe axioms --changed-from origin/main
 lake exe module-system
-bash scripts/lint-env.sh
+lake env bash scripts/lint-env.sh --changed-from origin/main
 ```
 Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
-fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). Never push red.
+fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). The local
+axiom and lint commands cover declarations in changed modules; CI runs their repository-wide forms.
+Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -49,4 +54,5 @@ fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing do
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: what was failing, the root cause, what you changed (or that you only
+re-triggered transient CI), and why.
