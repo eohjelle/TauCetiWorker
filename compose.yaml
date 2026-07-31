@@ -15,6 +15,8 @@ services:
       KIRO_API_KEY: "${KIRO_API_KEY:-}"
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       OPENROUTER_MANAGEMENT_KEY: "${OPENROUTER_MANAGEMENT_KEY:-}"
+      # This deployment's Lean installation is dedicated to TauCeti worker checkouts.
+      TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "true"
     volumes:
       # Agent and GitHub subscription credentials, created by the one-time login step.
       - claude-worker:/root/.claude:ro
