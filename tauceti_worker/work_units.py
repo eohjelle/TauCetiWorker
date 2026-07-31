@@ -21,6 +21,7 @@ from .agents import (
     fetch_ref,
     fill_prompt,
     host_agent_argv,
+    maintain_host_lake_cache,
     prepare_checkout,
     prepare_host_authoring,
     resolve_authoring_profile,
@@ -329,7 +330,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         detail = f"provider={profile.provider}, model={profile.model}, effort={effort}, sandbox={where}"
     log(f"→ {stage.upper()}: {what}   [{detail}]")
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
-    rc = fn(w, sv, c, opts, bubble)
+    try:
+        rc = fn(w, sv, c, opts, bubble)
+    finally:
+        # A writable artifact cache may cross its soft limit while the agent builds.  The agent has
+        # exited (or failed) before this runs, so a whole-cache purge cannot race Lake file access.
+        if not bubble and opts.host_prepared:
+            maintain_host_lake_cache(w.cfg, phase="after round")
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.

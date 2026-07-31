@@ -25,8 +25,11 @@ from .constants import (
     CLAUDE_CMD,
     CODEX_AUTHORING_FALLBACK_MODEL,
     CODEX_MODEL_ACCESS_TTL,
+    HOST_LAKE_CACHE_MAX_BYTES,
+    HOST_LAKE_CACHE_MIN_FREE_BYTES,
     OPENROUTER_MODELS,
     PI_RUN,
+    PRUNE_OBSOLETE_LEAN_TOOLCHAINS,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
@@ -569,11 +572,16 @@ def _host_shell() -> str:
 
 
 def host_lake_env(cfg: Config) -> dict[str, str]:
-    """The host Lake cache environment shared by current-main warmup and the work agent."""
+    """The host Lake cache environment shared by warmup and the work agent.
+
+    Writable artifact caching preserves the host-mode speedup across rounds.  An operator-supplied
+    value remains authoritative; otherwise host mode enables it and bounds the resulting storage
+    separately rather than silently changing Lake's behavior.
+    """
     return {
         "LAKE_CONFIG": str((cfg.state / "lake-cache.toml").absolute()),
         "LAKE_CACHE_DIR": str((cfg.checkout / ".lake" / "cache").absolute()),
-        "LAKE_ARTIFACT_CACHE": "true",
+        "LAKE_ARTIFACT_CACHE": os.environ.get("LAKE_ARTIFACT_CACHE", "true"),
         "LAKE_RESTORE_ARTIFACTS": "true",
     }
 
@@ -607,6 +615,85 @@ def configure_host_lake_cache(cfg: Config) -> dict[str, str]:
     # Export once in this one-round worker process so every supported model inherits the exact same knobs.
     os.environ.update(env)
     return env
+
+
+def _configured_gibibytes(name: str, default_bytes: int) -> int:
+    """Read a positive whole-GiB storage limit, falling back safely on invalid operator input."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default_bytes
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        log(f"warning: ignoring invalid {name}={raw!r}; expected a positive whole number of GiB")
+        return default_bytes
+    return value * 1024**3
+
+
+def _allocated_tree_bytes(root: Path) -> int:
+    """Return allocated bytes under ``root``, counting hard-linked inodes only once."""
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            stat = (Path(dirpath) / filename).lstat()
+            inode = (stat.st_dev, stat.st_ino)
+            if inode in seen:
+                continue
+            seen.add(inode)
+            total += stat.st_blocks * 512
+    return total
+
+
+def maintain_host_lake_cache(cfg: Config, *, phase: str, require_headroom: bool = False) -> bool:
+    """Purge the writable artifact cache only at a safe round boundary when storage is pressured.
+
+    The cache is deliberately one disposable unit because Lake has no artifact-level LRU.  This is a
+    high-water policy, not a filesystem quota: a running build may cross a threshold and is allowed to
+    finish before the post-round check removes the cache.
+    """
+    cache = cfg.checkout / ".lake" / "cache"
+    if not cache.exists():
+        return False
+    max_bytes = _configured_gibibytes("TAUCETI_LAKE_CACHE_MAX_GIB", HOST_LAKE_CACHE_MAX_BYTES)
+    min_free = _configured_gibibytes("TAUCETI_LAKE_CACHE_MIN_FREE_GIB", HOST_LAKE_CACHE_MIN_FREE_BYTES)
+    try:
+        allocated = _allocated_tree_bytes(cache)
+        free = shutil.disk_usage(cache).free
+    except OSError as e:
+        if require_headroom:
+            raise Die(f"preflight: could not measure host Lake cache storage: {e}") from e
+        log(f"warning: could not measure host Lake cache during {phase}: {e}")
+        return False
+    reasons = []
+    if allocated >= max_bytes:
+        reasons.append(f"{allocated / 1024**3:.1f} GiB >= {max_bytes / 1024**3:.0f} GiB limit")
+    if free < min_free:
+        reasons.append(f"only {free / 1024**3:.1f} GiB filesystem space remains")
+    if not reasons:
+        return False
+    try:
+        shutil.rmtree(cache)
+        cache.mkdir(parents=True)
+    except OSError as e:
+        if require_headroom:
+            raise Die(f"preflight: could not purge host Lake cache: {e}") from e
+        log(f"warning: could not purge host Lake cache during {phase}: {e}")
+        return False
+    log(f"host Lake cache purged {phase}: {'; '.join(reasons)}")
+    if require_headroom:
+        try:
+            remaining = shutil.disk_usage(cache).free
+        except OSError as e:
+            raise Die(f"preflight: could not verify filesystem space after purging the host Lake cache: {e}") from e
+        if remaining < min_free:
+            raise Die(
+                "preflight: filesystem space remains below the host Lake cache safety floor after "
+                f"purging ({remaining / 1024**3:.1f} GiB free; {min_free / 1024**3:.0f} GiB required)"
+            )
+    return True
 
 
 def host_login_shell_which(tool: str, env: dict | None = None) -> str | None:
@@ -648,6 +735,44 @@ def _run_host_login_command(argv: list[str], *, cwd: Path, env: dict) -> subproc
         return subprocess.CompletedProcess(argv, 1, "", str(e))
 
 
+def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
+    """On opted-in dedicated hosts, retain only official toolchains requested by worker checkouts."""
+    if not PRUNE_OBSOLETE_LEAN_TOOLCHAINS:
+        return
+    required: set[str] = set()
+    checkouts = cfg.checkout.parent.parent
+    try:
+        toolchain_files = {cfg.checkout / "lean-toolchain", *checkouts.glob("*/TauCeti/lean-toolchain")}
+        for toolchain_file in toolchain_files:
+            if not toolchain_file.is_file():
+                continue
+            requested = toolchain_file.read_text().strip()
+            if requested:
+                required.add(requested)
+    except OSError as e:
+        log(f"warning: could not inspect worker Lean toolchains: {e}")
+        return
+    if not required:
+        return
+    env = host_agent_env()
+    listed = _run_host_login_command(["elan", "toolchain", "list"], cwd=cfg.checkout, env=env)
+    if listed.returncode:
+        detail = ((listed.stderr or "") + (listed.stdout or "")).strip()[-300:]
+        suffix = f" ({detail})" if detail else ""
+        log(f"warning: could not list installed Lean toolchains; skipping cleanup{suffix}")
+        return
+    installed = {line.split()[0] for line in (listed.stdout or "").splitlines() if line.split()}
+    obsolete = sorted(name for name in installed if name.startswith("leanprover/lean4:") and name not in required)
+    for name in obsolete:
+        removed = _run_host_login_command(["elan", "toolchain", "uninstall", name], cwd=cfg.checkout, env=env)
+        if removed.returncode:
+            detail = ((removed.stderr or "") + (removed.stdout or "")).strip()[-300:]
+            suffix = f" ({detail})" if detail else ""
+            log(f"warning: could not uninstall obsolete Lean toolchain {name}{suffix}")
+        else:
+            log(f"uninstalled obsolete Lean toolchain {name}")
+
+
 def fetch_host_lake_caches(cfg: Config) -> None:
     """Fetch Mathlib plus TauCeti's public artifacts into the persistent host checkout."""
     env = host_agent_env()
@@ -684,7 +809,9 @@ def prepare_host_authoring(cfg: Config) -> None:
     """
     if not prepare_checkout(cfg):
         raise Die("preflight: could not prepare the current-main host authoring checkout")
+    prune_obsolete_host_lean_toolchains(cfg)
     configure_host_lake_cache(cfg)
+    maintain_host_lake_cache(cfg, phase="before round", require_headroom=True)
     fetch_host_lake_caches(cfg)
 
 

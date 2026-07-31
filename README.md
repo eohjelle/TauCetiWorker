@@ -416,6 +416,9 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `TAUCETI_LAKE_CACHE_MAX_GIB` | `10` | Soft high-water mark for the writable host `.lake/cache`; checked only before and after a round. |
+| `TAUCETI_LAKE_CACHE_MIN_FREE_GIB` | `4` | Purge the disposable host `.lake/cache` at a round boundary when the checkout filesystem has less free space. |
+| `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS` | `false` | On a dedicated host, remove official Lean toolchains no worker checkout requests. Custom and linked toolchains are never removed. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. Explicit model/effort override those fields while unrelated host configuration remains available; an explicit model disables automatic fallback. |
@@ -459,8 +462,14 @@ For host authoring, credential HOME isolation leaves Elan in its original
 available in the agent's login shell, resets the persistent checkout to current
 main, and restores Mathlib plus TauCeti's public Lake artifacts. The agent then
 uses that same checkout, `.lake`, and cache environment while working normally
-on the PR branch. Maintenance prompts make rebasing that writable branch onto
-current main the agent's responsibility; the worker does not substitute a different Lake
+on the PR branch. Writable Lake artifacts are retained up to a 10 GiB soft limit;
+the worker purges that one disposable cache between rounds if it reaches the
+limit or filesystem free space drops below 4 GiB. A dedicated worker host can
+set `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS=true`; current-main preparation then
+keeps official Lean toolchains requested by any worker checkout and uninstalls
+the others, while always leaving custom/linked Elan toolchains alone.
+Maintenance prompts make rebasing that writable branch onto current main the
+agent's responsibility; the worker does not substitute a different Lake
 configuration. `tauceti doctor` shows the Lake path seen by the agent shell.
 
 `tauceti doctor` checks all of this.

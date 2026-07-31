@@ -72,7 +72,10 @@ try:
         check("Lake cache path is absolute", cache_path.is_absolute())
         check("Lake cache is checkout-local", cache_path == cfg.checkout / ".lake" / "cache")
         check("fresh host-cache preflight leaves the clone target absent", not cfg.checkout.exists())
-        check("Lake artifact cache is enabled", env["LAKE_ARTIFACT_CACHE"] == "true")
+        check(
+            "Lake artifact cache respects an operator override",
+            env["LAKE_ARTIFACT_CACHE"] == "/stale/operator/value/LAKE_ARTIFACT_CACHE",
+        )
         check("Lake restores artifacts during later builds", env["LAKE_RESTORE_ARTIFACTS"] == "true")
         check("public config selects TauCeti service", 'cache.defaultService = "tauceti-public"' in config)
         check("public config has one service block", config.count("[[cache.service]]") == 1)
@@ -100,6 +103,19 @@ try:
 finally:
     restore_env(saved_lake_env)
 
+with tempfile.TemporaryDirectory() as td:
+    cfg = temp_cfg(Path(td))
+    saved_artifact_cache = os.environ.pop("LAKE_ARTIFACT_CACHE", None)
+    try:
+        check("Lake artifact cache defaults to writable", tc.host_lake_env(cfg)["LAKE_ARTIFACT_CACHE"] == "true")
+        os.environ["LAKE_ARTIFACT_CACHE"] = "false"
+        check("explicit read-only artifact cache is preserved", tc.host_lake_env(cfg)["LAKE_ARTIFACT_CACHE"] == "false")
+    finally:
+        if saved_artifact_cache is None:
+            os.environ.pop("LAKE_ARTIFACT_CACHE", None)
+        else:
+            os.environ["LAKE_ARTIFACT_CACHE"] = saved_artifact_cache
+
 
 def exercise_prepare(mathlib_rcs, tauceti_rc):
     """Run prepare_host_authoring with checkout/network effects replaced by a command recorder."""
@@ -110,27 +126,43 @@ def exercise_prepare(mathlib_rcs, tauceti_rc):
     mathlib_rcs = iter(mathlib_rcs)
     saved_prepare_checkout = tc.agents.prepare_checkout
     saved_run = tc.agents.subprocess.run
+    saved_prune = tc.agents.PRUNE_OBSOLETE_LEAN_TOOLCHAINS
     saved_env = {key: os.environ.get(key) for key in LAKE_KEYS}
 
     def fake_prepare_checkout(got):
         check("prepare receives the requested worker config", got is cfg)
         order.append("prepare-main")
+        (cfg.checkout / ".git").mkdir(parents=True)
+        (cfg.checkout / "lean-toolchain").write_text("leanprover/lean4:v4.test\n")
         return True
 
     def fake_run(argv, **kwargs):
         rendered = " ".join(str(arg) for arg in argv)
-        if "lake exe cache get" in rendered:
+        if "elan toolchain list" in rendered:
+            kind, rc = "elan-list", 0
+            stdout = (
+                "leanprover/lean4:v4.old\n"
+                "leanprover/lean4:v4.test\n"
+                "custom-linked-toolchain\n"
+            )
+        elif "elan toolchain uninstall" in rendered:
+            kind, rc, stdout = "elan-uninstall", 0, ""
+        elif "lake exe cache get" in rendered:
             kind, rc = "mathlib", next(mathlib_rcs)
+            stdout = ""
         elif "lake cache get" in rendered:
             kind, rc = "tauceti", tauceti_rc
+            stdout = ""
         else:
             kind, rc = "other", 0
+            stdout = ""
         order.append(kind)
         calls.append((kind, list(argv), rendered, kwargs))
-        return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
 
     tc.agents.prepare_checkout = fake_prepare_checkout
     tc.agents.subprocess.run = fake_run
+    tc.agents.PRUNE_OBSOLETE_LEAN_TOOLCHAINS = True
     try:
         result = tc.prepare_host_authoring(cfg)
         error = None
@@ -139,6 +171,7 @@ def exercise_prepare(mathlib_rcs, tauceti_rc):
     finally:
         tc.agents.prepare_checkout = saved_prepare_checkout
         tc.agents.subprocess.run = saved_run
+        tc.agents.PRUNE_OBSOLETE_LEAN_TOOLCHAINS = saved_prune
         restore_env(saved_env)
         import shutil
 
@@ -150,8 +183,20 @@ def exercise_prepare(mathlib_rcs, tauceti_rc):
 # means more compilation later, so it must not prevent the semantic repair agent from launching.
 _, error, order, calls = exercise_prepare([0], 1)
 check("TauCeti cache miss is nonfatal", error is None)
-check("current main is prepared before either cache fetch", order[:3] == ["prepare-main", "mathlib", "tauceti"])
+check(
+    "current main and toolchains are prepared before either cache fetch",
+    order[:5] == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "tauceti"],
+)
 check("host setup runs no unexpected subprocess", "other" not in order)
+check(
+    "obsolete official Lean toolchain is uninstalled",
+    any("elan toolchain uninstall leanprover/lean4:v4.old" in command for _, _, command, _ in calls),
+)
+uninstalls = [command for kind, _, command, _ in calls if kind == "elan-uninstall"]
+check(
+    "only obsolete official toolchains are uninstalled",
+    len(uninstalls) == 1 and "leanprover/lean4:v4.old" in uninstalls[0],
+)
 check(
     "host setup never runs a pre-agent lake build",
     all("lake build" not in command for _, _, command, _ in calls),
@@ -173,17 +218,65 @@ check(
 )
 check(
     "cache commands receive all Lake variables",
-    all(all((kwargs.get("env") or {}).get(key) for key in LAKE_KEYS) for _, _, _, kwargs in calls),
+    all(
+        all((kwargs.get("env") or {}).get(key) for key in LAKE_KEYS)
+        for kind, _, _, kwargs in calls
+        if kind in ("mathlib", "tauceti")
+    ),
 )
 check(
     "cache commands run through a login shell",
     all(len(argv) >= 3 and argv[-2] == "-lc" for _, argv, _, _ in calls),
 )
-check("cache fetch invokes plain Lake", all(argv[-1].startswith("exec lake ") for _, argv, _, _ in calls))
+check(
+    "cache fetch invokes plain Lake",
+    all(argv[-1].startswith("exec lake ") for kind, argv, _, _ in calls if kind in ("mathlib", "tauceti")),
+)
+
+# A shared Elan installation must retain the predecessor while a sibling worker checkout still names it.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    checkout = root / "checkouts" / "worker1" / "TauCeti"
+    sibling = root / "checkouts" / "worker2" / "TauCeti"
+    state = root / "state" / "worker1"
+    checkout.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    state.mkdir(parents=True)
+    (checkout / "lean-toolchain").write_text("leanprover/lean4:v4.new\n")
+    (sibling / "lean-toolchain").write_text("leanprover/lean4:v4.old\n")
+    cfg = SimpleNamespace(checkout=checkout, state=state)
+    uninstall_calls = []
+    saved_login_command = tc.agents._run_host_login_command
+
+    def fake_login_command(argv, **_kwargs):
+        uninstall_calls.append(list(argv))
+        stdout = "leanprover/lean4:v4.old\nleanprover/lean4:v4.new\n" if argv[-1] == "list" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    saved_prune = tc.agents.PRUNE_OBSOLETE_LEAN_TOOLCHAINS
+    tc.agents._run_host_login_command = fake_login_command
+    tc.agents.PRUNE_OBSOLETE_LEAN_TOOLCHAINS = True
+    try:
+        tc.prune_obsolete_host_lean_toolchains(cfg)
+        check("sibling checkout retains its requested toolchain", uninstall_calls == [["elan", "toolchain", "list"]])
+        (sibling / "lean-toolchain").write_text("leanprover/lean4:v4.new\n")
+        tc.prune_obsolete_host_lean_toolchains(cfg)
+        check(
+            "predecessor is retired after every checkout upgrades",
+            uninstall_calls[-2:]
+            == [["elan", "toolchain", "list"], ["elan", "toolchain", "uninstall", "leanprover/lean4:v4.old"]],
+        )
+    finally:
+        tc.agents._run_host_login_command = saved_login_command
+        tc.agents.PRUNE_OBSOLETE_LEAN_TOOLCHAINS = saved_prune
 
 # A transient Mathlib outage gets one retry.  Once the retry succeeds, the TauCeti fetch still follows.
 _, error, order, calls = exercise_prepare([1, 0], 0)
-check("Mathlib cache gets one retry", error is None and order == ["prepare-main", "mathlib", "mathlib", "tauceti"])
+check(
+    "Mathlib cache gets one retry",
+    error is None
+    and order == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "mathlib", "tauceti"],
+)
 check(
     "retry path still has no full build",
     all("lake build" not in command for _, _, command, _ in calls),
@@ -192,11 +285,61 @@ check(
 # Two Mathlib failures are a machine/setup failure: fail before touching TauCeti or launching a model.
 _, error, order, calls = exercise_prepare([1, 1], 0)
 check("repeated Mathlib failure raises Die", isinstance(error, tc.Die))
-check("fatal Mathlib path stops before TauCeti", order == ["prepare-main", "mathlib", "mathlib"])
+check(
+    "fatal Mathlib path stops before TauCeti",
+    order == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "mathlib"],
+)
 check(
     "fatal Mathlib path still has no full build",
     all("lake build" not in command for _, _, command, _ in calls),
 )
+
+# Cache retention is a soft high-water check at round boundaries. It removes only .lake/cache,
+# preserves the incremental build tree, and also responds to low free space independently.
+with tempfile.TemporaryDirectory() as td:
+    cfg = temp_cfg(Path(td))
+    artifact = cfg.checkout / ".lake" / "cache" / "artifacts" / "branch-output"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"branch artifact")
+    build_output = cfg.checkout / ".lake" / "build" / "lib" / "lean" / "TauCeti.olean"
+    build_output.parent.mkdir(parents=True)
+    build_output.write_bytes(b"warm incremental build")
+    saved_max = tc.agents.HOST_LAKE_CACHE_MAX_BYTES
+    saved_min = tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES
+    saved_disk_usage = tc.agents.shutil.disk_usage
+    saved_limit_env = {
+        name: os.environ.pop(name, None)
+        for name in ("TAUCETI_LAKE_CACHE_MAX_GIB", "TAUCETI_LAKE_CACHE_MIN_FREE_GIB")
+    }
+    try:
+        tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1
+        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 1
+        check("10 GiB is the default artifact-cache limit", saved_max == 10 * 1024**3)
+        check("oversized artifact cache is purged", tc.maintain_host_lake_cache(cfg, phase="test"))
+        check("cache purge removes branch artifacts", not artifact.exists())
+        check("cache purge preserves incremental build outputs", build_output.exists())
+
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"new branch artifact")
+        tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1024**4
+        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 4 * 1024**3
+        tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=1024**3)
+        check("low filesystem space independently purges the cache", tc.maintain_host_lake_cache(cfg, phase="test"))
+
+        os.environ["TAUCETI_LAKE_CACHE_MAX_GIB"] = "12"
+        check(
+            "operator can raise the cache limit",
+            tc.agents._configured_gibibytes("TAUCETI_LAKE_CACHE_MAX_GIB", saved_max) == 12 * 1024**3,
+        )
+    finally:
+        tc.agents.HOST_LAKE_CACHE_MAX_BYTES = saved_max
+        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = saved_min
+        tc.agents.shutil.disk_usage = saved_disk_usage
+        for name, value in saved_limit_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 # dispatch() is the counter boundary.  Host preparation must happen before do_fix_ci, whose real
@@ -279,7 +422,13 @@ finally:
 # both caches again before the second claim.
 reuse_saved = {
     name: getattr(wu, name)
-    for name in ("prepare_host_authoring", "_host_agent_binary", "do_fix_ci", "_progress_snapshot")
+    for name in (
+        "prepare_host_authoring",
+        "maintain_host_lake_cache",
+        "_host_agent_binary",
+        "do_fix_ci",
+        "_progress_snapshot",
+    )
 }
 reuse_events = []
 reuse_opts = tc.RoundOpts(
@@ -303,6 +452,7 @@ def claimed_then_run(*_args):
 
 try:
     wu.prepare_host_authoring = record_prepare
+    wu.maintain_host_lake_cache = lambda *_args, **_kwargs: reuse_events.append("maintain")
     wu._host_agent_binary = lambda _stage, _model: None
     wu.do_fix_ci = claimed_then_run
     wu._progress_snapshot = lambda *_args: None
@@ -310,7 +460,10 @@ try:
     second = wu.dispatch("fix-ci", SimpleNamespace(cfg=SimpleNamespace()), SimpleNamespace(), c, reuse_opts)
     check("claim-raced candidate asks the caller to continue", first is None)
     check("second candidate completes without another host warmup", second == 1)
-    check("claim-raced candidates reuse one host cache preparation", reuse_events == ["prepare", "stage", "stage"])
+    check(
+        "claim-raced candidates reuse one host cache preparation and check storage after each stage",
+        reuse_events == ["prepare", "stage", "maintain", "stage", "maintain"],
+    )
 finally:
     for name, value in reuse_saved.items():
         setattr(wu, name, value)

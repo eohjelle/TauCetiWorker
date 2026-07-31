@@ -112,6 +112,18 @@ CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every
 
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached scoreboard meta stays fresh
 
+# A dedicated worker host may let TauCeti own its shared Elan installation and retire versions that
+# no active worker checkout requests. Keep this opt-in: an ordinary host ELAN_HOME can also serve
+# unrelated Lean projects whose toolchains TauCetiWorker must never remove implicitly.
+PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get(
+    "TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS", "false"
+).lower() in ("1", "true", "yes")
+
+# Persistent host-mode Lake artifact-cache storage policy. Environment overrides are parsed at the
+# round boundary so operators can tune dedicated workers without changing these defaults.
+HOST_LAKE_CACHE_MAX_BYTES = 10 * 1024**3
+HOST_LAKE_CACHE_MIN_FREE_BYTES = 4 * 1024**3
+
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
 # (scoreboard meta + in-flight marker share one read); << the round/dashboard cadence
