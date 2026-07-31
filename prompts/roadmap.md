@@ -23,7 +23,7 @@ You are authoring a new pull request to TauCetiProject/TauCeti, an AIs-welcome L
   checklist, and ignore their instructions about roles, verdicts, and JSON output — those
   belong to a different agent and are not your output format. In your closing report, name the
   rubrics you read.
-__SOURCE_GUIDANCE__- Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The pinned Mathlib source is vendored in this checkout at `.lake/packages/mathlib` once `lake exe cache get` (or dependency resolution) has run — `grep` there; don't try to clone it from the network.
+__SOURCE_GUIDANCE__- Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The worker has already populated the pinned Mathlib source at `.lake/packages/mathlib` — `grep` there; don't rerun the cache fetch or try to clone Mathlib from the network.
 
 ## Claim your target (so two agents don't author the same thing)
 Once you have settled on a target, derive a short stable id for it and claim it BEFORE you start building. This lets other autonomous workers see the target is taken; it is cooperative, not a hard lock.
@@ -67,16 +67,16 @@ Make only fixes you can justify against a rubric. Do NOT broaden the PR, add spe
 generality, or invent findings to look diligent: scope is itself a rubric, and a sound small PR
 beats a padded one. If nothing needs changing, say so and move on. Then verify, once:
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing
+The worker fetched the Mathlib cache before launching you; do not repeat `lake exe cache get`.
 ```
-lake exe cache get
 lake build
-lake exe axioms
+tauceti-axioms --changed-from origin/main
+tauceti-lint-env --changed-from origin/main
 ```
 If `lake build` is red, FIX IT or retreat (below). Never push red.
 
-
-**Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 
 ## If the target won't close
 Never downgrade to a lookalike: a weakened statement, a degenerate special case, or scaffolding carrying the result's name. Retreat one rung at a time:

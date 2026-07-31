@@ -92,9 +92,9 @@ check(
 )
 check("kiro model is explicit (never Auto)", "auto" in [arg.lower() for arg in a], False)
 
-# PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
+# PATH must prepend HERE so the agent resolves the write and scoped-check wrappers.
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
-print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
+print("[OK ] PATH prepends repo dir for the agent wrappers")
 
 # Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
 # stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.

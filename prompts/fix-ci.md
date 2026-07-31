@@ -4,24 +4,27 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
-- Reproduce locally — this is the source of truth, not the log alone. The single `build` check bundles
-  the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
+- Then bring this writable PR branch up to date before running any local Lean command:
   ```
-  lake exe cache get
-  git fetch -q origin main
-  shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"; have_base=0
-  base_ref="$(git merge-base origin/main HEAD)"
-  if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); have_base=1; fi
-  if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
-  if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
-  rm -f "$base_shims"; rm -rf "$base_root"
-  lake build
-  lake exe axioms
-  lake exe module-system
-  bash scripts/lint-env.sh
+  git fetch origin
+  git rebase origin/main
   ```
-  If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
-  overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
+  Resolve any conflicts without discarding either main's changes or the PR's intent.
+- Start with those logs before running an expensive local build. Identify the failing step, module, and
+  declaration from CI, then reproduce only the smallest relevant command:
+  - For an elaboration/build failure, run
+    `lake build TauCeti.<Module>` (or
+    `lake env lean TauCeti/Path/To/Module.lean`).
+  - For an axiom or lint failure, run only the corresponding changed-module check:
+    `tauceti-axioms --changed-from origin/main` or
+    `tauceti-lint-env --changed-from origin/main`.
+  - For a module-system failure, run `lake exe module-system`.
+- Iterate with that targeted module/check command while fixing it. Do not repeatedly run the complete CI
+  suite during diagnosis; it is the final gate below.
+- If `lint-env` flags a declaration that is NOT in your diff, do not assume the branch is merely stale.
+  A new global `simp` lemma, instance, import, or attribute in your diff can change the environment seen
+  by an existing declaration. Since you rebased onto current main above, investigate that semantic
+  effect instead of dismissing the failure as staleness.
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
@@ -35,7 +38,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
-## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
+## Final gate before pushing
+Only after the targeted failure is fixed, run the global build and module-system audit plus the
+changed-module axiom and lint checks:
 ```
 lake exe cache get
 git fetch -q origin main
@@ -45,13 +50,14 @@ if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; 
 if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
-lake build
-lake exe axioms
+lake build --iofail
+tauceti-axioms --changed-from origin/main
 lake exe module-system
-bash scripts/lint-env.sh
+tauceti-lint-env --changed-from origin/main
 ```
-Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
-fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). Never push red.
+If this gate exposes another failure, return to the smallest targeted command, fix it, then rerun the
+gate. A green `lake build` alone is NOT enough — the changed-module audits must pass too. CI remains the
+authoritative repository-wide axiom and lint audit.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

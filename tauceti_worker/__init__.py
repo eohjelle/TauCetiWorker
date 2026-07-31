@@ -24,6 +24,7 @@ import sys  # noqa: F401
 import time  # noqa: F401
 
 from . import (
+    agent_logs,
     agents,
     cli,
     config,

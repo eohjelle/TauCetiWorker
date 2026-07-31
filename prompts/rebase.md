@@ -4,7 +4,7 @@ You are reconciling the branch with current main on pull request #__PR__ of TauC
 - Fetch and integrate the latest `main`:
   ```
   git fetch origin
-  git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
+  git rebase origin/main
   ```
 - Resolve every conflict on its merits:
   - **`TauCeti.lean` (the intentionally empty root module)**: preserve `main`'s version; do not add imports or reconstruct it.
@@ -21,18 +21,26 @@ If the branch already includes current `main` and no concrete repair is needed, 
 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
-## Verify before pushing (all three MUST pass, after the merge/rebase)
+## Verify before pushing (after the merge/rebase)
 ```
 lake exe cache get
 lake build
-lake exe axioms
+tauceti-axioms --changed-from origin/main
+tauceti-lint-env --changed-from origin/main
 ```
-Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
+Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
+declarations in changed modules; CI runs their repository-wide forms. Iterate until green — a botched
+conflict resolution that builds red is worse than the conflict.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
-- Commit the merge/resolution (if `git merge` left a merge commit, keep its default message; otherwise `<type>: <subject>`, ending the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
+- Finish every conflicted commit with `git add ...` and `GIT_EDITOR=true git rebase --continue`.
+  Rebase reuses the original commit messages, so do not create an extra commit merely to record the
+  rebase.
+- If verification requires additional changes after the rebase, commit those fixes (message
+  `<type>: <subject>`, imperative present; end the body with
+  `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push with the project's safe wrapper — and ONLY the wrapper:
   ```
   "__BIN__/git-safe-push"
@@ -41,4 +49,4 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which files conflicted, how you resolved each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary of which files conflicted and how you resolved each.
