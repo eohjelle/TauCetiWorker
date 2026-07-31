@@ -28,11 +28,16 @@ from pathlib import Path
 from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
+    _host_shell,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
     bubble_supports_lake_cache_service,
     bubble_version_meets_minimum,
+    configure_host_lake_cache,
     ensure_fork_proxy_current,
+    host_agent_env,
+    host_lake_env,
+    host_login_shell_which,
     installed_bubble_version,
     isolate_home,
     resolve_authoring_profile,
@@ -193,8 +198,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--stream",
         action="store_true",
-        help="stream the agent's (noisy) conversation log to the terminal; "
-        "default redirects it to a file under logs/ and prints the path (or $TAUCETI_STREAM=1)",
+        help="stream the agent's formatted activity transcript to the terminal; "
+        "default writes that same transcript under logs/ and prints the path (or $TAUCETI_STREAM=1)",
     )
     p.add_argument(
         "--roadmap-only",
@@ -691,7 +696,22 @@ def cmd_doctor(args) -> int:
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
-    rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
+    agent_shell_env = {**host_agent_env(), **host_lake_env(cfg)}
+    lake_path = host_login_shell_which("lake", env=agent_shell_env)
+    if lake_path:
+        lake_note = f"`{_host_shell()} -lc`: {lake_path}"
+    else:
+        lake_note = f"plain `lake` is not resolvable through `{_host_shell()} -lc`"
+    rows.append(("lake (agent shell)", lake_path is not None, lake_note))
+    push_helper = str(HERE / "scripts" / "git-safe-push")
+    push_path = host_login_shell_which("git-safe-push", env=agent_shell_env)
+    rows.append(
+        (
+            "agent helpers",
+            push_path == push_helper,
+            f"`{_host_shell()} -lc`: {push_path or 'not resolvable'} (expected {push_helper})",
+        )
+    )
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
     codex_creds = codex_dir(cfg.home) / "auth.json"
@@ -722,7 +742,7 @@ def cmd_doctor(args) -> int:
         mark = "ok " if ok else "MISSING"
         if not ok and name in ("gh", "git", "uv/uvx", "gh auth"):
             bad += 1
-        print(f"  [{mark:7}] {name:14} {note}")
+        print(f"  [{mark:7}] {name:20} {note}")
     return 1 if bad else 0
 
 
@@ -736,11 +756,27 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s != "review")
-    if needs_host_build and not _have("lake") and not opts.dry_run:
-        raise Die(
-            "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
-            "(or pass --bubble to build inside the sandbox instead)"
-        )
+    if needs_host_build and not opts.dry_run:
+        configure_host_lake_cache(cfg)
+        agent_env = host_agent_env()
+        lake_path = host_login_shell_which("lake", env=agent_env)
+        if lake_path is None:
+            raise Die(
+                "preflight: plain `lake` is not resolvable in the agent command login shell "
+                f"(`{_host_shell()} -lc`). "
+                "Login-shell startup may be rewriting PATH; configure it so `lake` reaches the shared "
+                "Elan toolchain (or pass --bubble instead). "
+                "`tauceti doctor` shows the path seen by that shell."
+            )
+        push_helper = str(HERE / "scripts" / "git-safe-push")
+        if host_login_shell_which("git-safe-push", env=agent_env) != push_helper:
+            raise Die(
+                "preflight: the agent command login shell "
+                f"(`{_host_shell()} -lc`) does not preserve the worker's helper path; "
+                f"`git-safe-push` must resolve to {push_helper}. "
+                "Configure login-shell PATH to retain the worker's scripts directory. "
+                "`tauceti doctor` shows the path seen by that shell."
+            )
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";
     # catch it here with a pointer to the two ways out.
@@ -827,8 +863,14 @@ def cli_main() -> int:
 
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
-    can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create"):
+    can run the write and scoped-check wrappers on PATH. Cheap and idempotent."""
+    for f in (
+        "claim.sh",
+        "git-safe-push",
+        "gh-safe-pr-create",
+        "tauceti-axioms",
+        "tauceti-lint-env",
+    ):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

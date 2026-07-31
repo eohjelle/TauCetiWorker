@@ -22,7 +22,9 @@ from .agents import (
     fetch_ref,
     fill_prompt,
     host_agent_argv,
+    maintain_host_lake_cache,
     prepare_checkout,
+    prepare_host_authoring,
     resolve_authoring_profile,
     resolve_codex_model_access,
     review_in_bubble,
@@ -98,6 +100,7 @@ class RoundOpts:
     authoring_profile: AuthoringProfile | None = None
     # --account: the Codex account this round is REQUIRED to spend under. Checked, never switched to.
     account: str | None = None
+    host_prepared: bool = False  # dispatch reset the persistent checkout to origin/main and warmed its caches
 
     @property
     def agent_name(self) -> str:
@@ -342,6 +345,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
         opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
+    # Warm current-main artifacts before entering a semantic host-authoring stage. This is a
+    # machine-wide checkout/cache prerequisite, so a failure must stop here — before do_fix* charges
+    # this PR's attempt counters or any model is launched. Host review and Bubble never compile here.
+    if not bubble and stage != "review" and not opts.host_prepared:
+        prepare_host_authoring(w.cfg)
+        opts.host_prepared = True
     # LAUNCH STAGE for a Claude round selected on an unopened window. Everything the bootstrap decision
     # requires is true exactly here and not earlier: a concrete work unit is in hand, the survey (and so
     # the GitHub preflight) succeeded, Claude is the model actually about to run, and the agent binary
@@ -380,7 +389,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     log(f"→ {stage.upper()}: {what}   [{detail}]")
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
-    rc = fn(w, sv, c, opts, bubble)
+    try:
+        rc = fn(w, sv, c, opts, bubble)
+    finally:
+        # A writable artifact cache may cross its soft limit while the agent builds.  The agent has
+        # exited (or failed) before this runs, so a whole-cache purge cannot race Lake file access.
+        if not bubble and opts.host_prepared:
+            maintain_host_lake_cache(w.cfg, phase="after round")
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
@@ -617,14 +632,23 @@ def _do_fixlike(
     *,
     prompt_file: str,
     label: str,
-    charged: tuple[str, ...] = (),
+    attempt_keys: tuple[str, ...] = (),
 ) -> int | None:
     """Shared shape for fix / fix-ci / rebase: take the branch claim, then run the agent against the PR
     branch — in bubble (it checks out the PR inside the container) or on the host checkout.
 
-    `charged` names the per-PR counters the caller already spent, so a provider outage can hand them
-    back (see _refund_infra_failure)."""
+    `attempt_keys` names the per-PR counters charged once checkout reaches the point where a PR-specific
+    failure can occur. A provider outage can hand those counters back (see _refund_infra_failure)."""
     pr, head = c.pr, c.head
+    attempt_charged = False
+
+    def charge_attempt() -> None:
+        nonlocal attempt_charged
+        if not attempt_charged:
+            for key in attempt_keys:
+                w.counters.incr(key)
+            attempt_charged = True
+
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
         raise Die(f"{label}: PR #{pr} vanished from the survey")
@@ -632,27 +656,29 @@ def _do_fixlike(
     # can't check the PR out. Skip to the next candidate rather than build a `https://github.com//`
     # remote or an `allow_push="/"` (a fork head deletes to empty fields in PRInfo.from_json).
     if not (p.head_owner and p.head_repo and p.head_ref):
+        charge_attempt()
         log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
         return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name)
     if bubble:
+        charge_attempt()
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
         rc = run_in_bubble(
             w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
         )  # bubble checks out the PR inside
     else:
-        if not prepare_checkout(w.cfg):
-            log(f"checkout failed for #{pr} — skipping this attempt")
-            report_failure(f"{label} #{pr}: checkout preparation failed", code=1)
-            return 1
+        if not getattr(opts, "host_prepared", False):
+            prepare_host_authoring(w.cfg)
+            opts.host_prepared = True
         co = w.cfg.checkout
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
         chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
         if chk.returncode:
+            charge_attempt()
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
             report_failure(f"{label} #{pr}: gh pr checkout failed: {detail or 'no diagnostic'}", code=1)
@@ -661,43 +687,71 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
+        charge_attempt()
         rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
     else:
-        _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
+        charged_keys = attempt_keys if attempt_charged else ()
+        _refund_infra_failure(w, c, label, charged_keys)  # raises NoProgress when the provider was at fault
     return rc
 
 
 def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    key = f"fix-{pr}-{head[:12]}"
-    w.counters.incr(key)  # count up front (an un-checkout-able PR mustn't loop)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix", charged=(key,))
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="fix.md",
+        label="fix",
+        attempt_keys=(f"fix-{pr}-{head[:12]}",),
+    )
 
 
 def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    keys = (f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}")
-    for key in keys:
-        w.counters.incr(key)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci", charged=keys)
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="fix-ci.md",
+        label="fix-ci",
+        attempt_keys=(f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}"),
+    )
 
 
 def do_rebase(w, sv, c, opts, bubble) -> int | None:
-    key = f"rebase-pr-{c.pr}"
-    w.counters.incr(key)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="rebase.md",
+        label="rebase",
+        attempt_keys=(f"rebase-pr-{c.pr}",),
+    )
 
 
 def do_bump(w, sv, c, opts, bubble) -> int | None:
     """Adapt a red bump-mathlib PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
-    keys = (f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}")  # count up front so an un-checkout-able PR can't loop
-    for key in keys:
-        w.counters.incr(key)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump", charged=keys)
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="bump.md",
+        label="bump",
+        attempt_keys=(f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}"),
+    )
 
 
 def do_progress(w, sv, c, opts, bubble) -> int | None:
@@ -955,7 +1009,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             mounts=mounts,
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
-    if not prepare_checkout(w.cfg):
+    if not getattr(opts, "host_prepared", False) and not prepare_checkout(w.cfg):
         raise Die("checkout failed")
     prompt = fill_prompt(
         HERE / "prompts" / "roadmap.md",

@@ -5,6 +5,12 @@ You are addressing AI code review on pull request #__PR__ of TauCetiProject/TauC
   - `gh pr view __PR__ --repo TauCetiProject/TauCeti --json comments`
   - `gh api "/repos/TauCetiProject/TauCeti/pulls/__PR__/comments?per_page=100"` (the per-rubric review threads; each root carries a `<!--tauceti-rubric:NAME-->` marker, and the finding text + suggested fix).
 - The blocking rubrics are the ones marked ⛔ (block) or 🟡 (changes requested) on the scoreboard. The other rubrics are already ✅ approved — note which ones.
+- Before editing or running Lean, bring this writable PR branch up to date:
+  ```
+  git fetch origin
+  git rebase origin/main
+  ```
+  Resolve any conflicts without discarding either main's changes or the PR's intent.
 
 ## Do not regress what is already green
 The scoreboard shows several rubrics already approved (✅). A re-review re-runs the rubrics you touched, so a change that fixes one blocker but degrades an approved rubric will turn that rubric red and the PR will not converge — this is the single most common reason a nearly-done PR is eventually abandoned. So:
@@ -24,13 +30,15 @@ For each finding, judge whether it is actually correct:
 - Everything under `namespace TauCeti`.
 - Must stay green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force a change through — that is itself a reason to push back on the finding.
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing
 ```
 lake exe cache get
 lake build
-lake exe axioms
+tauceti-axioms --changed-from origin/main
+tauceti-lint-env --changed-from origin/main
 ```
-Iterate until green. Never push red.
+Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
+declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -44,4 +52,5 @@ Iterate until green. Never push red.
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which findings you fixed (and how you verified each), which you contested (and the evidence), and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary of which findings you fixed and which you contested, including the evidence
+for any contest.

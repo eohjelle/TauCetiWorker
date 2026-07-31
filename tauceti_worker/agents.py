@@ -26,14 +26,17 @@ from .constants import (
     CLAUDE_CMD,
     CODEX_AUTHORING_FALLBACK_MODEL,
     CODEX_MODEL_ACCESS_TTL,
+    HOST_LAKE_CACHE_MAX_BYTES,
+    HOST_LAKE_CACHE_MIN_FREE_BYTES,
     OPENROUTER_MODELS,
     PI_RUN,
+    PRUNE_OBSOLETE_LEAN_TOOLCHAINS,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
     TAUCETI,
 )
-from .github import me
+from .github import git_author_identity, me
 from .paths import HERE
 from .quota import (
     Quota,
@@ -326,6 +329,15 @@ def fill_prompt(path: Path, **subs) -> str:
     return out
 
 
+def configure_checkout_git_identity(checkout: Path) -> bool:
+    """Link this checkout's Git author identity to the account authenticated with ``gh``."""
+    name, email = git_author_identity()
+    for key, value in (("user.name", name), ("user.email", email)):
+        if subprocess.run(["git", "-C", str(checkout), "config", "--local", key, value]).returncode:
+            return False
+    return True
+
+
 def prepare_checkout(cfg: Config) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
     co = cfg.checkout
@@ -338,6 +350,8 @@ def prepare_checkout(cfg: Config) -> bool:
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
+    if not configure_checkout_git_identity(co):
+        return False
     if g("fetch", "-q", "origin"):
         return False
     # -f discards a prior round's leftover edits and lands us on main in one step; a plain
@@ -379,10 +393,26 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+def host_agent_env() -> dict[str, str]:
+    """The common environment host work agents and their login-shell preflight receive.
+
+    Elan defaults to ``$HOME/.elan``.  For an isolated worker, ``isolate_home`` has already pinned
+    ``ELAN_HOME`` to the operator's real installation; for the default non-isolated worker, derive the
+    same default directly.  Put that installation's launchers on PATH so plain ``lake`` does not depend
+    on shell startup files re-adding them after HOME isolation.
+    """
+    home = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    elan_home = Path(os.environ.get("ELAN_HOME", str(home / ".elan")))
+    return {
+        **os.environ,
+        "PATH": f"{HERE / 'scripts'}:{elan_home / 'bin'}:{os.environ.get('PATH', '')}",
+    }
+
+
 def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
-    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    env = host_agent_env()
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
@@ -699,6 +729,263 @@ def _host_home() -> Path:
         return Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (ImportError, KeyError, OSError):
         return Path(os.path.expanduser("~"))
+
+
+def _host_shell() -> str:
+    """The login shell agent command tools use, independent of the parent process's ``$SHELL``."""
+    try:
+        import pwd
+
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+        if shell:
+            return shell
+    except (ImportError, KeyError, OSError):
+        pass
+    return os.environ.get("SHELL") or "/bin/sh"
+
+
+def host_lake_env(cfg: Config) -> dict[str, str]:
+    """The host Lake cache environment shared by warmup and the work agent.
+
+    Writable artifact caching preserves the host-mode speedup across rounds.  An operator-supplied
+    value remains authoritative; otherwise host mode enables it and bounds the resulting storage
+    separately rather than silently changing Lake's behavior.
+    """
+    return {
+        "LAKE_CONFIG": str((cfg.state / "lake-cache.toml").absolute()),
+        "LAKE_CACHE_DIR": str((cfg.checkout / ".lake" / "cache").absolute()),
+        "LAKE_ARTIFACT_CACHE": os.environ.get("LAKE_ARTIFACT_CACHE", "true"),
+        "LAKE_RESTORE_ARTIFACTS": "true",
+    }
+
+
+def configure_host_lake_cache(cfg: Config) -> dict[str, str]:
+    """Materialize TauCeti's anonymous public cache config and export the agent's Lake environment."""
+    env = host_lake_env(cfg)
+    config = (
+        f'cache.defaultService = "{TAUCETI_CACHE_SERVICE}"\n'
+        "[[cache.service]]\n"
+        f'name = "{TAUCETI_CACHE_SERVICE}"\n'
+        'kind = "s3"\n'
+        f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
+        f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+    )
+    try:
+        cfg.state.mkdir(parents=True, exist_ok=True)
+        # cli.preflight() calls this before dispatch has prepared a first-run checkout, solely so its
+        # login-shell probe and the eventual agent share one environment.  Do not create .lake/cache
+        # in that fresh clone target: git clone refuses an existing nonempty destination.
+        # prepare_host_authoring() calls us again after prepare_checkout(), at which point the cache
+        # directory can be materialized safely.
+        if (cfg.checkout / ".git").is_dir():
+            Path(env["LAKE_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        config_path = Path(env["LAKE_CONFIG"])
+        if not config_path.exists() or config_path.read_text() != config:
+            config_path.write_text(config)
+    except OSError as e:
+        raise Die(f"preflight: could not configure the host Lake artifact cache: {e}") from e
+    # Host agents are launched later through host_agent_argv(), which deliberately snapshots os.environ.
+    # Export once in this one-round worker process so every supported model inherits the exact same knobs.
+    os.environ.update(env)
+    return env
+
+
+def _configured_gibibytes(name: str, default_bytes: int) -> int:
+    """Read a positive whole-GiB storage limit, falling back safely on invalid operator input."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default_bytes
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        log(f"warning: ignoring invalid {name}={raw!r}; expected a positive whole number of GiB")
+        return default_bytes
+    return value * 1024**3
+
+
+def _allocated_tree_bytes(root: Path) -> int:
+    """Return allocated bytes under ``root``, counting hard-linked inodes only once."""
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            stat = (Path(dirpath) / filename).lstat()
+            inode = (stat.st_dev, stat.st_ino)
+            if inode in seen:
+                continue
+            seen.add(inode)
+            total += stat.st_blocks * 512
+    return total
+
+
+def maintain_host_lake_cache(cfg: Config, *, phase: str, require_headroom: bool = False) -> bool:
+    """Purge the writable artifact cache only at a safe round boundary when storage is pressured.
+
+    The cache is deliberately one disposable unit because Lake has no artifact-level LRU.  This is a
+    high-water policy, not a filesystem quota: a running build may cross a threshold and is allowed to
+    finish before the post-round check removes the cache.
+    """
+    cache = cfg.checkout / ".lake" / "cache"
+    if not cache.exists():
+        return False
+    max_bytes = _configured_gibibytes("TAUCETI_LAKE_CACHE_MAX_GIB", HOST_LAKE_CACHE_MAX_BYTES)
+    min_free = _configured_gibibytes("TAUCETI_LAKE_CACHE_MIN_FREE_GIB", HOST_LAKE_CACHE_MIN_FREE_BYTES)
+    try:
+        allocated = _allocated_tree_bytes(cache)
+        free = shutil.disk_usage(cache).free
+    except OSError as e:
+        if require_headroom:
+            raise Die(f"preflight: could not measure host Lake cache storage: {e}") from e
+        log(f"warning: could not measure host Lake cache during {phase}: {e}")
+        return False
+    reasons = []
+    if allocated >= max_bytes:
+        reasons.append(f"{allocated / 1024**3:.1f} GiB >= {max_bytes / 1024**3:.0f} GiB limit")
+    if free < min_free:
+        reasons.append(f"only {free / 1024**3:.1f} GiB filesystem space remains")
+    if not reasons:
+        return False
+    try:
+        shutil.rmtree(cache)
+        cache.mkdir(parents=True)
+    except OSError as e:
+        if require_headroom:
+            raise Die(f"preflight: could not purge host Lake cache: {e}") from e
+        log(f"warning: could not purge host Lake cache during {phase}: {e}")
+        return False
+    log(f"host Lake cache purged {phase}: {'; '.join(reasons)}")
+    if require_headroom:
+        try:
+            remaining = shutil.disk_usage(cache).free
+        except OSError as e:
+            raise Die(f"preflight: could not verify filesystem space after purging the host Lake cache: {e}") from e
+        if remaining < min_free:
+            raise Die(
+                "preflight: filesystem space remains below the host Lake cache safety floor after "
+                f"purging ({remaining / 1024**3:.1f} GiB free; {min_free / 1024**3:.0f} GiB required)"
+            )
+    return True
+
+
+def host_login_shell_which(tool: str, env: dict | None = None) -> str | None:
+    """Resolve a tool through the same login-shell shape used by agent command execution."""
+    import shlex
+
+    probe_env = dict(env or os.environ)
+    quoted_tool = shlex.quote(tool)
+    try:
+        p = subprocess.run(
+            [_host_shell(), "-lc", f"command -v {quoted_tool}"],
+            env=probe_env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [line.strip() for line in (p.stdout or "").splitlines() if line.strip()]
+    return lines[-1] if p.returncode == 0 and lines else None
+
+
+def _run_host_login_command(argv: list[str], *, cwd: Path, env: dict) -> subprocess.CompletedProcess:
+    """Run host setup via the agent's login shell, capturing a useful failure diagnostic."""
+    import shlex
+
+    try:
+        return subprocess.run(
+            [_host_shell(), "-lc", "exec " + shlex.join(argv)],
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(argv, 1, "", str(e))
+
+
+def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
+    """On opted-in dedicated hosts, retain only official toolchains requested by worker checkouts."""
+    if not PRUNE_OBSOLETE_LEAN_TOOLCHAINS:
+        return
+    required: set[str] = set()
+    checkouts = cfg.checkout.parent.parent
+    try:
+        toolchain_files = {cfg.checkout / "lean-toolchain", *checkouts.glob("*/TauCeti/lean-toolchain")}
+        for toolchain_file in toolchain_files:
+            if not toolchain_file.is_file():
+                continue
+            requested = toolchain_file.read_text().strip()
+            if requested:
+                required.add(requested)
+    except OSError as e:
+        log(f"warning: could not inspect worker Lean toolchains: {e}")
+        return
+    if not required:
+        return
+    env = host_agent_env()
+    listed = _run_host_login_command(["elan", "toolchain", "list"], cwd=cfg.checkout, env=env)
+    if listed.returncode:
+        detail = ((listed.stderr or "") + (listed.stdout or "")).strip()[-300:]
+        suffix = f" ({detail})" if detail else ""
+        log(f"warning: could not list installed Lean toolchains; skipping cleanup{suffix}")
+        return
+    installed = {line.split()[0] for line in (listed.stdout or "").splitlines() if line.split()}
+    obsolete = sorted(name for name in installed if name.startswith("leanprover/lean4:") and name not in required)
+    for name in obsolete:
+        removed = _run_host_login_command(["elan", "toolchain", "uninstall", name], cwd=cfg.checkout, env=env)
+        if removed.returncode:
+            detail = ((removed.stderr or "") + (removed.stdout or "")).strip()[-300:]
+            suffix = f" ({detail})" if detail else ""
+            log(f"warning: could not uninstall obsolete Lean toolchain {name}{suffix}")
+        else:
+            log(f"uninstalled obsolete Lean toolchain {name}")
+
+
+def fetch_host_lake_caches(cfg: Config) -> None:
+    """Fetch Mathlib plus TauCeti's public artifacts into the persistent host checkout."""
+    env = host_agent_env()
+    # Use the same plain command and login-shell environment that preflight verifies for the agent.
+    lake = "lake"
+
+    mathlib = _run_host_login_command([lake, "exe", "cache", "get"], cwd=cfg.checkout, env=env)
+    if mathlib.returncode:
+        mathlib = _run_host_login_command([lake, "exe", "cache", "get"], cwd=cfg.checkout, env=env)
+    if mathlib.returncode:
+        detail = ((mathlib.stderr or "") + (mathlib.stdout or "")).strip()[-500:]
+        suffix = f"\n  lake said: {detail}" if detail else ""
+        raise Die(
+            "preflight: Mathlib cache fetch failed twice in the current-main host checkout; "
+            f"refusing to launch an agent that would compile Mathlib from scratch.{suffix}"
+        )
+
+    own = _run_host_login_command(
+        [lake, "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI],
+        cwd=cfg.checkout,
+        env=env,
+    )
+    if own.returncode:
+        detail = ((own.stderr or "") + (own.stdout or "")).strip()[-300:]
+        suffix = f" ({detail})" if detail else ""
+        log(f"warning: TauCeti Lake cache miss; the agent will build missing outputs{suffix}")
+
+
+def prepare_host_authoring(cfg: Config) -> None:
+    """Warm host authoring from current main without running a full pre-agent build.
+
+    Mathlib's cache is mandatory: falling back to compiling Mathlib would waste the model round. TauCeti's
+    public root-package cache is an optimization and follows CI/Bubble's non-fatal miss semantics.
+    """
+    if not prepare_checkout(cfg):
+        raise Die("preflight: could not prepare the current-main host authoring checkout")
+    prune_obsolete_host_lean_toolchains(cfg)
+    configure_host_lake_cache(cfg)
+    maintain_host_lake_cache(cfg, phase="before round", require_headroom=True)
+    fetch_host_lake_caches(cfg)
 
 
 def bubble_cmd_is_disposable(cmd: list[str] | None = None) -> bool:
@@ -1079,9 +1366,15 @@ def run_in_bubble(
     shutil.rmtree(rounddir, ignore_errors=True)
     rounddir.mkdir(parents=True, exist_ok=True)
     (rounddir / "prompt.txt").write_text(prompt)
-    # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
-    # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
-    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+    # Stage the write and scoped-check wrappers: mounted read-only at /opt/round and put on PATH
+    # inside the container. The agent's ONLY push path remains the branch-CAS git-safe-push.
+    for f in (
+        "git-safe-push",
+        "gh-safe-pr-create",
+        "claim.sh",
+        "tauceti-axioms",
+        "tauceti-lint-env",
+    ):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
@@ -1310,7 +1603,9 @@ def isolate_home(wid: str) -> Path:
     operator's external refresher rotates it. The worker itself never refreshes (never touches the
     single-use refresh token). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is repointed
     there, so both the pacer and the spawned claude read the isolated creds even when the operator's real
-    config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
+    config dir is elsewhere. Elan is intentionally shared: an explicit ``$ELAN_HOME`` is preserved, and
+    otherwise it is pinned to the real pre-isolation home's ``.elan``. Returns the worker home and sets
+    $HOME. Children inherit.
 
     macOS does NOT move $HOME. Both Claude Code and gh keep their credentials in the login Keychain,
     which `security` resolves through $HOME, so repointing it made both unreachable: the pacer found no
@@ -1334,12 +1629,23 @@ def isolate_home(wid: str) -> Path:
     # on macOS where $HOME deliberately does not move. The sentinel is written last, so it means
     # "isolation completed", and a partially built environment re-runs the whole setup.
     if os.environ.get("TAUCETI_DATA_HOME") == str(home):
+        os.environ.setdefault("ELAN_HOME", str(_host_home() / ".elan"))
         # Reassert the redirects rather than trusting them: they are what every credential read
         # resolves through, and a child that lost one would silently use the operator's account.
         os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
         os.environ["CODEX_HOME"] = str(iso_codex)
         return home
+    if sys.platform != "darwin" and Path(os.environ.get("HOME", "")) == home:
+        # An already-isolated child may come from an older launcher that did not export ELAN_HOME.
+        os.environ.setdefault("ELAN_HOME", str(_host_home() / ".elan"))
+        os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
+        os.environ["CODEX_HOME"] = str(iso_codex)
+        os.environ["TAUCETI_DATA_HOME"] = str(home)
+        return home
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    # HOME isolation is for mutable agent credentials, not multi-gigabyte Lean toolchains. Resolve Elan
+    # while HOME still names the operator's real home; loop children inherit this explicit absolute path.
+    os.environ.setdefault("ELAN_HOME", str(real / ".elan"))
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
     iso_claude.mkdir(parents=True, exist_ok=True)
     iso_codex.mkdir(parents=True, exist_ok=True)

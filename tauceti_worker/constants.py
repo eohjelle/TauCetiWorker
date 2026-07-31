@@ -16,7 +16,7 @@ REVIEW = "TauCetiProject/TauCetiReview"
 
 
 # Per-PR budgets (a PR can never churn forever).
-MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't change (a stuck
+MAX_FIX_ATTEMPTS = 6  # per-head: stop re-running the fixer on a commit it can't change (a stuck
 
 # head never advances a review round, so CI's round cap can't catch it).
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
@@ -88,7 +88,7 @@ STATUS_LABELS = ("awaiting-CI", "awaiting-review", "review-in-progress", "awaiti
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
-ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "10800"))  # 3-hour hard cap per round
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
@@ -125,6 +125,18 @@ CLAIM_TTL_S = int(os.environ.get("CLAIM_TTL", "1500"))  # 25 min lease; expires 
 CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every 5 min while the agent runs
 
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached scoreboard meta stays fresh
+
+# A dedicated worker host may let TauCeti own its shared Elan installation and retire versions that
+# no active worker checkout requests. Keep this opt-in: an ordinary host ELAN_HOME can also serve
+# unrelated Lean projects whose toolchains TauCetiWorker must never remove implicitly.
+PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get(
+    "TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS", "false"
+).lower() in ("1", "true", "yes")
+
+# Persistent host-mode Lake artifact-cache storage policy. Environment overrides are parsed at the
+# round boundary so operators can tune dedicated workers without changing these defaults.
+HOST_LAKE_CACHE_MAX_BYTES = 10 * 1024**3
+HOST_LAKE_CACHE_MIN_FREE_BYTES = 4 * 1024**3
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 

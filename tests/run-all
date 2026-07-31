@@ -32,13 +32,17 @@ RUN_STDLIB=(
   codex_account.py
   codex_fallback.py
   contest_claim.py
+  fix_ci_prompt.py
   fix_diagnostic.py
   fork_authoring.py
+  git_identity.py
   github_ratelimit.py
   host_agent_preflight.py
+  host_cache.py
   ignore_quota_hardblock.py
   infra_failure_budget.py
   inflight_review.py
+  isolate_home_elan.py
   isolate_home_macos.py
   isolate_home_paths.py
   ledger_blocking.py

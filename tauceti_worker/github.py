@@ -33,6 +33,26 @@ def me() -> str:
     return login
 
 
+@functools.lru_cache(maxsize=1)
+def git_author_identity() -> tuple[str, str]:
+    """Git author name and GitHub noreply email for the account authenticated with ``gh``."""
+    r = gh_run(["gh", "api", "user", "--jq", "[.login, .id]"])
+    try:
+        login, account_id = json.loads(r.stdout or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        login, account_id = "", None
+    if (
+        r.returncode != 0
+        or not isinstance(login, str)
+        or not login
+        or not isinstance(account_id, int)
+        or isinstance(account_id, bool)
+        or account_id <= 0
+    ):
+        raise Die("could not determine the Git author identity from `gh` (run `gh auth login`)")
+    return login, f"{account_id}+{login}@users.noreply.github.com"
+
+
 def can_push(repo: str) -> bool | None:
     """Does the authenticated account have push (write) access to `repo`? `true`/`false` from GitHub's
     own `permissions.push`, or None when we can't tell (network/rate-limit/parse)."""
