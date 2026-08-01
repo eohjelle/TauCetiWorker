@@ -42,8 +42,8 @@ if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; 
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
 lake build
-tauceti-axioms --changed-from origin/main
-tauceti-lint-env --changed-from origin/main
+tauceti-axioms --changed-since-merge-base origin/main
+tauceti-lint-env --changed-since-merge-base origin/main
 ```
 Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
 declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.

@@ -71,8 +71,8 @@ beats a padded one. If nothing needs changing, say so and move on. Then verify, 
 The worker fetched the Mathlib cache before launching you; do not repeat `lake exe cache get`.
 ```
 lake build
-tauceti-axioms --changed-from origin/main
-tauceti-lint-env --changed-from origin/main
+tauceti-axioms --changed-since-merge-base origin/main
+tauceti-lint-env --changed-since-merge-base origin/main
 ```
 If `lake build` is red, FIX IT or retreat (below). Never push red.
 

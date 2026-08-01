@@ -16,8 +16,8 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
     `lake build TauCeti.<Module>` (or
     `lake env lean TauCeti/Path/To/Module.lean`).
   - For an axiom or lint failure, run only the corresponding changed-module check:
-    `tauceti-axioms --changed-from origin/main` or
-    `tauceti-lint-env --changed-from origin/main`.
+    `tauceti-axioms --changed-since-merge-base origin/main` or
+    `tauceti-lint-env --changed-since-merge-base origin/main`.
   - For a module-system failure, run `lake exe module-system`.
 - Iterate with that targeted module/check command while fixing it. Do not repeatedly run the complete CI
   suite during diagnosis; it is the final gate below.
@@ -51,9 +51,9 @@ if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json le
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
 lake build --iofail
-tauceti-axioms --changed-from origin/main
+tauceti-axioms --changed-since-merge-base origin/main
 lake exe module-system
-tauceti-lint-env --changed-from origin/main
+tauceti-lint-env --changed-since-merge-base origin/main
 ```
 If this gate exposes another failure, return to the smallest targeted command, fix it, then rerun the
 gate. A green `lake build` alone is NOT enough — the changed-module audits must pass too. CI remains the
