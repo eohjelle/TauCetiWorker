@@ -10,8 +10,8 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
     `lake build TauCeti.<Module>` (or
     `lake env lean TauCeti/Path/To/Module.lean`).
   - For an axiom or lint failure, run only the corresponding changed-module check:
-    `lake exe axioms --changed-from origin/main` or
-    `lake env bash scripts/lint-env.sh --changed-from origin/main`.
+    `lake exe axioms --changed-since-merge-base origin/main` or
+    `lake env bash scripts/lint-env.sh --changed-since-merge-base origin/main`.
   - For a module-system failure, run `lake exe module-system`.
 - Iterate with that targeted command while fixing the failure. Do not repeatedly run the final gate
   during diagnosis.
@@ -33,9 +33,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ```
 lake exe cache get
 lake build
-lake exe axioms --changed-from origin/main
+lake exe axioms --changed-since-merge-base origin/main
 lake exe module-system
-lake env bash scripts/lint-env.sh --changed-from origin/main
+lake env bash scripts/lint-env.sh --changed-since-merge-base origin/main
 ```
 Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
 fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). The local

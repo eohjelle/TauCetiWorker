@@ -22,8 +22,8 @@ lake build
 ```
 lake exe cache get
 lake build
-lake exe axioms --changed-from origin/main
-lake env bash scripts/lint-env.sh --changed-from origin/main
+lake exe axioms --changed-since-merge-base origin/main
+lake env bash scripts/lint-env.sh --changed-since-merge-base origin/main
 ```
 Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
 declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.

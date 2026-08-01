@@ -17,11 +17,11 @@ def check(condition: bool, message: str) -> None:
 for name in PROMPTS:
     text = (ROOT / "prompts" / name).read_text()
     check(
-        "lake exe axioms --changed-from origin/main" in text,
+        "lake exe axioms --changed-since-merge-base origin/main" in text,
         f"{name}: missing changed-module axiom audit",
     )
     check(
-        "lake env bash scripts/lint-env.sh --changed-from origin/main" in text,
+        "lake env bash scripts/lint-env.sh --changed-since-merge-base origin/main" in text,
         f"{name}: missing changed-module environment lint",
     )
     check(
