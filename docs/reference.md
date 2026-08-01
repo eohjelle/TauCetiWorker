@@ -68,6 +68,21 @@ An explicit `--author-model`, `TAUCETI_AUTHORING_CODEX_MODEL`, or legacy
 A generic authoring override is rejected with `--agent auto`, because the model
 or effort may not apply to whichever provider quota selection picks.
 
+## Host authoring storage
+
+Credential-home isolation leaves Elan in its original `ELAN_HOME`. Before a host
+authoring round, the worker verifies that ordinary `lake` is available in the
+agent's login shell, resets the persistent checkout to current main, and restores
+Mathlib plus TauCeti's public Lake artifacts. The agent then uses that checkout
+and its writable Lake cache while working on the PR branch.
+
+The worker retains those artifacts up to a 10 GiB soft limit and purges only the
+disposable `.lake/cache` between rounds when the limit is reached or filesystem
+free space falls below 4 GiB. On a dedicated worker host,
+`TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS=true` additionally removes official Lean
+toolchains that no worker checkout requests; custom and linked toolchains are
+always preserved. `tauceti doctor` shows the Lake path visible to the agent shell.
+
 ## Codex accounts
 
 `--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
@@ -108,6 +123,9 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% < elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `TAUCETI_LAKE_CACHE_MAX_GIB` | `10` | Soft high-water mark for the writable host `.lake/cache`, checked only between rounds. |
+| `TAUCETI_LAKE_CACHE_MIN_FREE_GIB` | `4` | Purge that disposable cache at a round boundary when the checkout filesystem has less free space. |
+| `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS` | `false` | On a dedicated host, remove official Lean toolchains no worker checkout requests; never remove custom or linked toolchains. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |

@@ -17,8 +17,8 @@ def check(name, ok):
     print(f"[{'OK ' if ok else 'XX '}] {name}")
 
 
-axioms = "tauceti-axioms --changed-from origin/main"
-lint = "tauceti-lint-env --changed-from origin/main"
+axioms = "tauceti-axioms --changed-since-merge-base origin/main"
+lint = "tauceti-lint-env --changed-since-merge-base origin/main"
 axiom_wrapper = (REPO / "scripts" / "tauceti-axioms").read_text()
 lint_wrapper = (REPO / "scripts" / "tauceti-lint-env").read_text()
 
@@ -31,11 +31,11 @@ for prompt_name in PROMPT_NAMES:
     check(f"{prompt_name} no longer uses the bundled helper", "tauceti-local-checks" not in prompt)
     check(
         f"{prompt_name} does not bypass the axiom wrapper",
-        "lake exe axioms --changed-from" not in prompt,
+        "lake exe axioms --changed-since-merge-base" not in prompt,
     )
     check(
         f"{prompt_name} does not bypass the lint wrapper",
-        "scripts/lint-env.sh --changed-from" not in prompt,
+        "scripts/lint-env.sh --changed-since-merge-base" not in prompt,
     )
     check(
         f"{prompt_name} has no repository-wide axiom command",
@@ -45,6 +45,7 @@ for prompt_name in PROMPT_NAMES:
         f"{prompt_name} has no repository-wide lint command",
         re.search(r"(?m)^(?:lake env )?bash scripts/lint-env\.sh$", prompt) is None,
     )
+    check(f"{prompt_name} does not use the retired flag", "--changed-from" not in prompt)
     check(
         f"{prompt_name} identifies CI as the repository-wide backstop",
         "CI" in prompt and "repository-wide" in prompt,
@@ -53,7 +54,8 @@ for prompt_name in PROMPT_NAMES:
     report = prompt.split("## Report", 1)[1]
     check(
         f"{prompt_name} report guidance omits routine verification",
-        not re.search(r"\b(?:lake|axiom|lint|verification)\b", report, re.IGNORECASE),
+        not re.search(r"\b(?:lake|axiom|lint|verification)\b", report, re.IGNORECASE)
+        or "You don't need to make claims about" in report,
     )
 
 fix_ci = (REPO / "prompts" / "fix-ci.md").read_text()

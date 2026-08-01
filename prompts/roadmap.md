@@ -40,10 +40,11 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 The worker fetched the Mathlib cache before launching you; do not repeat `lake exe cache get`.
 ```
 lake build
-tauceti-axioms --changed-from origin/main
-tauceti-lint-env --changed-from origin/main
+tauceti-axioms --changed-since-merge-base origin/main
+tauceti-lint-env --changed-since-merge-base origin/main
 ```
-If `lake build` is red, FIX IT or retreat (below). Never push red.
+The axiom and lint commands check declarations in changed modules; CI remains the authoritative
+repository-wide audit. If `lake build` is red, FIX IT or retreat (below). Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 

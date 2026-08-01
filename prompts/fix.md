@@ -34,8 +34,8 @@ For each finding, judge whether it is actually correct:
 ```
 lake exe cache get
 lake build
-tauceti-axioms --changed-from origin/main
-tauceti-lint-env --changed-from origin/main
+tauceti-axioms --changed-since-merge-base origin/main
+tauceti-lint-env --changed-since-merge-base origin/main
 ```
 Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
 declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.

@@ -20,8 +20,8 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 ```
 lake exe cache get
 lake build
-tauceti-axioms --changed-from origin/main
-tauceti-lint-env --changed-from origin/main
+tauceti-axioms --changed-since-merge-base origin/main
+tauceti-lint-env --changed-since-merge-base origin/main
 ```
 Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
 declarations in changed modules; CI runs their repository-wide forms. Iterate until green — a botched

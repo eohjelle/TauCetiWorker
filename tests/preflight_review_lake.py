@@ -74,6 +74,7 @@ with tempfile.TemporaryDirectory() as td:
         state=root / "state",
         checkout=root / "checkout",
         logdir=root / "logs",
+        quota_cache=root / "quota-cache",
     )
     cfg.home.mkdir()
     cfg.state.mkdir()
