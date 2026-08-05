@@ -46,7 +46,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning tauceti-path.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/tauceti-axioms scripts/tauceti-lint-env scripts/docker-entrypoint tests/*.sh tests/run-all
+        run: shellcheck --severity=warning tauceti-path.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/tauceti-axioms scripts/tauceti-lint-env scripts/curl-no-progress scripts/docker-entrypoint tests/*.sh tests/run-all
 
   build:
     runs-on: ubuntu-latest
@@ -113,9 +113,15 @@ jobs:
             touch /root/.claude/.tauceti-quota/bootstrap.lock
             rm /root/.claude/.tauceti-quota/bootstrap.lock
             rmdir /root/.claude/.tauceti-quota
-            for tool in gh git uvx jq lake codex claude tauceti-oauth-refresh; do
+            for tool in gh git uvx jq lake curl codex claude tauceti-oauth-refresh; do
               command -v "$tool" >/dev/null
             done
+            test "$(command -v curl)" = /usr/local/bin/curl
+            curl_json="$(curl -Z -s -w "%{stderr}%{json}\\n" \
+              -o /dev/null file:///etc/os-release \
+              -o /dev/null file:///etc/os-release 2>&1)"
+            printf "%s\n" "$curl_json" | python3 -c \
+              "import json, sys; lines = sys.stdin.read().splitlines(); assert len(lines) == 2; [json.loads(line) for line in lines]"
             elan --version
             test -z "$(find "$ELAN_HOME/toolchains" -mindepth 1 -maxdepth 1 -print -quit)"
             ./tauceti --help >/dev/null

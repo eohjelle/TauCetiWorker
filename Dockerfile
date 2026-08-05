@@ -73,7 +73,8 @@ COPY scripts ./scripts
 COPY tauceti_worker ./tauceti_worker
 COPY tauceti-path.sh /etc/profile.d/tauceti-path.sh
 
-RUN install -m 0755 scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
+RUN install -m 0755 scripts/curl-no-progress /usr/local/bin/curl \
+    && install -m 0755 scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
     && chmod 0644 /etc/profile.d/tauceti-path.sh \
     && chmod 0755 tauceti scripts/claim.sh scripts/gh-safe-pr-create scripts/git-safe-push \
