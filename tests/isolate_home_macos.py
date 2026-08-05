@@ -164,14 +164,14 @@ with tempfile.TemporaryDirectory() as root:
 # exact same paths on both platforms and nothing migrates.
 with tempfile.TemporaryDirectory() as root:
     iso = Path(root) / "iso"
-    saved = {k: os.environ.get(k) for k in ("TAUCETI_DATA_HOME", "HOME", "CLAIM_GITDIR")}
+    saved = {k: os.environ.get(k) for k in ("TAUCETI_DATA_HOME", "HOME", "CLAIM_GITDIR_BASE")}
     try:
         os.environ.update(TAUCETI_DATA_HOME=str(iso), HOME=str(Path(root) / "real"))
-        os.environ.pop("CLAIM_GITDIR", None)
+        os.environ.pop("CLAIM_GITDIR_BASE", None)
         cfg = tc.Config.resolve("worker1")
         check("store follows the data root", cfg.store_dir.is_relative_to(iso), True)
         check("bubble home follows the data root", agents.bubble_home(cfg).is_relative_to(iso), True)
-        check("claim scratch is per worker", Path(os.environ["CLAIM_GITDIR"]).is_relative_to(iso), True)
+        check("claim scratch is per worker", Path(os.environ["CLAIM_GITDIR_BASE"]).is_relative_to(iso), True)
         check("login home is untouched", cfg.home, Path(root) / "real")
 
         # An unisolated worker (the 'default' id) has no sentinel: its data stays under the login

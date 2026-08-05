@@ -7,7 +7,9 @@ GitHub.
 """
 
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +40,7 @@ class Harness:
         for key in (
             "CLAIM_REPO",
             "TAUCETI_CLAIM_KEY",
+            "TAUCETI_CLAIM_REPO",
             "TAUCETI_CLAIM_SH",
             "TAUCETI_PUSH_EXPECT",
             "TAUCETI_PUSH_REF",
@@ -93,12 +96,13 @@ def fork_lifecycle():
         assert h.claims.begin_branch_work(143, "abc", "feature", "alice", "TauCeti")
         assert h.acquired_from == ["alice/TauCeti"]
         assert h.heartbeats == [("branch/143", "alice/TauCeti")]
-        assert os.environ["CLAIM_REPO"] == "alice/TauCeti"
+        assert "CLAIM_REPO" not in os.environ
+        assert os.environ["TAUCETI_CLAIM_REPO"] == "alice/TauCeti"
         assert os.environ["TAUCETI_PUSH_REMOTE"] == "https://github.com/alice/TauCeti"
         h.claims.release()
         assert h.released_from == ["alice/TauCeti"]
-        assert "CLAIM_REPO" not in os.environ
         assert "TAUCETI_CLAIM_KEY" not in os.environ
+        assert "TAUCETI_CLAIM_REPO" not in os.environ
 
 
 def canonical_lifecycle():
@@ -115,6 +119,7 @@ def explicit_override():
         assert h.claims.begin_branch_work(143, "abc", "feature", "alice", "TauCeti")
         assert h.acquired_from == ["coordination/claims"]
         assert h.heartbeats == [("branch/143", "coordination/claims")]
+        assert os.environ["TAUCETI_CLAIM_REPO"] == "coordination/claims"
         h.claims.release()
         assert h.released_from == ["coordination/claims"]
         assert os.environ["CLAIM_REPO"] == "coordination/claims"
@@ -123,6 +128,8 @@ def explicit_override():
 def skipped_candidate_does_not_leak():
     with Harness([1, 0]) as h:
         assert not h.claims.begin_branch_work(1, "a", "one", "alice", "TauCeti")
+        assert "TAUCETI_CLAIM_KEY" not in os.environ
+        assert "TAUCETI_CLAIM_REPO" not in os.environ
         assert h.claims.begin_branch_work(2, "b", "two", "bob", "TauCeti")
         assert h.acquired_from == ["alice/TauCeti", "bob/TauCeti"]
         assert h.heartbeats == [("branch/2", "bob/TauCeti")]
@@ -137,6 +144,7 @@ def acquire_error_fails_open():
         assert h.heartbeats == []
         assert h.claims.held is None
         assert "TAUCETI_CLAIM_KEY" not in os.environ
+        assert "TAUCETI_CLAIM_REPO" not in os.environ
         assert "CLAIM_REPO" not in os.environ
         assert os.environ["TAUCETI_PUSH_EXPECT"] == "abc"
 
@@ -167,6 +175,33 @@ def heartbeat_child_uses_selected_repo():
         round_mod.subprocess.Popen = real_popen
 
 
+def safe_push_scopes_claim_repo():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        claim_log = tmp / "claim.log"
+        claim = tmp / "claim.sh"
+        claim.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$CLAIM_REPO" "$1" >> "$CLAIM_LOG"\nexit 0\n')
+        claim.chmod(0o755)
+        git = tmp / "git"
+        git.write_text("#!/bin/sh\nexit 0\n")
+        git.chmod(0o755)
+        env = {
+            **os.environ,
+            "PATH": f"{tmp}:{os.environ['PATH']}",
+            "CLAIM_LOG": str(claim_log),
+            "CLAIM_REPO": "coordination/global",
+            "TAUCETI_CLAIM_KEY": "branch/143",
+            "TAUCETI_CLAIM_REPO": "alice/TauCeti",
+            "TAUCETI_CLAIM_SH": str(claim),
+            "TAUCETI_PUSH_REF": "feature",
+            "TAUCETI_PUSH_EXPECT": "abc",
+            "TAUCETI_PUSH_REMOTE": "https://github.com/alice/TauCeti",
+        }
+        result = subprocess.run([REPO / "scripts" / "git-safe-push"], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert claim_log.read_text().splitlines() == ["alice/TauCeti|holds"]
+
+
 fails = sum(
     check(name, case)
     for name, case in (
@@ -176,6 +211,7 @@ fails = sum(
         ("a skipped fork candidate cannot leak into the next candidate", skipped_candidate_does_not_leak),
         ("claim errors still proceed unclaimed under branch CAS", acquire_error_fails_open),
         ("heartbeat child inherits the selected repository", heartbeat_child_uses_selected_repo),
+        ("git-safe-push scopes its lease check to the selected repository", safe_push_scopes_claim_repo),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

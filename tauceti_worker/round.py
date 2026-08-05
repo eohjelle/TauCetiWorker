@@ -178,10 +178,8 @@ class Claims:
         self.cfg = cfg
         self.ctx = ctx
         self.held: tuple[str, str] | None = None
-        # Capture an operator override before a successful dynamic selection exports CLAIM_REPO for
-        # git-safe-push. A skipped fork candidate must not become an override for the next candidate.
-        self._original_claim_repo = os.environ.get("CLAIM_REPO")
-        self._claim_repo_override = self._original_claim_repo or None
+        # Capture an operator override once so a skipped fork candidate cannot affect the next one.
+        self._claim_repo_override = os.environ.get("CLAIM_REPO") or None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
 
@@ -201,14 +199,15 @@ class Claims:
         os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
         if rc == 0:
             self.held = (key, claim_repo)
-            # Host agents inherit this for git-safe-push's immediate pre-push lease verification.
-            os.environ["CLAIM_REPO"] = claim_repo
+            # Keep this scoped to the push arbiter: unrelated agent-invoked claims remain canonical.
+            os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
             os.environ["TAUCETI_CLAIM_KEY"] = key
             self.ctx.add_cleanup(self.release)
             self.start_heartbeat(key, claim_repo)
         else:
             log(f"claim acquire #{pr} errored (rc={rc}) — proceeding unclaimed (branch CAS still protects)")
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
+            os.environ.pop("TAUCETI_CLAIM_REPO", None)
         return True
 
     def start_heartbeat(self, key: str, claim_repo: str) -> None:
@@ -251,10 +250,7 @@ class Claims:
             )
             self.held = None
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
-            if self._original_claim_repo is None:
-                os.environ.pop("CLAIM_REPO", None)
-            else:
-                os.environ["CLAIM_REPO"] = self._original_claim_repo
+            os.environ.pop("TAUCETI_CLAIM_REPO", None)
 
 
 def cmd_heartbeat(args) -> int:
