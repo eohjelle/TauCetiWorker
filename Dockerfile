@@ -3,7 +3,6 @@
 FROM node:22-bookworm
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG TAUCETI_LEAN_TOOLCHAIN=leanprover/lean4:v4.32.0
 
 # Runtime tools for tauceti and its agents, plus a native toolchain for Lean builds. Debian
 # package revisions deliberately track Bookworm's security repository instead of being frozen.
@@ -26,9 +25,11 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Lean toolchains are shared container infrastructure, not per-worker HOME state. Install Elan's
-# mutable state under /opt/elan, but expose its proxies and uv/uvx from /usr/local/bin so they
-# remain discoverable after TauCeti replaces HOME and an agent starts a login shell.
+# Lean toolchains are shared container infrastructure, not per-worker HOME state. Keep Elan itself
+# image-owned under /opt/elan, while Compose persists only /opt/elan/toolchains so the checkout's
+# lean-toolchain file remains authoritative across image and container replacement. Expose Elan's
+# proxies and uv/uvx from /usr/local/bin so they remain discoverable after TauCeti replaces HOME and
+# an agent starts a login shell.
 ENV ELAN_HOME=/opt/elan \
     UV_CACHE_DIR=/root/.cache/uv \
     DISABLE_AUTOUPDATER=1 \
@@ -37,8 +38,7 @@ ENV ELAN_HOME=/opt/elan \
 RUN set -eux; \
     curl -fsSL https://elan.lean-lang.org/elan-init.sh \
       | sh -s -- -y --default-toolchain none --no-modify-path; \
-    "$ELAN_HOME/bin/elan" toolchain install "$TAUCETI_LEAN_TOOLCHAIN"; \
-    "$ELAN_HOME/bin/elan" default "$TAUCETI_LEAN_TOOLCHAIN"; \
+    mkdir -p "$ELAN_HOME/toolchains"; \
     for tool in "$ELAN_HOME"/bin/*; do \
       install -m 0755 "$tool" "/usr/local/bin/$(basename "$tool")"; \
     done; \
@@ -56,16 +56,16 @@ RUN set -eux; \
 
 # Subscription authentication is performed at runtime and persisted by compose.yaml. Pin the
 # clients so rebuilding a deployment uses known client versions; the scheduled image build detects
-# when a pinned client or its service contract stops working. Keep this after Lean so a client-version
-# bump does not invalidate the much larger toolchain layer.
+# when a pinned client or its service contract stops working. Keep this after Elan so a client-version
+# bump does not invalidate the installer layer.
 ARG CLAUDE_CODE_VERSION=2.1.220
 ARG CODEX_VERSION=0.145.0
 RUN npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "@openai/codex@${CODEX_VERSION}"
 
-# Keep the toolchain layers reusable while making every image contain the exact checked-out
-# worker revision under test (including pull-request changes).
+# Keep dependency layers reusable while making every image contain the exact checked-out worker
+# revision under test (including pull-request changes).
 WORKDIR /opt/tauceti
 COPY tauceti pyproject.toml ./
 COPY prompts ./prompts

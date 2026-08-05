@@ -1,7 +1,8 @@
 # Docker deployment
 
-The Compose deployment packages TauCetiWorker, Lean, GitHub CLI, Codex, and Claude
-Code for an unattended Linux host.
+The Compose deployment packages TauCetiWorker, Elan, GitHub CLI, Codex, and Claude
+Code for an unattended Linux host. The Lean toolchain selected by TauCeti is downloaded
+on first use and retained in a named volume.
 
 The image is built from the current local checkout: the Dockerfile copies `tauceti`,
 `tauceti_worker/`, `prompts/`, and `scripts/` from the build context and never clones
@@ -69,8 +70,8 @@ docker compose up -d
 ```
 
 The options are appended to `tauceti work --loop`. Edit or remove the line and run
-`docker compose up -d` again to change or clear them; credentials and worker data are
-retained.
+`docker compose up -d` again to change or clear them; credentials, Lean toolchains,
+and worker data are retained.
 
 ### Pacing
 
@@ -126,6 +127,7 @@ next start.
 | `claude-worker`, `codex-worker` | Access-token mirrors, writable by refreshers and mounted read-only by the worker |
 | `gh` | GitHub CLI credentials |
 | `uv-cache` | Downloaded Python tools and packages |
+| `elan-toolchains` | Lean toolchains selected by each checkout's `lean-toolchain` file |
 | `checkouts` | Worker repositories and incremental Lean build artifacts |
 | `state` | Scheduler state and isolated worker home |
 | `logs` | Per-round logs |
@@ -133,6 +135,12 @@ next start.
 Claude and Codex use rotating, single-consumer refresh tokens. One refresher owns
 each provider credential and publishes a refresh-token-free mirror; the worker never
 mounts the source provider credentials.
+
+Elan's executable and proxies remain image-owned, while only downloaded Lean toolchains
+are persisted. This avoids baking a TauCeti version into the image, lets each checkout's
+`lean-toolchain` file remain authoritative, and prevents container replacement from
+re-downloading a multi-gigabyte toolchain. On this dedicated deployment, obsolete official
+toolchains are removed once no worker checkout requests them.
 
 The refreshers check once a minute, renew within 90 minutes of expiry, avoid rotating
 more than once per 10 minutes, and back off to 15 minutes after errors. Advanced

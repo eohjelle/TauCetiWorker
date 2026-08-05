@@ -22,9 +22,10 @@ services:
       - claude-worker:/root/.claude:ro
       - codex-worker:/root/.codex:ro
       - gh:/root/.config/gh
-      # Preserve build downloads when the image or isolated worker HOME changes. The pinned
-      # Lean toolchain remains image-owned so an image update cannot be hidden by a stale volume.
+      # Preserve build downloads and the checkout-selected Lean toolchain across image or container
+      # replacement. Elan's executables remain image-owned so updates cannot be hidden by this volume.
       - uv-cache:/root/.cache/uv
+      - elan-toolchains:/opt/elan/toolchains
       # Checkouts, scheduler state, and durable per-round logs.
       - checkouts:/opt/tauceti/checkouts
       - state:/opt/tauceti/state
@@ -82,6 +83,7 @@ volumes:
   codex-worker:
   gh:
   uv-cache:
+  elan-toolchains:
   checkouts:
   state:
   logs:

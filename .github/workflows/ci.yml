@@ -112,7 +112,8 @@ jobs:
             for tool in gh git uvx jq lake codex claude tauceti-oauth-refresh; do
               command -v "$tool" >/dev/null
             done
-            lake --version
+            elan --version
+            test -z "$(find "$ELAN_HOME/toolchains" -mindepth 1 -maxdepth 1 -print -quit)"
             ./tauceti --help >/dev/null
             claude auth login --help >/dev/null
             codex login --help 2>&1 | grep -F -- --device-auth >/dev/null
@@ -133,6 +134,8 @@ jobs:
             grep -F "usage: tauceti work"
           TAUCETI_PACE=0:10,100:90 docker compose config --format json | python3 -c \
             'import json, sys; assert json.load(sys.stdin)["services"]["tauceti"]["environment"]["TAUCETI_PACE"] == "0:10,100:90"'
+          docker compose config --format json | python3 -c \
+            'import json, sys; mounts=json.load(sys.stdin)["services"]["tauceti"]["volumes"]; assert any(m["source"] == "elan-toolchains" and m["target"] == "/opt/elan/toolchains" for m in mounts)'
           test ! -e .env
           trap 'rm -f .env' EXIT
           printf '%s\n' 'TAUCETI_WORKER_ARGS=--help' 'TAUCETI_PACE=0:10,100:90' >.env
