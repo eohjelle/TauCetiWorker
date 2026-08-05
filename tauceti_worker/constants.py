@@ -129,9 +129,11 @@ SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached
 # A dedicated worker host may let TauCeti own its shared Elan installation and retire versions that
 # no active worker checkout requests. Keep this opt-in: an ordinary host ELAN_HOME can also serve
 # unrelated Lean projects whose toolchains TauCetiWorker must never remove implicitly.
-PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get(
-    "TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS", "false"
-).lower() in ("1", "true", "yes")
+PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get("TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Persistent host-mode Lake artifact-cache storage policy. Environment overrides are parsed at the
 # round boundary so operators can tune dedicated workers without changing these defaults.

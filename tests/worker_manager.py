@@ -97,11 +97,23 @@ try:
 
     # Legacy command import produces the same semantic settings without retaining shell syntax.
     legacy = root / "workers.conf"
-    legacy.write_text("./tauceti work --loop --worker-id worker2 --agent codex --only rebase,review --ignore-quota\n")
+    legacy.write_text(
+        "./tauceti work --loop --worker-id worker2 --agent codex --only rebase,review "
+        "--ignore-quota --pace 0:10,100:90\n"
+    )
     imported = wm.parse_legacy_config(legacy)
     assert imported[0].id == "worker2"
     assert imported[0].only == ("rebase", "review")
     assert imported[0].ignore_quota is True
+    assert imported[0].pace == "0:10,100:90"
+
+    invalid_pace = root / "invalid-pace.toml"
+    invalid_pace.write_text('version = 1\n[[workers]]\nid = "bad-pace"\npace = "50%@1h"\n')
+    try:
+        wm.load_worker_specs(invalid_pace)
+        raise AssertionError("invalid declarative pace was accepted")
+    except wm.WorkersError as exc:
+        assert "workers[0].pace" in str(exc) and "time:budget" in str(exc)
 
     # The full semantic model must remain parseable by the real work CLI.
     maximal = wm.WorkerSpec(
@@ -117,7 +129,7 @@ try:
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
-        pace="50%@1h",
+        pace="0:10,100:90",
         stream=True,
         isolate_home=True,
     )
@@ -192,7 +204,7 @@ try:
                         "source": "https://example.invalid/source",
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
-                        "pace": "50%@1h",
+                        "pace": "0:10,100:90",
                         "stream": True,
                         "isolate_home": True,
                         "restart": "on-failure",
@@ -232,7 +244,7 @@ worker2 — running
 worker3 — backing off
   phases:   roadmap, fix, fix-ci
   agent:    claude · bubble sandbox
-  pacing:   normal · curve 50%@1h
+  pacing:   normal · curve 0:10,100:90
   roadmap:  RepresentationTheory
             skip: Algebra
             also treat as self: maintainer

@@ -31,6 +31,7 @@ from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
+from .quota import parse_pace_curve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, read_json, update_status
 
@@ -245,6 +246,11 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
+        if spec.pace is not None:
+            try:
+                parse_pace_curve(spec.pace)
+            except ValueError as exc:
+                raise WorkersError(f"workers[{index}].pace: {exc}") from None
         return spec
 
     def as_dict(self) -> dict:

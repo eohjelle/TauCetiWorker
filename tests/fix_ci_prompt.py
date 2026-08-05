@@ -62,7 +62,9 @@ fix_ci = (REPO / "prompts" / "fix-ci.md").read_text()
 diagnosis, final_gate = fix_ci.split("## Final gate before pushing", 1)
 check(
     "fix-ci inspects logs before rebasing and local compilation",
-    0 <= diagnosis.find("gh run view <run-id>") < diagnosis.find("git rebase origin/main")
+    0
+    <= diagnosis.find("gh run view <run-id>")
+    < diagnosis.find("git rebase origin/main")
     < diagnosis.find("lake build TauCeti.<Module>"),
 )
 check("fix-ci diagnosis keeps targeted module builds", "lake build TauCeti.<Module>" in diagnosis)
@@ -70,8 +72,11 @@ check("fix-ci diagnosis uses scoped-check wrappers", axioms in diagnosis and lin
 check("fix-ci diagnosis does not run the complete gate", "lake exe cache get" not in diagnosis)
 check(
     "fix-ci final gate orders build and audits",
-    0 <= final_gate.find("lake build --iofail") < final_gate.find(axioms)
-    < final_gate.find("lake exe module-system") < final_gate.find(lint),
+    0
+    <= final_gate.find("lake build --iofail")
+    < final_gate.find(axioms)
+    < final_gate.find("lake exe module-system")
+    < final_gate.find(lint),
 )
 check(
     "only fix-ci retains the fast repository-wide module-system audit",
@@ -110,8 +115,7 @@ check(
 )
 check(
     "lint wrapper preserves the target script's checkout-relative $0",
-    "bash -c 'source \"$1\" \"${@:2}\"' \"$repo_root/scripts/lint-env.sh\" \"$source_file\" \"$@\""
-    in lint_wrapper,
+    'bash -c \'source "$1" "${@:2}"\' "$repo_root/scripts/lint-env.sh" "$source_file" "$@"' in lint_wrapper,
 )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

@@ -168,10 +168,7 @@ try:
     )
     check(
         "work round stages scoped-check wrappers",
-        all(
-            os.access(cfg.state / "bubble-round" / name, os.X_OK)
-            for name in ("tauceti-axioms", "tauceti-lint-env")
-        ),
+        all(os.access(cfg.state / "bubble-round" / name, os.X_OK) for name in ("tauceti-axioms", "tauceti-lint-env")),
     )
 
     out = io.StringIO()

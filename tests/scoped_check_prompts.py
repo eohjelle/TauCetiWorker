@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Authoring workers build globally but run axiom/lint checks on changed modules."""
 
-from pathlib import Path
 import re
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPTS = ("roadmap.md", "fix.md", "fix-ci.md", "rebase.md", "bump.md")

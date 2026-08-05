@@ -263,6 +263,8 @@ the one-shot import, which refuses to overwrite an existing `workers.toml`
 without `--force`:
 
 ```bash
+# Legacy lines may include --pace; import converts it to the semantic `pace` field.
+echo './tauceti work --loop --worker-id worker1 --pace 0:10,100:90' > workers.conf
 tauceti workers import workers.conf
 ```
 

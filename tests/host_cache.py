@@ -140,11 +140,7 @@ def exercise_prepare(mathlib_rcs, tauceti_rc):
         rendered = " ".join(str(arg) for arg in argv)
         if "elan toolchain list" in rendered:
             kind, rc = "elan-list", 0
-            stdout = (
-                "leanprover/lean4:v4.old\n"
-                "leanprover/lean4:v4.test\n"
-                "custom-linked-toolchain\n"
-            )
+            stdout = "leanprover/lean4:v4.old\nleanprover/lean4:v4.test\ncustom-linked-toolchain\n"
         elif "elan toolchain uninstall" in rendered:
             kind, rc, stdout = "elan-uninstall", 0, ""
         elif "lake exe cache get" in rendered:
@@ -274,8 +270,7 @@ with tempfile.TemporaryDirectory() as td:
 _, error, order, calls = exercise_prepare([1, 0], 0)
 check(
     "Mathlib cache gets one retry",
-    error is None
-    and order == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "mathlib", "tauceti"],
+    error is None and order == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "mathlib", "tauceti"],
 )
 check(
     "retry path still has no full build",
@@ -308,8 +303,7 @@ with tempfile.TemporaryDirectory() as td:
     saved_min = tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES
     saved_disk_usage = tc.agents.shutil.disk_usage
     saved_limit_env = {
-        name: os.environ.pop(name, None)
-        for name in ("TAUCETI_LAKE_CACHE_MAX_GIB", "TAUCETI_LAKE_CACHE_MIN_FREE_GIB")
+        name: os.environ.pop(name, None) for name in ("TAUCETI_LAKE_CACHE_MAX_GIB", "TAUCETI_LAKE_CACHE_MIN_FREE_GIB")
     }
     try:
         tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1

@@ -12,6 +12,9 @@ services:
     environment:
       TAUCETI_WORKER_ID: docker
       TAUCETI_WORKER_ARGS: "${TAUCETI_WORKER_ARGS:-}"
+      # Set TAUCETI_PACE in .env for a persistent custom quota curve. A --pace option in
+      # TAUCETI_WORKER_ARGS remains authoritative when both are supplied.
+      TAUCETI_PACE: "${TAUCETI_PACE:-}"
       # This deployment's Lean installation is dedicated to TauCeti worker checkouts.
       TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "true"
     volumes:
