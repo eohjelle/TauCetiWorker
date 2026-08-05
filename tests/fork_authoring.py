@@ -186,6 +186,19 @@ def test_roadmap():
         "roadmap: no unsubstituted placeholders",
         "__FORK__" not in prompt and "__WORKERID__" not in prompt and "__SOURCE_GUIDANCE__" not in prompt,
     )
+    check("roadmap: prompt encourages cross-roadmap prerequisites", "Follow prerequisites across roadmaps" in prompt)
+    check(
+        "roadmap: switched target checks its own intention board",
+        '--label "roadmap/<target-roadmap>"' in prompt,
+    )
+    check("roadmap: claim follows the actual target", "author/<target-roadmap>/<slug>" in prompt)
+    check("roadmap: marker follows the actual target", '"focus":"<target-roadmap>"' in prompt)
+    check("roadmap: switched PR records its consumer", "Consumer roadmap: <designated-roadmap>" in prompt)
+    check(
+        "roadmap: impossible target stops without a fictional report",
+        "release your claim and stop without a PR" in prompt,
+    )
+    check("roadmap: no unactionable obstruction report", "precise obstruction report" not in prompt)
     check("roadmap: bubble source path is in prompt", "read-only at `/opt/source`" in prompt)
     priorities = (
         "(1) satisfy the `Topology` roadmap exactly as written; (2) write excellent library code that will\n"
