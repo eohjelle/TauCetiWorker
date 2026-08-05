@@ -62,4 +62,4 @@ You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`)
   Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 
 ## Report
-End with a concise summary: the target you chose, the milestone it serves, and why it was the cheapest step that milestone needed, the file(s) added and line count, the exact `lake build` / `lake exe axioms` result lines (proving green + axiom-clean), and the PR number/URL. Do not claim green unless you saw it.
+End with a concise summary: the target you chose, the milestone it serves, and why it was the most effective current step towards that milestone, and the file(s) added and line count. You don't need to make claims about `lake build` or `lake exe axioms`, CI will handle that.
