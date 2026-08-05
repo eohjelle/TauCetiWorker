@@ -186,7 +186,7 @@ def test_roadmap():
         "roadmap: no unsubstituted placeholders",
         "__FORK__" not in prompt and "__WORKERID__" not in prompt and "__SOURCE_GUIDANCE__" not in prompt,
     )
-    check("roadmap: prompt permits explicit upstream dependencies", "Follow only explicit blockers" in prompt)
+    check("roadmap: prompt encourages cross-roadmap prerequisites", "Follow prerequisites across roadmaps" in prompt)
     check(
         "roadmap: switched target checks its own intention board",
         '--label "roadmap/<target-roadmap>"' in prompt,
