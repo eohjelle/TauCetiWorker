@@ -97,7 +97,8 @@ COPY tauceti-path.sh /etc/profile.d/tauceti-path.sh
 # The refresher is a symlink, not a copy: it imports the rotation core from tauceti_worker, and
 # resolving its own path back to /opt/tauceti is how it finds the package in an image that runs the
 # worker from a checkout rather than an installed wheel.
-RUN ln -s /opt/tauceti/scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
+RUN install -m 0755 scripts/curl-no-progress /usr/local/bin/curl \
+    && ln -s /opt/tauceti/scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
     && chmod 0644 /etc/profile.d/tauceti-path.sh \
     && chmod 0755 tauceti scripts/oauth_refresh_loop.py scripts/claim.sh scripts/gh-safe-pr-create scripts/git-safe-push \
