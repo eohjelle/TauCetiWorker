@@ -3,6 +3,11 @@
 The Compose deployment packages TauCetiWorker, Lean, GitHub CLI, Codex, Claude
 Code, and the checksum-pinned Kiro CLI for an unattended Linux host.
 
+The image is built from the current local checkout: the Dockerfile copies `tauceti`,
+`tauceti_worker/`, `prompts/`, and `scripts/` from the build context and never clones
+a remote TauCetiWorker repository. Building from a fork checkout therefore packages
+that fork's exact checked-out revision, including uncommitted source changes.
+
 ## Requirements
 
 - Docker with Compose v2, either as `docker compose` or the standalone `docker-compose`
@@ -86,6 +91,23 @@ a model prompt:
 docker compose run --rm tauceti ./tauceti usage --json
 ```
 
+### Pacing
+
+For a persistent custom quota curve, set `TAUCETI_PACE` in `.env`:
+
+```dotenv
+TAUCETI_PACE=0:10,100:90
+```
+
+Compose passes this directly to the worker. You can also put `--pace 0:10,100:90`
+in `TAUCETI_WORKER_ARGS`; the command-line value wins if both are present. A blank or
+unset `TAUCETI_PACE` keeps the default identity curve (`used% < elapsed%`).
+
+The bundled Compose service runs one worker loop directly because Docker already
+provides supervision. It therefore does not read `workers.toml` or the legacy
+`workers.conf`. Declarative workers do support `pace = "0:10,100:90"` in
+`workers.toml`; `workers.conf` supports the equivalent `--pace` only as input to the
+one-shot `tauceti workers import` migration. See [Persistent workers](workers.md).
 ## Operations
 
 Stop the deployment while retaining all data:
@@ -100,6 +122,10 @@ Update the checkout and replace the image while retaining volumes:
 git pull
 docker compose up -d --build
 ```
+
+Because the image copies the local checkout, inspect or switch to the intended fork
+branch before rebuilding. `git pull` is only an example update policy; Docker does not
+fetch or select a branch itself.
 
 To erase credentials, checkouts, caches, logs, and worker state:
 
