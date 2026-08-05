@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import ROADMAP, TAUCETI
+from .constants import ROADMAP
 from .paths import HERE
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
@@ -166,11 +166,10 @@ class Config:
         # so nothing migrates.
         dh = Path(os.environ.get("TAUCETI_DATA_HOME") or h)
         state = HERE / "state" / wid
-        # Per-worker claim scratch. claim.sh defaults this under $HOME, which was per-worker only
-        # while $HOME moved; without it every macOS worker would now build claim objects in one
-        # shared bare repo with no local lock around `remote set-url` and fetch.
-        repo = os.environ.get("CLAIM_REPO") or TAUCETI
-        os.environ.setdefault("CLAIM_GITDIR", str(dh / ".cache" / "tauceti-claims" / f"{repo.replace('/', '__')}.git"))
+        # Per-worker, per-repository claim scratch. claim.sh defaults this under $HOME, which was
+        # per-worker only while $HOME moved; use the worker data root while letting a dynamic
+        # CLAIM_REPO select its own child store. An explicit CLAIM_GITDIR still overrides the base.
+        os.environ.setdefault("CLAIM_GITDIR_BASE", str(dh / ".cache" / "tauceti-claims"))
         return Config(
             wid=wid,
             home=h,

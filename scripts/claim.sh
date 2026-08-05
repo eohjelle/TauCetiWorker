@@ -24,14 +24,15 @@
 #   claim.sh gc                            # CAS-delete expired claims
 #
 # Env: CLAIM_REPO (default TauCetiProject/TauCeti), TAUCETI_WORKER_ID (default host-pid),
-#      CLAIM_TTL (default 1500), CLAIM_GITDIR (scratch object store).
+#      CLAIM_TTL (default 1500), CLAIM_GITDIR_BASE (per-repo scratch parent),
+#      CLAIM_GITDIR (explicit scratch object store override).
 set -uo pipefail
 
 REPO="${CLAIM_REPO:-TauCetiProject/TauCeti}"
 URL="https://github.com/$REPO"
 WID="${TAUCETI_WORKER_ID:-$(hostname)-$$}"
 DEFAULT_TTL="${CLAIM_TTL:-1500}"
-GITDIR="${CLAIM_GITDIR:-$HOME/.cache/tauceti-claims/${REPO//\//__}.git}"
+GITDIR="${CLAIM_GITDIR:-${CLAIM_GITDIR_BASE:-$HOME/.cache/tauceti-claims}/${REPO//\//__}.git}"
 NS="refs/tauceti-claims"
 export GIT_AUTHOR_NAME="tauceti-claim" GIT_AUTHOR_EMAIL="claim@tauceti.invalid"
 export GIT_COMMITTER_NAME="tauceti-claim" GIT_COMMITTER_EMAIL="claim@tauceti.invalid"

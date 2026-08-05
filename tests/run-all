@@ -24,6 +24,7 @@ RUN_STDLIB=(
   authoring_profiles.py
   bubble_cache.py
   bubble_version.py
+  branch_claim_repo.py
   build_status_rollup.py
   claude_config_dir.py
   claude_keychain.py

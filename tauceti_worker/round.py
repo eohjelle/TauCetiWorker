@@ -177,7 +177,9 @@ class Claims:
     def __init__(self, cfg: Config, ctx: RoundContext):
         self.cfg = cfg
         self.ctx = ctx
-        self.held: str | None = None
+        self.held: tuple[str, str] | None = None
+        # Capture an operator override once so a skipped fork candidate cannot affect the next one.
+        self._claim_repo_override = os.environ.get("CLAIM_REPO") or None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
 
@@ -185,7 +187,9 @@ class Claims:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
         (caller skips this PR — dedup). A claim error is non-fatal: proceed unclaimed (CAS still protects)."""
         key = f"branch/{pr}"
-        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True).returncode
+        claim_repo = self._claim_repo_override or f"{owner}/{repo}"
+        claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
+        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
             log(f"branch #{pr} claimed by another worker — skipping (COOP dedup)")
             return False
@@ -194,20 +198,30 @@ class Claims:
         os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{owner}/{repo}"
         os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
         if rc == 0:
-            self.held = key
+            self.held = (key, claim_repo)
+            # Keep this scoped to the push arbiter: unrelated agent-invoked claims remain canonical.
+            os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
             os.environ["TAUCETI_CLAIM_KEY"] = key
             self.ctx.add_cleanup(self.release)
-            self.start_heartbeat(key)
+            self.start_heartbeat(key, claim_repo)
         else:
             log(f"claim acquire #{pr} errored (rc={rc}) — proceeding unclaimed (branch CAS still protects)")
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
+            os.environ.pop("TAUCETI_CLAIM_REPO", None)
         return True
 
-    def start_heartbeat(self, key: str) -> None:
+    def start_heartbeat(self, key: str, claim_repo: str) -> None:
         rfd, wfd = os.pipe()
         os.set_inheritable(rfd, True)
         cmd = self_argv("_heartbeat", key, "--ppipe", str(rfd))
-        env = self_env({**os.environ, "TAUCETI_CLAIM_SH": CLAIM_SH, "CLAIM_TTL": str(CLAIM_TTL_S)})
+        env = self_env(
+            {
+                **os.environ,
+                "CLAIM_REPO": claim_repo,
+                "TAUCETI_CLAIM_SH": CLAIM_SH,
+                "CLAIM_TTL": str(CLAIM_TTL_S),
+            }
+        )
         self._hb = subprocess.Popen(cmd, pass_fds=[rfd], env=env)
         os.close(rfd)  # parent keeps only the write end; its closure (or death) is the EOF signal
         self._hb_wfd = wfd
@@ -230,8 +244,13 @@ class Claims:
 
     def release(self) -> None:
         if self.held:
-            subprocess.run([CLAIM_SH, "release", self.held], capture_output=True)
+            key, claim_repo = self.held
+            subprocess.run(
+                [CLAIM_SH, "release", key], capture_output=True, env={**os.environ, "CLAIM_REPO": claim_repo}
+            )
             self.held = None
+            os.environ.pop("TAUCETI_CLAIM_KEY", None)
+            os.environ.pop("TAUCETI_CLAIM_REPO", None)
 
 
 def cmd_heartbeat(args) -> int:
