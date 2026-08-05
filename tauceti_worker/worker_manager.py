@@ -314,6 +314,11 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
+        if spec.pace is not None:
+            try:
+                parse_pace_curve(spec.pace)
+            except ValueError as exc:
+                raise WorkersError(f"workers[{index}].pace: {exc}") from None
         return spec
 
     def as_dict(self) -> dict:

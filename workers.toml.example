@@ -16,5 +16,6 @@ ignore_quota = true
 id = "worker3"
 enabled = true
 only = ["roadmap", "fix", "fix-ci"]
+pace = "0:10,100:90"
 roadmap_only = "RepresentationTheory"
 source = "https://github.com/FormalFrontier/Etingof-RepresentationTheory-draft1"
