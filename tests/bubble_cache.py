@@ -256,6 +256,10 @@ try:
     check("work round does not expose the upstream domain directly", "--allow-domain" not in work_argv)
     check("work round runs both cache commands", "lake exe cache get" in work_argv and "lake cache get" in work_argv)
     check("work round stages no competing Lake config", not (cfg.state / "bubble-round" / "lake-cache.toml").exists())
+    check(
+        "Bubble uses its own Elan rather than forwarding the host installation",
+        "ELAN_HOME" not in work_argv and "/host-only/shared-elan" not in work_argv,
+    )
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):

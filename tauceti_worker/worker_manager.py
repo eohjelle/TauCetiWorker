@@ -372,6 +372,11 @@ class WorkerSpec:
         )
         if problem:
             raise WorkersError(f"workers[{index}]: {problem}")
+        if spec.pace is not None:
+            try:
+                parse_pace_curve(spec.pace)
+            except ValueError as exc:
+                raise WorkersError(f"workers[{index}].pace: {exc}") from None
         return spec
 
     def as_dict(self) -> dict:
