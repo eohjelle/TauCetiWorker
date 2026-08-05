@@ -171,6 +171,14 @@ def test_roadmap():
     check("roadmap: prompt has --head <forkowner>:", "--head alice:roadmap/" in prompt)
     check("roadmap: prompt carries the worker id", "worker3" in prompt)
     check("roadmap: no unsubstituted placeholders", "__FORK__" not in prompt and "__WORKERID__" not in prompt)
+    check("roadmap: prompt permits explicit upstream dependencies", "Follow a blocking dependency upstream" in prompt)
+    check(
+        "roadmap: switched target checks its own intention board",
+        '--label "roadmap/<target-roadmap>"' in prompt,
+    )
+    check("roadmap: claim follows the actual target", "author/<target-roadmap>/<slug>" in prompt)
+    check("roadmap: marker follows the actual target", '"focus":"<target-roadmap>"' in prompt)
+    check("roadmap: switched PR records its consumer", "Consumer roadmap: <designated-roadmap>" in prompt)
 
 
 # ---- 4. ensure_fork_proxy_current: version-gated auth-proxy daemon restart -------------------
