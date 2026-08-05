@@ -66,6 +66,7 @@ RUN_STDLIB=(
   spread_candidates.py
   ssl_cert_file.py
   status_labels.py
+  tend_bot_permissions.py
   worker_manager.py
 )
 # special-cased python tests (handled explicitly below)

@@ -35,8 +35,7 @@ def me() -> str:
 
 def can_push(repo: str) -> bool | None:
     """Does the authenticated account have push (write) access to `repo`? `true`/`false` from GitHub's
-    own `permissions.push`, or None when we can't tell (network/rate-limit/parse) — callers fail OPEN on
-    None so a transient hiccup never blocks work; only an explicit `false` means 'no access'."""
+    own `permissions.push`, or None when we can't tell (network/rate-limit/parse)."""
     r = gh_run(["gh", "api", f"repos/{repo}", "--jq", ".permissions.push"])
     if r.returncode != 0:
         return None

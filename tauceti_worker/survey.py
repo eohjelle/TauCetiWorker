@@ -35,9 +35,10 @@ from .constants import (
     PROGRESS_TTL,
     REVIEW_DAILY_CAP,
     STATUS_LABELS,
+    TAUCETI,
     TAUCETI_OWNER,
 )
-from .github import GitHub, GitHubError, me
+from .github import GitHub, GitHubError, can_push, me
 from .review_state import Meta, ReviewState
 
 # ============================================================================
@@ -521,14 +522,13 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     nondraft = [p for p in prs if not p.is_draft]
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
-    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci): its own, plus FIRST-PARTY
-    # bot automation — a bot-authored PR whose head branch lives in the base repo (the review bot's
-    # bump PRs). Requiring the head in-repo keeps the worker off a fork or an external/unrelated bot's
-    # branch (which it either can't push to, or shouldn't touch); a human contributor's PR is neither
-    # ours nor a first-party bot's, so it is left alone. Roadmap backpressure counts only the part of
-    # `mine` identified with this run's selected area(s), conservatively including unresolved roadmap
-    # PRs: it bounds what WE author in that scope, and a bot's PR never consumes our capacity.
-    tended = [p for p in nondraft if p.author == me_login or (p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
+    # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
+    # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
+    bot_on_canonical = any(p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft)
+    tend_bot = bot_on_canonical and can_push(TAUCETI) is True
+    tended = [
+        p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
+    ]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv._mine_open_prs = mine
@@ -691,7 +691,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
     #    fix still owns its review findings).
-    for p in nondraft:
+    for p in tended:
         if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
             continue
         c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
