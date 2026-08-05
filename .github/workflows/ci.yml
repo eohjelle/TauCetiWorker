@@ -109,6 +109,10 @@ jobs:
             test "$(command -v lake)" = /usr/local/bin/lake
             test "$(command -v git-safe-push)" = /opt/tauceti/scripts/git-safe-push
             test "$(git config --system --get-all credential.https://github.com.helper | tail -n 1)" = "!gh auth git-credential"
+            mkdir -p /root/.claude/.tauceti-quota
+            touch /root/.claude/.tauceti-quota/bootstrap.lock
+            rm /root/.claude/.tauceti-quota/bootstrap.lock
+            rmdir /root/.claude/.tauceti-quota
             for tool in gh git uvx jq lake codex claude tauceti-oauth-refresh; do
               command -v "$tool" >/dev/null
             done

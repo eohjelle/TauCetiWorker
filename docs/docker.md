@@ -124,7 +124,8 @@ next start.
 | Volume | Contents |
 |---|---|
 | `claude`, `codex` | Provider credentials, writable only by setup and the corresponding refresher |
-| `claude-worker`, `codex-worker` | Access-token mirrors, writable by refreshers and mounted read-only by the worker |
+| `claude-worker` | Refresh-token-free Claude mirror plus the worker's shared quota-bootstrap ledger |
+| `codex-worker` | Access-token mirror, writable by the refresher and mounted read-only by the worker |
 | `gh` | GitHub CLI credentials |
 | `uv-cache` | Downloaded Python tools and packages |
 | `elan-toolchains` | Lean toolchains selected by each checkout's `lean-toolchain` file |
@@ -134,7 +135,9 @@ next start.
 
 Claude and Codex use rotating, single-consumer refresh tokens. One refresher owns
 each provider credential and publishes a refresh-token-free mirror; the worker never
-mounts the source provider credentials.
+mounts the source provider credentials. The Claude mirror is writable by the worker
+only because its quota-bootstrap ledger lives beside it; the refresher republishes the
+access-only credential every polling cycle.
 
 Elan's executable and proxies remain image-owned, while only downloaded Lean toolchains
 are persisted. This avoids baking a TauCeti version into the image, lets each checkout's

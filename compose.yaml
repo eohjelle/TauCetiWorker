@@ -18,8 +18,10 @@ services:
       # This deployment's Lean installation is dedicated to TauCeti worker checkouts.
       TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "true"
     volumes:
-      # Agent and GitHub subscription credentials, created by the one-time login step.
-      - claude-worker:/root/.claude:ro
+      # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because
+      # the worker keeps its shared quota-bootstrap ledger beside it; the renewable credential remains
+      # isolated in the separate `claude` volume.
+      - claude-worker:/root/.claude
       - codex-worker:/root/.codex:ro
       - gh:/root/.config/gh
       # Preserve build downloads and the checkout-selected Lean toolchain across image or container
