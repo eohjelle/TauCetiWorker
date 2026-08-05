@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -893,6 +894,30 @@ class _TokenIdentity:
         return not (self.account_id or self.email or self.plan)
 
 
+# Why each non-file credential store makes --account unverifiable. Phrased as the reason codex will not
+# be reading auth.json, since that is the fact the operator has to act on.
+_STORE_WHY = {
+    "keyring": "it keeps the credential in the platform keyring instead",
+    "ephemeral": "it holds the credential only in memory, and persists nothing",
+    "auto": "it prefers the platform keyring whenever one is available, so which store is authoritative "
+    "depends on the machine the agent runs on",
+}
+
+
+def _store_reason(store: str, cfg_path: Path, checkout: Path) -> str:
+    """One sentence naming what makes auth.json non-authoritative, phrased as the thing to act on."""
+    if store == "project-layer":
+        return (
+            f"{checkout}/.codex/config.toml exists, and a trusted project config layer overrides the "
+            f"user one — so TauCeti cannot tell which store codex will use for a round that runs in "
+            f"that checkout"
+        )
+    if store.startswith("unreadable:"):
+        return f"{cfg_path} could not be read ({store.split(':', 1)[1]}), so its credential store is unknown"
+    why = _STORE_WHY.get(store, "TauCeti does not recognise that store and will not assume it is the file")
+    return f'{cfg_path} sets cli_auth_credentials_store = "{store}", so {why}'
+
+
 def _para(text: str) -> str:
     """Wrap one paragraph for a terminal. These messages interpolate email addresses of wildly varying
     length, so hand-wrapped source lines go ragged for the operators who most need to read them.
@@ -1050,6 +1075,53 @@ class Quota:
             conflict=conflict or email_conflict,
         )
 
+    def _codex_credentials_store(self) -> str | None:
+        """Why auth.json may NOT be the credential codex uses, or None when it provably is.
+
+        The invariant is deliberately one-sided: None means VERIFIED file-backed, so every path that
+        cannot establish that must return a reason, not None. Anything else turns "we could not tell"
+        into "we checked and it is fine", which is the fail-open this whole guard exists to prevent.
+
+        codex 0.146.0 takes `cli_auth_credentials_store`, one of file/keyring/auto/ephemeral. Unset
+        resolves to `file` — `codex doctor --json` reports `auth storage mode = File` for an empty
+        CODEX_HOME — so a MISSING config file is the one non-file-valued case that is still verified.
+
+        `auto` is refused with keyring and ephemeral: it prefers a platform keyring whenever one is
+        available, so which store wins depends on the machine the agent lands on, and keyring
+        availability can change between here and launch. Only the exact string `file` passes; codex
+        itself rejects `" FILE "` and friends, so normalising them would be inventing an agreement it
+        does not have."""
+        cfg_path = codex_dir(self.cfg.home) / "config.toml"
+        try:
+            with open(cfg_path, "rb") as fh:
+                data = tomllib.load(fh)
+        except FileNotFoundError:
+            pass  # no user config ⇒ codex's default, which is file
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            # NOT "codex would fail to start anyway": a permission or transient I/O error can clear
+            # before launch, and TauCeti's entitlement probe passes --ignore-user-config, so some codex
+            # invocations start happily on a config we could not read. We simply do not know.
+            return f"unreadable:{type(e).__name__}"
+        else:
+            if not isinstance(data, dict):
+                return "unreadable:not-a-table"
+            if "cli_auth_credentials_store" in data:
+                value = data["cli_auth_credentials_store"]
+                if not isinstance(value, str):
+                    return "unreadable:non-string-value"
+                if value != "file":
+                    return value
+        # A trusted project-level config layer overrides the user one — verified against 0.146.0: a
+        # trusted <project>/.codex/config.toml setting `ephemeral` makes doctor report Ephemeral even
+        # when the user config says `file`. Host rounds launch codex with cwd set to the checkout, so
+        # that layer applies to them. Resolving codex's trust rules here would mean reimplementing them,
+        # so the presence of such a file is itself disqualifying: it is absent in every ordinary
+        # checkout, so this costs nothing until someone actually has one.
+        checkout = getattr(self.cfg, "checkout", None)  # tolerate the lightweight cfg stubs tests build
+        if checkout is not None and _safe_exists(Path(checkout) / ".codex" / "config.toml"):
+            return "project-layer"
+        return None
+
     def _codex_creds_source(self) -> Path:
         """The credential location the OPERATOR must edit to change this worker's Codex account. Under an
         isolated home that is NOT the file we read: we read a mirror, and isolate_home leaves a marker
@@ -1083,6 +1155,26 @@ class Quota:
                     f"identify and did not check. Unset ${var} and re-run, so the account named by the "
                     f"credential file is the account that actually pays."
                 )
+        # auth.json is only the credential codex uses while its store mode is `file`. Under `keyring` or
+        # `ephemeral` codex ignores the file completely — but a file left over from before the switch
+        # stays on disk, so reading it would confidently certify an account codex is not using. That
+        # fails OPEN, which is the one direction this check must never fail.
+        store = self._codex_credentials_store()
+        if store is not None:
+            return (
+                _para(
+                    f"--account {requested} cannot be verified: "
+                    f"{_store_reason(store, codex_dir(self.cfg.home) / 'config.toml', self.cfg.checkout)}. "
+                    f"Any account TauCeti read from {src}/auth.json could be one codex is not using."
+                )
+                + "\n\n"
+                + _para(
+                    "Make codex's credential store provably `file` — its default, so unset or "
+                    'cli_auth_credentials_store = "file", with no project-level override — if you want '
+                    "--account to be verifiable, or drop --account and accept that the paying account "
+                    "is unchecked."
+                )
+            )
         # Every command we print names the credential store it acts on, ALWAYS — even when that is the
         # default ~/.codex. A bare `codex logout` targets whatever store the reader's shell resolves to,
         # so an operator running under a custom or per-worker $CODEX_HOME who copy-pastes it would revoke
@@ -1180,6 +1272,19 @@ class Quota:
 
     def codex(self, *, refresh: bool = False) -> Provider:
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
+        # The pacer reads auth.json for the token it measures usage with, so it inherits the same
+        # assumption --account does: that auth.json is the credential codex uses. Under a non-file
+        # store it is not, and a leftover file would have us fetch and CACHE one account's usage while
+        # the agent spends another — pacing against the wrong budget in whichever direction happens to
+        # be wrong. This costs no request; it turns a silent mispace into a stated reason.
+        store = self._codex_credentials_store()
+        if store is not None:
+            return Provider(
+                "codex",
+                False,
+                None,
+                error=f"codex credential store is not verifiably the file TauCeti paces against ({store})",
+            )
         auth = self._codex_creds()
         if not auth:
             return Provider("codex", False, None, error="no ~/.codex/auth.json")
