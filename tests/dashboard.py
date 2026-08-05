@@ -309,7 +309,7 @@ def test_skip_edge_cases():
         os.environ["TAUCETI_ROADMAP_SKIP"] = "algebra,topology"
         tc.do_roadmap(w, None, tc.Candidate(0, "", "algebra"), opts, False)
         check("pinned area still drives the prompt", "`algebra`" in captured["prompt"])
-        check("pinned area not listed as skipped", "these areas: `topology`" in captured["prompt"])
+        check("pinned area not listed as skipped", "Never target `topology`" in captured["prompt"])
         # auto mode with every known area skipped → NoProgress (not a fallback to "any")
         captured.clear()
         raised = False
