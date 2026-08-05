@@ -100,6 +100,7 @@ COPY tauceti-path.sh /etc/profile.d/tauceti-path.sh
 # Bare-Python helper entrypoints (including the OAuth refresher) also import the
 # worker package, so install its shared Tools dependency outside the uv-script env.
 RUN uv pip install --system --break-system-packages . \
+    && install -m 0755 scripts/curl-no-progress /usr/local/bin/curl \
     && ln -s /opt/tauceti/scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
     && chmod 0644 /etc/profile.d/tauceti-path.sh \
