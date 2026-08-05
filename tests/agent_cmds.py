@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """M8: verify the host agent argv is byte-for-byte what round.sh's run_agent builds."""
 
+import os
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -22,10 +25,31 @@ def check(name, argv, expect):
 
 
 a, env = tc.host_agent_argv(P, "codex")
-check("codex", a, ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", P])
+check(
+    "codex",
+    a,
+    [
+        "codex",
+        "exec",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+        "--sandbox",
+        "danger-full-access",
+        "--skip-git-repo-check",
+        P,
+    ],
+)
+assert "OPENAI_API_KEY" not in env, "codex env must drop OPENAI_API_KEY (bills the ChatGPT plan)"
+print("[OK ] codex env drops OPENAI_API_KEY")
 
 a, env = tc.host_agent_argv(P, "claude")
-check("claude", a, ["claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
+check(
+    "claude",
+    a,
+    ["claude", "-p", P, "--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"],
+)
 assert "ANTHROPIC_API_KEY" not in env, "claude env must drop ANTHROPIC_API_KEY (bills the Max plan)"
 print("[OK ] claude env drops ANTHROPIC_API_KEY")
 
@@ -36,6 +60,72 @@ check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"],
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 
+# Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
+# stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.
+saved_run = tc.agents.subprocess.run
+saved_stream = os.environ.get("TAUCETI_STREAM")
+saved_runtime_status = os.environ.get(tc.runtime_status.STATUS_ENV)
+calls = []
+tc.agents.subprocess.run = lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=0)
+try:
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["TAUCETI_STREAM"] = "1"
+        tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test")
+        check("streamed agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
+        os.environ.pop("TAUCETI_STREAM")
+        tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test")
+        check("logged agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
+
+        status_file = Path(td) / "status.json"
+        os.environ[tc.runtime_status.STATUS_ENV] = str(status_file)
+
+        def fail_with_diagnostic(*_args, **kwargs):
+            kwargs["stdout"].write(b"API Error: 529 Overloaded\n")
+            return SimpleNamespace(returncode=1)
+
+        tc.agents.subprocess.run = fail_with_diagnostic
+        tc.run_agent_proc(["claude"], env={}, logdir=Path(td), label="agent-claude")
+        failure = tc.runtime_status.read_json(status_file)
+        check(
+            "agent failure publishes its diagnostic",
+            failure.get("failure_reason"),
+            "claude agent exited with status 1: API Error: 529 Overloaded",
+        )
+        check("agent failure publishes its exit code", failure.get("failure_code"), 1)
+        assert Path(failure["failure_log"]).name.startswith("agent-claude-")
+finally:
+    tc.agents.subprocess.run = saved_run
+    if saved_stream is None:
+        os.environ.pop("TAUCETI_STREAM", None)
+    else:
+        os.environ["TAUCETI_STREAM"] = saved_stream
+    if saved_runtime_status is None:
+        os.environ.pop(tc.runtime_status.STATUS_ENV, None)
+    else:
+        os.environ[tc.runtime_status.STATUS_ENV] = saved_runtime_status
+
+# Host configuration must not change worker authoring. Both backends consume the
+# committed/provider-specific profile instead.
+saved_host_home = tc.agents._host_home
+saved_model = os.environ.pop("TAUCETI_CODEX_MODEL", None)
+try:
+    with tempfile.TemporaryDirectory() as td:
+        host_home = Path(td)
+        (host_home / ".codex").mkdir()
+        (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-luna"\n')
+        tc.agents._host_home = lambda: host_home
+        check("Codex default ignores host model selection", tc.agents._codex_model(), "gpt-5.6-sol")
+        (host_home / ".codex" / "config.toml").write_text("not valid [")
+        check("invalid host model config is irrelevant", tc.agents._codex_model(), "gpt-5.6-sol")
+        os.environ["TAUCETI_CODEX_MODEL"] = "operator-model"
+        check("bubble Codex model operator override", tc.agents._codex_model(), "operator-model")
+finally:
+    tc.agents._host_home = saved_host_home
+    if saved_model is None:
+        os.environ.pop("TAUCETI_CODEX_MODEL", None)
+    else:
+        os.environ["TAUCETI_CODEX_MODEL"] = saved_model
+
 # $TAUCETI_CLAUDE_CMD wraps/replaces the host claude executable; the standard flags are still appended,
 # and an empty / whitespace-only value falls back to bare `claude` rather than a broken argv.
 _saved = tc.agents.CLAUDE_CMD
@@ -44,11 +134,26 @@ a, _ = tc.host_agent_argv(P, "claude")
 check(
     "claude override",
     a,
-    ["my-wrapper", "--flag", "claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"],
+    [
+        "my-wrapper",
+        "--flag",
+        "claude",
+        "-p",
+        P,
+        "--model",
+        "claude-opus-5",
+        "--effort",
+        "high",
+        "--dangerously-skip-permissions",
+    ],
 )
 tc.agents.CLAUDE_CMD = "   "
 a, _ = tc.host_agent_argv(P, "claude")
-check("claude override blank falls back", a, ["claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
+check(
+    "claude override blank falls back",
+    a,
+    ["claude", "-p", P, "--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"],
+)
 tc.agents.CLAUDE_CMD = _saved
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

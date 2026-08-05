@@ -22,7 +22,21 @@ MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
 # still blocking). The worker no longer caps its own review rounds — it keeps reviewing on every new
 # head until the PR merges or CI closes it — so every PR reaches a terminal state.
+MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an attempt back before
+# the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
+# retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
+# matched the transient patterns, an uncapped refund would retry it until a human noticed.
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without posting a verdict
+
+# Progress reporting (TauCetiProgress). Pinned by SHA, not a branch: the worker's generator and the
+# merge gate in TauCetiRoadmap must run the SAME version, or the worker can emit headers the gate does
+# not recognise and every report wedges. Bump this together with the two pins in
+# TauCetiRoadmap/.github/workflows/progress-*.yml.
+PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "f735789ac2b5185f6650f46e91a074fefdee6d68")
+PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
+MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
+PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
 
 # (the engine can't produce a review at all), stop retrying and ESCALATE —
 # a loud per-round warning + a tracking issue — since a PR that can never be
@@ -58,7 +72,17 @@ MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across head
 
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
 
-MAX_OPEN_PRS = 8  # backpressure: don't author new roadmap PRs while this many of ours are open
+# Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
+# are open.
+MAX_OPEN_PRS = 8
+
+# The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
+# The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
+# (a PR climbs CI -> review -> author fixes -> merge). Fixed set: a new status label won't appear here
+# until it is added, which keeps the line stable and its columns comparable round to round. These are
+# not a partition — a PR carrying none of them lands in no bucket, and the roadmap/* area labels are a
+# separate axis that this line ignores.
+STATUS_LABELS = ("awaiting-CI", "awaiting-review", "review-in-progress", "awaiting-author", "ready-to-merge")
 
 
 # Loop timing. Env-overridable for tuning and tests.
@@ -124,28 +148,58 @@ OPENROUTER_MODELS = {
 
 AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek", "minimax": "MiniMax"}
 
+# Reproducible authoring defaults. Provider selection remains quota-driven; once
+# selected, host and bubble launchers consume this exact model/effort profile.
+# Review models are configured separately by the review engine.
+CODEX_AUTHORING_FALLBACK_MODEL = "gpt-5.6-terra"
+# A model entitlement normally changes only when an account's subscription changes. Keep the
+# side-effect-free access probe out of every round while still noticing an upgrade promptly.
+CODEX_MODEL_ACCESS_TTL = 3600
+AUTHORING_DEFAULTS = {
+    # Prefer flagship Sol for authoring. A cached preflight probe selects Terra only when Codex confirms
+    # that this repository default is unavailable to the current subscription.
+    # Pin Claude to the current exact Opus generation, not its moving alias.
+    "codex": ("gpt-5.6-sol", "high"),
+    "claude": ("claude-opus-5", "high"),
+}
+
 PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
 
 # $TAUCETI_CLAUDE_CMD overrides the `claude` executable for host rounds (a sandbox wrapper, a
 # differently-named build, ...); it's split as a shell word list and the standard
 # -p/--model/--permission flags are still appended. Matches PI_RUN / $TAUCETI_BUBBLE /
-# $TAUCETI_CODEX_MODEL. (Bubble rounds run claude inside the container, so this is --host only.)
+# $TAUCETI_CODEX_MODEL. (Bubble rounds run claude inside the container, so this is host-mode only.)
 CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "roadmap"]
+# `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
+# Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
+# honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains
+# ahead of fleet-wide reviews so awaiting-author work cannot be starved by unrelated reviews. Roadmap
+# is the final fallback and is handled separately after these stages. The durable attempt breaker
+# keeps a stuck or rejected progress report from burning every round.
+AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
+
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
-# Both derive from ALLOWED_TASKS so the table number, the row order, and the keybinding can never drift.
+# ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
+# runtime priority. Keeping those concepts separate avoids silently rebinding established digit keys.
 KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...
 
 KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1", ...
 
-# Every mode runs a MODEL on third-party content, so each defaults to bubble (opt out with --host).
+# Every mode runs a MODEL on third-party content, so each is eligible for the bubble sandbox
+# (opt in with --bubble; the host is the default).
 SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
+# `progress` is the exception: there is no untrusted checkout to confine. It needs `gh` against
+# TauCetiRoadmap (the bubble proxy is scoped to TauCeti) and the model is handed bounded text rather
+# than a working tree to roam. Its remaining exposure — merged PR descriptions reaching the model — is
+# bounded by the merge gate, which only ever admits two markdown files in one directory.
+SANDBOX_DEFAULT["progress"] = False
 
 
 AGENTS = ["auto", "codex", "claude", "deepseek", "minimax"]

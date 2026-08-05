@@ -21,13 +21,26 @@ from types import SimpleNamespace
 
 # Isolate the prefs file: persistence must land here, not in the operator's real ~/.config.
 _CFGDIR = tempfile.mkdtemp(prefix="tauceti-prefs-")
+for _key in (
+    "TAUCETI_CONFIG_HOME",
+    "TAUCETI_WORKERS_CONFIG",
+    "TAUCETI_WORKERS_STATE_DIR",
+    "TAUCETI_RUNTIME_DIR",
+):
+    os.environ.pop(_key, None)
 os.environ["XDG_CONFIG_HOME"] = _CFGDIR
+os.environ["XDG_STATE_HOME"] = str(Path(_CFGDIR) / "state-home")
+os.environ["TAUCETI_RUNTIME_DIR"] = str(Path(_CFGDIR) / "runtime")
 os.environ.pop("TAUCETI_ROADMAP_ONLY", None)  # start from a known (unset) area state
 os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
+
+assert tc.default_workers_config().is_relative_to(Path(_CFGDIR)), (
+    f"dashboard test configuration escaped its temporary root: {tc.default_workers_config()}"
+)
 
 fails = 0
 
@@ -59,10 +72,34 @@ def fake_survey(next_stage="review"):
     ]
     sv.n_open_nondraft = 2
     sv.n_reviewable = 2
+    sv.status_labels = [
+        ("awaiting-CI", 0, 0),
+        ("awaiting-review", 2, 1),
+        ("review-in-progress", 0, 0),
+        ("awaiting-author", 0, 0),
+        ("ready-to-merge", 0, 0),
+    ]
     sv.reviewable.actionable = [tc.Candidate(101, "x"), tc.Candidate(102, "x")]
     _f = tc.roadmap_only()  # mirror survey()'s sanitization: None → "auto"
     sv.roadmap_only = "auto" if _f is None else (_f or "any")
     sv.roadmap_skip = tc.roadmap_skip()
+    sv._mine_open_prs = [
+        tc.PRInfo(
+            number=200 + n,
+            head_oid="x",
+            head_ref="roadmap/x",
+            head_owner="o",
+            head_repo="r",
+            is_draft=False,
+            mergeable="MERGEABLE",
+            author="me",
+            build_success=True,
+            build_failed=False,
+            labels=("roadmap/algebra" if n < tc.MAX_OPEN_PRS else "roadmap/topology",),
+        )
+        for n in range(tc.MAX_OPEN_PRS + 1)
+    ]
+    sv.rescope_roadmap()
     sv.next_auto_stage = next_stage
     return sv
 
@@ -99,7 +136,7 @@ async def test_dashboard():
         await pilot.press("m")
         check("m cycles model auto->codex", app.model_dial == "codex")
         await pilot.press("s")
-        check("s toggles sandbox to host", app.host is True)
+        check("s toggles sandbox to bubble", app.bubble is True)
 
         before = table.row_count
         await pilot.press("down")  # onto review (index 1)
@@ -119,6 +156,8 @@ async def test_dashboard():
         await pilot.pause(0.1)
         check("only picker set env area to topology", os.environ.get("TAUCETI_ROADMAP_ONLY") == "topology")
         check("roadmap row area updated immediately (no stale redraw)", app.sv.roadmap_only == "topology")
+        check("roadmap row count rescoped immediately", app.sv.n_mine_open == 1)
+        check("roadmap row backpressure rescoped immediately", app.sv.roadmap_backpressure is False)
 
         # a digit jumps the cursor to that kind and launches a one-round follow-up (then exits)
         await pilot.press("2")
@@ -132,14 +171,14 @@ async def test_dashboard():
     check("prefs file written under XDG_CONFIG_HOME", prefs_file.exists() and str(prefs_file).startswith(_CFGDIR))
     saved = json.loads(prefs_file.read_text())
     check("prefs persisted model=codex", saved.get("model") == "codex")
-    check("prefs persisted host=True", saved.get("host") is True)
+    check("prefs persisted bubble=True", saved.get("bubble") is True)
     check("prefs persisted user-chosen only=topology", saved.get("roadmap_only") == "topology")
 
     app2 = tc._dashboard_app(CFG, loader=loader)
     async with app2.run_test() as pilot:
         await pilot.pause(0.05)
         check("restart restores model=codex", app2.model_dial == "codex")
-        check("restart restores sandbox=host", app2.host is True)
+        check("restart restores sandbox=bubble", app2.bubble is True)
 
 
 async def test_cursor_before_load():
@@ -327,7 +366,7 @@ def test_bare_cli_ignores_prefs():
     try:
         cfg = SimpleNamespace(home=Path(cfgdir))
         tc.save_dashboard_prefs(
-            cfg, {"model": "auto", "host": False, "roadmap_only": "SavedArea", "roadmap_skip": "SkipArea"}
+            cfg, {"model": "auto", "bubble": False, "roadmap_only": "SavedArea", "roadmap_skip": "SkipArea"}
         )
         check("bare CLI only is None (auto), ignoring the saved pref", tc.roadmap_only() is None)
         check("bare CLI skip is empty, ignoring the saved pref", tc.roadmap_skip() == [])
@@ -350,7 +389,7 @@ def test_dashboard_uses_saved_pref():
     try:
         cfg = SimpleNamespace(home=Path(cfgdir), state=Path(cfgdir) / "state", logdir=Path("/tmp/x"))
         tc.save_dashboard_prefs(
-            cfg, {"model": "auto", "host": False, "roadmap_only": "topology", "roadmap_skip": "algebra"}
+            cfg, {"model": "auto", "bubble": False, "roadmap_only": "topology", "roadmap_skip": "algebra"}
         )
         tc._dashboard_app(cfg, loader=loader)  # runs the saved-pref restore
         check("dashboard applied the saved only to the env", os.environ.get("TAUCETI_ROADMAP_ONLY") == "topology")
@@ -390,6 +429,66 @@ async def test_skip_dashboard():
             os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
+async def test_persistent_workers_view():
+    """The dashboard's loop action writes desired state, and the Workers view monitors and edits it."""
+    config = tc.default_workers_config()
+    tc.save_worker_specs(
+        config,
+        [tc.WorkerSpec(id="worker1"), tc.WorkerSpec(id="worker2", agent="codex", only=("review",))],
+    )
+    old_ensure = tc.worker_manager.ensure_manager
+    tc.worker_manager.ensure_manager = lambda _config: False
+    try:
+        app = tc._dashboard_app(CFG, loader=loader)
+        async with app.run_test() as pilot:
+            await await_survey(app, pilot)
+            await pilot.press("w")
+            await pilot.pause(0.05)
+            check("w opens the persistent Workers view", app.view == "workers")
+            check("Workers view lists configured workers", app.query_one("#workers-tbl").row_count == 2)
+            await pilot.press("down")
+            await pilot.press("space")
+            await pilot.pause(0.05)
+            check("space persists desired stopped state", tc.load_worker_specs(config)[1].enabled is False)
+            await pilot.press("w")
+            await pilot.press("l")
+            await pilot.pause(0.05)
+            specs = tc.load_worker_specs(config)
+            check("loop action adds a persistent worker", len(specs) == 3 and specs[-1].id == "worker3")
+            check("persistent launch carries dashboard model", specs[-1].agent == app.model_dial)
+    finally:
+        tc.worker_manager.ensure_manager = old_ensure
+
+
+def test_dashboard_migrates_host_pref():
+    """The sandbox pref key was renamed host -> bubble when the default flipped to host. An old prefs
+    file (only the `host` key) must migrate as bubble = not host, so a user who was reviewing untrusted
+    PRs in bubble (host=false) is NOT silently un-sandboxed on upgrade. A present `bubble` key wins."""
+    cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-mig-")
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    old_only = os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+    old_skip = os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+    os.environ["XDG_CONFIG_HOME"] = cfgdir
+    try:
+        cfg = SimpleNamespace(home=Path(cfgdir), state=Path(cfgdir) / "state", logdir=Path("/tmp/x"))
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": False})  # old bubble default
+        check("old host=false migrates to bubble mode", tc._dashboard_app(cfg, loader=loader).bubble is True)
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": True})  # old host toggle
+        check("old host=true migrates to host mode", tc._dashboard_app(cfg, loader=loader).bubble is False)
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "bubble": True, "host": False})  # new key wins
+        check("new bubble key takes precedence over legacy host", tc._dashboard_app(cfg, loader=loader).bubble is True)
+        tc.save_dashboard_prefs(cfg, {"model": "auto"})  # neither key -> new host default
+        check("no sandbox pref defaults to host", tc._dashboard_app(cfg, loader=loader).bubble is False)
+    finally:
+        os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
+        if old_only is not None:
+            os.environ["TAUCETI_ROADMAP_ONLY"] = old_only
+        if old_skip is not None:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
+
+
 async def run_all():
     await test_dashboard()
     await test_cursor_before_load()
@@ -401,7 +500,9 @@ async def run_all():
     test_roadmap_skip_parse()
     test_bare_cli_ignores_prefs()
     test_dashboard_uses_saved_pref()
+    test_dashboard_migrates_host_pref()
     await test_skip_dashboard()
+    await test_persistent_workers_view()
 
 
 asyncio.run(run_all())

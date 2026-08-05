@@ -43,10 +43,21 @@ def no(msg: str) -> None:
 
 
 def group_alive(pgid: int) -> bool:
+    """Is this group still holding live processes?
+
+    Three outcomes, not two, and the third is why this is not a bare bool internally. ESRCH is an
+    empty group. EPERM means the group exists but nothing in it could be signalled: on Darwin that is
+    what a group of unreaped zombies reports, but it is also what a live member we may not signal
+    reports, and killpg cannot distinguish them. Collapsing EPERM to "dead" would let this test's
+    oracle certify a sweep that actually leaked something, so say which happened instead of hiding it.
+    """
     try:
         os.killpg(pgid, 0)
         return True
     except ProcessLookupError:
+        return False
+    except PermissionError:
+        print(f"  [note] group {pgid} exists but is unsignalable (EPERM); treating as swept")
         return False
 
 
@@ -158,6 +169,85 @@ elif group_alive(pgid4):
         pass
 else:
     ok("run_round_subprocess swept the leaked group on normal return")
+
+print("== 5. an unsignalable group is reported, not raised, at every call site ==")
+# Darwin returns EPERM from killpg when a group exists but no member could be signalled -- a group of
+# unreaped zombies, which is what a just-killed leader is until its parent wait()s it, but equally a
+# live member we may not signal. Neither may crash a teardown path: reap_round_group runs in the loop
+# parent's finally, so an escaping PermissionError takes the whole --loop down. Simulate the platform's
+# answer rather than the platform, so this runs anywhere.
+real_killpg = os.killpg
+
+
+def denying_killpg(_pgid, _sig):
+    raise PermissionError(1, "Operation not permitted")
+
+
+# signal_group is the single place that classifies; check it first, then that no caller re-raises.
+os.killpg = denying_killpg
+try:
+    if tc.round.signal_group(999999, 0) == "denied":
+        ok("signal_group classifies EPERM as denied")
+    else:
+        no("signal_group mis-classified EPERM")
+finally:
+    os.killpg = real_killpg
+
+
+# Every site, driven so the EPERM lands on each signal in turn: reap's SIGTERM, reap's probe, reap's
+# final SIGKILL, and both of kill_round_group's. "Did not raise" is necessary but not sufficient, so
+# also record the calls to show the sweep stops at the denial instead of spinning to its deadline.
+class FakeProc:
+    """Minimal Popen stand-in: alive until waited, and never a real process."""
+
+    pid = os.getpid()  # so getpgid() resolves; killpg is patched out, so nothing is ever signalled
+    returncode = None
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("fake", timeout or 0)
+
+
+for label, fn, deny_at in (
+    ("reap: SIGTERM", lambda: tc.reap_round_group(999999, term_grace=0.2), 0),
+    ("reap: liveness probe", lambda: tc.reap_round_group(999999, term_grace=0.2), 1),
+    ("reap: final SIGKILL", lambda: tc.reap_round_group(999999, term_grace=0.0), 1),
+    ("kill_round_group: SIGTERM", lambda: tc.round.kill_round_group(FakeProc(), term_grace=0), 0),
+    ("kill_round_group: SIGKILL", lambda: tc.round.kill_round_group(FakeProc(), term_grace=0), 1),
+):
+    seen = []
+
+    def counting_killpg(pgid, sig, _seen=seen, _deny_at=deny_at):
+        _seen.append(sig)
+        if len(_seen) - 1 == _deny_at:
+            raise PermissionError(1, "Operation not permitted")
+        return None  # pretend it landed; never touch a real process group
+
+    os.killpg = counting_killpg
+    try:
+        fn()
+        if len(seen) == deny_at + 1:
+            ok(f"{label}: EPERM handled and no further signals sent")
+        else:
+            no(f"{label}: kept signalling after EPERM ({len(seen)} calls)")
+    except PermissionError:
+        no(f"{label}: EPERM escaped")
+    except Exception as exc:  # noqa: BLE001 - any escape is the failure being tested for
+        no(f"{label}: raised {type(exc).__name__}: {exc}")
+    finally:
+        os.killpg = real_killpg
+
+# ESRCH must stay distinguishable from EPERM, or the classification is decorative.
+os.killpg = lambda _pgid, _sig: (_ for _ in ()).throw(ProcessLookupError())
+try:
+    if tc.round.signal_group(999999, 0) == "gone":
+        ok("signal_group still classifies ESRCH as gone")
+    else:
+        no("signal_group conflated ESRCH with denied")
+finally:
+    os.killpg = real_killpg
 
 # Clean the per-worker state this test seeded.
 shutil.rmtree(REPO / "state" / WID, ignore_errors=True)

@@ -11,22 +11,34 @@ and let it pick the most useful job each round until you stop it.
 It runs as your authenticated `gh` account: you set up `gh auth`, the worker acts
 as that account, and it treats that account's own PRs as the ones it tends. The
 repo is hardwired to `TauCetiProject/TauCeti`. This is an operator's tool for that
-project, not a general framework.
-
-You author through **your own fork**: the worker forks `TauCetiProject/TauCeti` (once,
-automatically), pushes authored branches and fixes to that fork, and opens PRs from it —
-so you do **not** need write access to the canonical repo, only a `gh auth` that can fork
-it and push to your fork. (A fine-grained token scoped only to the canonical repo is not
-enough.) Set `TAUCETI_FORK=<owner>/<repo>` to point at an existing fork instead of the
-auto-created one.
+project, not a general framework. You author through **your own fork**: the worker
+forks `TauCetiProject/TauCeti` once, automatically, pushes authored branches and
+fixes there, and opens PRs from it, so you do **not** need write access to the
+canonical repo. (A fine-grained token scoped only to the canonical repo is not
+enough.) Set `TAUCETI_FORK=<owner>/<repo>` to use an existing fork instead.
 
 ## Quickstart
+
+You need `gh`, `git`, `uv`, and `jq`. Log `gh` in as the account the worker should
+act as, and log in to each subscription agent you want to use:
+
+```bash
+gh auth login
+codex login            # for --agent codex, or auto
+claude auth login      # for --agent claude, or auto
+```
+
+Code-writing phases on the host also need an `elan`/`lake` toolchain. The
+OpenRouter agents need an exported `OPENROUTER_API_KEY` instead, plus the `pi`
+runner for host rounds; Bubble includes `pi`. The `--bubble` sandbox has
+additional requirements; see [the sandbox notes](docs/sandbox.md).
 
 Install it as a tool, no clone needed:
 
 ```bash
 uv tool install git+https://github.com/kim-em/TauCetiWorker.git
 
+tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
 tauceti work --only review         # one round of a specific kind of work, then exit
@@ -34,41 +46,40 @@ tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / 
 tauceti work --loop                # fully automatic: keep picking the most useful job
 ```
 
-From a clone of this repo you can also just run `./tauceti` (a small PEP 723 `uv`
-shim that runs the `tauceti_worker` package), and every command above works the same. Either way, Ctrl-C stops the
-current round and exits, and `tauceti doctor` checks your environment and tells
-you what's missing.
+Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
+instead, a small PEP 723 `uv` shim that runs the same package; every command
+below works either way, and this README writes the installed form.
 
-### The dashboard
+## The dashboard
 
 Bare `tauceti` opens an interactive dashboard ([Textual](https://textual.textualize.io/)).
 The table lists each kind of work with a number, how many PRs are ready, and a
-sample; a cursor highlights one row. The survey is fetched once in the background
-and refreshed on `r` (or every 90s), so moving the cursor is instant — it never
-re-queries GitHub. It reacts to single keypresses (no Enter):
+sample. The survey is fetched once in the background and refreshed on `r` (or
+every 90s), so moving the cursor never re-queries GitHub. It reacts to single
+keypresses, no Enter:
 
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` (or `k` / `j`) | move the cursor between kinds |
 | `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the areas) |
 | `Enter` | run one round of the selected kind |
-| `1`–`6` | run one round of that numbered kind directly |
-| `l` / `L` | loop the auto cascade / loop just the selected kind |
+| `1`–`7` | run one round of that numbered kind directly |
+| `l` / `L` | add a persistent worker for the auto cascade / selected kind |
 | `o` / `x` | pick the single roadmap area (`--roadmap-only`) / edit the skipped areas (`--roadmap-skip`) |
-| `m` / `s` | cycle the agent / toggle the sandbox (bubble ↔ host) |
+| `m` / `s` | cycle the agent / toggle the sandbox (host ↔ bubble) |
+| `w` | switch between available Work and desired/actual Workers |
 | `r` / `c` / `q` | refresh / copy the launch command to the clipboard / quit |
 
-The agent, sandbox, and roadmap area dials you pick are remembered between runs in
-`$XDG_CONFIG_HOME/tauceti/dashboard.json` (default `~/.config/tauceti/`), so the
-dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_ONLY` /
-`TAUCETI_ROADMAP_SKIP` in the environment still overrides the saved value. The saved
-values are dashboard-only: a bare `tauceti work` never reads them (rounds launched from
-the dashboard carry them via explicit `--roadmap-only` / `--roadmap-skip`). The file is a user config dir, not
-the per-worker `state/`, so it is shared whether you run `./tauceti` from a clone or
-the `uv tool install`ed `tauceti`, and survives upgrades.
+In the Workers view, arrows select a worker, Space persists enabled/disabled
+desired state, Ctrl-R restarts it, and Enter follows its current logfile.
 
-Over a pipe or with no TTY it prints a one-shot snapshot instead (use `tauceti
-status` in scripts).
+Your agent, sandbox, and roadmap selections persist in `dashboard.json` under
+the TauCeti config directory, so the dashboard reopens where you left it. They
+are dashboard-only: a bare `tauceti work` never reads them, and an explicit
+`TAUCETI_ROADMAP_ONLY` or `TAUCETI_ROADMAP_SKIP` in the environment still wins.
+Clone-based and installed invocations share this user-level file. Over a pipe or
+with no TTY the dashboard prints a one-shot snapshot instead. Use `tauceti
+status` in scripts.
 
 ## What a round does
 
@@ -77,54 +88,55 @@ A round does exactly one unit of work: the first of these that applies.
 | Step | What it does |
 |------|--------------|
 | **Rebase** | Resolve one of our conflicting PRs — a genuine content conflict under `TauCeti/` after a sibling merged first (the root `TauCeti.lean` is auto-synced on `main`, so it no longer collides). |
-| **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. |
-| **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
-| **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
+| **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
+| **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
+| **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
+| **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so `awaiting-author` work cannot be starved by unrelated reviews. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
 Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
 the worker. A GitHub API failure aborts the round rather than reading as "nothing
 to do", so a transient outage never falls through to authoring.
 
-## Modes
+## Configure a round
 
-There are three dials: which work (`--only`), which agent (`--agent`), and where
-it runs (`--host`). They're independent, so combine them however you like.
+Three independent dials: which work, which agent, and where it runs. Combine
+them however you like.
 
 ### What work: `--only`
 
 With no `--only`, a round walks the whole cascade and does the first job that
-applies. `--only <task>[,<task>...]` pins it to particular kinds:
+applies. `--only <task>[,<task>...]` pins it to particular kinds, and `--skip`
+drops kinds from the cascade (the two combine by subtraction):
 
 ```bash
 tauceti work --loop --only review     # only review open PRs
-tauceti work --loop --only roadmap    # only open new roadmap PRs
 tauceti work --loop --only fix,fix-ci # only tend to our own PRs
-tauceti work --loop --only bump       # only adapt broken bump-mathlib PRs
+tauceti work --loop --skip roadmap    # everything except authoring new PRs
 ```
 
-The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
+Roadmap rounds steer toward one area, a subdirectory of the
+[roadmap](https://github.com/TauCetiProject/TauCetiRoadmap):
 
-Roadmap rounds steer toward one area (a subdirectory of the
-[roadmap](https://github.com/TauCetiProject/TauCetiRoadmap)). Pin it with
-`--roadmap-only <area>` (or `TAUCETI_ROADMAP_ONLY`, or the dashboard's `o`
-key); an empty value means "all areas". With nothing set, each round picks a
-fresh random area (so an unpinned `--loop` roams the whole roadmap over time).
-To stay out of areas other contributors are working on, exclude them with
-`--roadmap-skip <area>[,<area>...]` (or `TAUCETI_ROADMAP_SKIP`, or the dashboard's
-`x` key): skipped areas drop out of the random pick and the all-areas case.
-`--roadmap-only` wins if it names a skipped area.
+- `--roadmap-only <area>` pins it. An empty value means all areas. With nothing
+  set, each round picks a fresh random area, so an unpinned `--loop` roams the
+  whole roadmap over time.
+- `--roadmap-skip <area>[,<area>...]` excludes areas from both the random pick
+  and the all-areas case. `--roadmap-only` wins on overlap.
+- `--source <path-or-url>` adapts compatible material from an existing repository,
+  and needs the roadmap phase enabled plus one pinned area. It is supplementary:
+  the agent prioritizes the roadmap as written, then review-quality library code,
+  and only then migration of the source.
 
-Within an area, roadmap workers also respect finer-grained **claims** registered by other
-contributors on the [intentions board](https://github.com/leanprover-community/intentions):
-an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that someone has
-claimed is treated as theirs, and the worker is told not to author it. "You" is your own
-`gh auth` identity; if you run workers under several accounts (or coordinate with someone
-whose intentions you're fulfilling), list those logins with
-`--roadmap-extra-identities <login>[,<login>...]` (or `TAUCETI_ROADMAP_EXTRA_IDENTITIES`) so
-the worker doesn't avoid your own side's claims. This is on by default and is cooperative
-(soft, fail-open); `--ignore-claims` (or `TAUCETI_RESPECT_CLAIMS=false`) opts out.
+```bash
+tauceti work --only roadmap --roadmap-only Topology --source ../existing-library
+```
+
+Roadmap workers also avoid finer-grained targets other contributors have claimed
+on the [intentions board](https://github.com/leanprover-community/intentions).
+Adjust with `--roadmap-extra-identities` (logins that count as your own side) or
+turn it off with `--ignore-claims`; see [the reference](docs/reference.md).
 
 ### Which agent: `--agent`
 
@@ -132,197 +144,139 @@ the worker doesn't avoid your own side's claims. This is on by default and is co
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex preferred, Opus fallback | subscription, paced |
-| `codex` | Codex only | subscription, paced |
-| `claude` | Opus only | subscription, paced |
+| `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
+| `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
+| `claude` | `claude-opus-5`, high effort | subscription, paced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
 Set a default with `TAUCETI_AGENT`. The OpenRouter agents are pay-per-token, so
-they never run on their own; you have to ask for them by name. Override their
-model ids with `DEEPSEEK_MODEL` / `MINIMAX_MODEL`, and point at a non-default `pi`
-runner with `PI_RUN`.
+they never run on their own; you have to ask for them by name.
 
-### Where it runs: bubble, or `--host`
+For an explicit provider, `--author-model` and `--author-effort` override the
+profile for one run. Pinning a Codex model also disables the automatic Terra
+fallback. Every authoring launch prints its effective provider, model, effort,
+and sandbox.
 
-Every round runs its agent inside a [`bubble`](https://github.com/kim-em/bubble)
-sandbox by default. That's a repo-scoped container: your `gh` token never enters
-it (git and gh go through bubble's auth proxy), only the one credential the agent
-needs is seeded, and none of your host config crosses the boundary. That matters
-most for review, where the agent reads untrusted PRs.
+### Which account: `--account`
 
-`--host` opts out and runs the agent directly on the host. It's faster, but the
+TauCeti spends whatever account the agent CLIs are already logged into. If you
+have several ChatGPT accounts and care which one pays, `--account` makes that
+explicit:
+
+```bash
+tauceti doctor                 # shows which Codex account the credential is for
+tauceti work --agent codex --account you@example.com
+```
+
+It is a check, never a switch: a credential for a different account exits the
+round before spending anything. Codex only, because its credential carries the
+account identity and `codex login status` will not show it. To run TauCeti on one
+account while your interactive `codex` keeps another, give it a private
+credential directory with `CODEX_HOME`; see
+[the reference](docs/reference.md#codex-accounts).
+
+### Where it runs: the host, or `--bubble`
+
+Every round runs its agent directly on the host by default. It's fast, but the
 agent has your full credentials and network, so keep it for trusted or local
-runs. Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime;
-if you don't have one, `tauceti doctor` says so and you run with `--host`. You
-don't have to install bubble yourself, `tauceti` fetches it with `uvx` when it
-isn't already on your `PATH`. On `--host` you can point at a non-default `claude`
-with `TAUCETI_CLAUDE_CMD` (a sandbox wrapper, a differently-named build, ...); it's
-split as a shell word list and the usual flags are appended.
+runs.
 
-The agent's conversation transcript is noisy, so by default a round redirects it
-to a timestamped file under `logs/` and prints the path (tailing it if the agent
-exits non-zero). Pass `--stream` to watch it live on the terminal instead.
+For code and review phases, `--bubble` runs the selected agent and its checkout
+inside a repo-scoped [bubble](https://github.com/kim-em/bubble) container. The
+agent's git and gh traffic goes through Bubble's proxy, your `gh` token never
+enters the container, only the selected agent credential is seeded, and none of
+your host config crosses the boundary. The outer worker still surveys GitHub and
+coordinates the round from the host. Progress-report rounds are the exception:
+they always run on the host. Bubble needs an
+[Incus](https://linuxcontainers.org/incus/) runtime. See
+[the sandbox notes](docs/sandbox.md) for the exact boundary and requirements.
+
+The agent's conversation transcript is noisy, so a round redirects it to a
+timestamped file under `logs/` and prints the path, tailing it if the agent exits
+non-zero. Pass `--stream` to watch it live instead.
+
+## Persistent workers
+
+Persistent workers are declarative and do not belong to a terminal session. You
+describe what you want, and a manager keeps reality matching it. Nothing needs to
+exist first:
+
+```bash
+tauceti workers add                        # an enabled worker1, the whole cascade
+tauceti workers add reviewer --only review # a focused, named worker
+tauceti workers                            # desired and actual state
+tauceti workers logs --follow reviewer     # its durable console log
+```
+
+`add` writes the definition to `workers.toml`, under
+`$XDG_CONFIG_HOME/tauceti/` or the platform default, and starts a manager. From
+there, `enable`, `disable`, `restart`, and `remove` adjust one worker each. The
+manager validates the whole file before applying it, starts missing enabled
+workers, gracefully stops disabled or removed ones, restarts only definitions
+that changed, and backs off repeated failures.
+
+For fields that `add` does not expose, run `tauceti workers edit`, validate with
+`tauceti workers apply --check`, then apply. Editing while the manager runs is
+safe: it keeps the last valid generation if the new file fails validation. A
+later `enable`, `disable`, `add`, or `remove` rewrites the file canonically and
+drops comments and hand formatting.
+
+`workers apply` starts a detached manager for the current login session. To hand
+an existing manager over to a native user service that survives logout and
+returns after a reboot:
+
+```bash
+tauceti workers manager-stop --leave-workers
+tauceti workers service install
+tauceti workers service status
+```
+
+This installs a systemd user service on Linux or a LaunchAgent on macOS. Omit
+the first command when no detached manager is running.
+
+Every worker needs a unique id, which `add` assigns for you. The id namespaces
+that worker's state, checkout, review store, and logs, and isolates its mutable
+agent credentials where the platform allows, so credential refreshes don't race.
+Workers coordinate through GitHub rather than through each other, so adding
+workers adds throughput. Ad-hoc rounds take the same id through
+`tauceti work --worker-id alice`.
+
+[The workers documentation](docs/workers.md) has the full `workers.toml` schema,
+every action, the credential isolation rules, and the tmux viewer.
 
 ## Pacing against quota
 
-`tauceti` paces itself against your subscription quota with no setup. It reads the
-credential files the official CLIs already maintain (`~/.claude/.credentials.json`,
-`~/.codex/auth.json`) and queries each provider's usage endpoint. It honors
-`$CLAUDE_CONFIG_DIR` for the Claude credentials, so personal/work account switching
-is paced correctly; bubble honors the same var, so it seeds the matching credentials
-into the sandbox too. On macOS, where Claude Code keeps its creds in the login Keychain
-rather than a file, the pacer reads them from the Keychain instead, read-only: it
-never refreshes the Keychain (that would log out your interactive `claude`), so on
-token expiry it just reports Claude unavailable for the cycle, and your next `claude`
-run (interactive, or one `--ignore-quota --agent claude` round) refreshes the
-Keychain so the pacer can read it again. A locked Keychain (headless/SSH) reports
-unavailable with a hint to `security unlock-keychain` first. The rule is
-"keep usage under elapsed time": a provider is available while `used% ≤ elapsed%`
-on both its 5-hour and its weekly window. Auto mode prefers Codex (to spare the
-scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
-can't read usage, it treats the provider as unavailable rather than guessing it's
-free.
+`tauceti` paces Codex and Claude against their session and weekly subscription
+limits with no setup beyond logging in with the official CLIs. A provider is
+available only while its used percentage is strictly below the budget for the
+elapsed fraction of every reported window; `--agent auto` prefers Codex, to spare
+the scarcer Opus, falls back to Claude, and sleeps when neither has room. Usage
+it cannot read counts as unavailable rather than free. The dashboard and
+`tauceti status` show current usage and why a provider is waiting.
 
-`--ignore-quota` turns the pacer off (then pass an explicit `--agent`).
-`--quota-cmd <cmd>` (or `TAUCETI_QUOTA_CMD`) swaps in your own pacer instead: it's
-run as `<cmd> <agent>`, and its first line of stdout is the model to run now, or
-empty for "wait".
-
-## Inside the sandbox
-
-In a bubble round the checkout, `lake build`, and every git/gh call happen inside
-the container:
-
-- GitHub traffic goes through bubble's auth proxy, scoped to
-  `TauCetiProject/TauCeti`. A push or API call outside that repo is rejected by
-  the proxy, not just flagged by CI later.
-- Only the one credential the agent needs is seeded. The other models'
-  credentials, and all your host config (`CLAUDE.md`, skills), stay out.
-- Review runs the `tauceti-review` engine inside the container too, offline: the
-  engine, the roadmap, and the review store are mounted in, and it runs on the
-  image's `python3` with no PyPI or cross-repo fetch. The only traffic crossing
-  the proxy is the TauCeti clone, the PR API, and the scoreboard post.
-- The shared Mathlib cache is an overlay, so one round can't poison a later build,
-  and the container is ephemeral.
-
-The sandbox itself lives at [kim-em/bubble](https://github.com/kim-em/bubble).
-The OpenRouter agents (`--agent deepseek|minimax`) run in the bubble too: the
-image ships [`pi`](https://github.com/badlogic/pi-mono) and allows openrouter.ai
-egress ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)), and the
-key is staged read-only into the container.
-
-## Many workers at once
-
-Each worker namespaces its state, checkout, review store, and logs by id, so
-several can share a host:
-
-```bash
-tauceti work --loop --worker-id alice --only review
-tauceti work --loop --worker-id bob   --only roadmap
-```
-
-`--worker-id` pins a stable name and is the only knob you need: any id other than
-`default` also gives that worker its own `$HOME` (symlinking your read-only Claude
-tool surface, copying the mutable auth in once) so their credential refreshes don't
-race. Your `gh` and `git` config stays shared, not isolated (it doesn't refresh-race,
-and the host survey and pushes need it), so the worker still authenticates as you.
-(`--isolate-home` still exists, but only to force that same isolation for the
-`default` id; a distinct id already implies it.) The workers coordinate through
-GitHub, not through each other: the per-PR scoreboard comment is the shared review
-state, `git-safe-push` / `gh-safe-pr-create` compare-and-swap so no one clobbers
-another's push, and `claim.sh` hands out branches. Add workers and throughput goes
-up.
-
-On macOS, Claude Code keeps its creds in the login Keychain rather than a file.
-Bubble rounds still work: bubble seeds the in-container `claude` from a
-`.credentials.json`, so when one isn't present `tauceti` writes the credential into
-your `$CLAUDE_CONFIG_DIR` (or `~/.claude`) from the Keychain, refreshing it when it's
-missing or expired (read-only on the Keychain, which is never written; the first
-round unlocks it interactively if it's locked). The pacer reads the Keychain
-directly, so it never refreshes that file and never rotates the shared login token.
-Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
-can't give a host worker its own Claude account there; host-mode multi-worker
-isolation on macOS applies to Codex only.
-
-## `tauceti work` reference
-
-`tauceti work` does one round and exits; `--loop` runs the driver. The same list
-is in `tauceti work -h`.
-
-| Flag | What it does |
+| Control | Effect |
 | --- | --- |
-| `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
-| `--only TASKS` | Restrict the round to a comma list of `rebase,review,fix-ci,fix,bump,roadmap` (default: the whole cascade). |
-| `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax` — see the agent table above. |
-| `--host` | Opt out of the bubble sandbox and run the agent directly on the host. |
-| `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
-| `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
-| `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
-| `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
-| `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
-| `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
-| `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
-| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its `$HOME`. |
-| `--isolate-home` | Force the per-worker `$HOME` even for the `default` id (a distinct id already implies it). |
-| `--dry-run` | Survey and print the picker's decision; act on nothing. |
+| _(default)_ | Require `used% < elapsed%` on every window |
+| `--pace 0:10,50:70,90:90` | Use a piecewise-linear `time%:budget%` curve instead: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Usage must remain strictly below the current budget. Budgets ≥ 100 mean no soft cap; a window at 100% used still backs off |
+| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex` or `--agent claude`; hard limits still apply |
+| `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
-### Environment variables
+`TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the corresponding controls by
+default. After a Claude window resets, `tauceti` may make one small request to
+start its usage clock, but only after it has found work and confirmed the other
+window has room.
+[The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
+and that bootstrap in detail.
 
-Flags win over these. Most are tuning knobs with sane defaults; you rarely set them.
+## Further documentation
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
-| `TAUCETI_WORKER_ID` | `default` | Default for `--worker-id`. |
-| `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
-| `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
-| `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own, for `--roadmap-extra-identities`. |
-| `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
-| `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
-| `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
-| `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for `--host` rounds; split as a shell word list, the usual flags appended. |
-| `TAUCETI_CODEX_MODEL` | host's configured model | The Codex model to run in the bubble. |
-| `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
-| `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
-| `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on `--host`. |
-| `TAUCETI_BUBBLE` | `bubble` (else `uvx`-fetched) | Override the bubble executable. |
-| `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
-| `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
-| `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
-| `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
-| `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
-| `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
-| `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
-| `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits surface immediately and are waited out by the loop preflight. |
-| `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
-| `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
-
-## What you need
-
-- Always: `gh` (logged in as the account the worker should act as), `git`, `uv`,
-  and `jq`.
-- Bubble (the default sandbox): a working Incus runtime. `tauceti` fetches the
-  bubble CLI itself.
-- `--host` authoring: an `elan`/`lake` toolchain on the host.
-- The agents you want: `codex` and/or `claude` logged in, and for
-  `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
-  bubble image; you only need it on the host for `--host` rounds).
-
-`tauceti doctor` checks all of this.
-
-## What's in the repo
-
-- `tauceti_worker/`: the worker package, split by concern — `constants`, `config`, `paths`,
-  `github`, `quota`, `review_state`, `survey`, `round`, `agents`, `work_units`, `loop`, `tui`,
-  and `cli` (the entry point). `rich`/`textual` are imported lazily and only by `tui`.
-- `tauceti`: a small PEP 723 `uv` shim ([PEP 723](https://peps.python.org/pep-0723/)) so
-  `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
-  `tauceti` console script (`tauceti_worker.cli:cli_main`).
-- `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
-  these on `PATH` inside a round, so they stay shell. (The wheel bundles them into the package.)
-- `prompts/*.md`: the per-task agent prompts.
-- `tests/`: plain `python3 tests/<name>.py` scripts (`dashboard.py` runs under `uv run`), driven
-  by `tests/run-all`; plus `lifecycle.sh`. Each loads the package and exercises one concern.
-- `checkouts/`, `state/`, `logs/`: runtime only, git-ignored.
+- [Persistent workers](docs/workers.md): the `workers.toml` schema, every
+  `tauceti workers` action, state on disk, and running past logout.
+- [`tauceti work` reference](docs/reference.md): every flag and environment
+  variable.
+- [Quota and pacing](docs/quota.md): credential sources, Claude's two windows,
+  and the window bootstrap.
+- [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
+  and macOS credential handling.
+- [Docker deployment](docs/docker.md): the unattended Compose deployment.
