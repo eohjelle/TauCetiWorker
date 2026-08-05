@@ -600,7 +600,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         # Lifecycle test hooks (no GitHub, no model, no mutation) — exercise lock / fd-leak / timeout.
         hb = os.environ.get("TAUCETI_TEST_HEARTBEAT")
         if hb:
-            Claims(cfg, ctx).start_heartbeat("branch/test")
+            Claims(cfg, ctx).start_heartbeat("branch/test", os.environ.get("CLAIM_REPO") or TAUCETI)
             log(f"[test] heartbeat started; holding {hb}s then exiting")
             time.sleep(int(hb))
             return 0
