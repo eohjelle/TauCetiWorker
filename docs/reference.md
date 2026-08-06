@@ -76,12 +76,14 @@ agent's login shell, resets the persistent checkout to current main, and restore
 Mathlib plus TauCeti's public Lake artifacts. The agent then uses that checkout
 and its writable Lake cache while working on the PR branch.
 
-The worker retains those artifacts up to a 10 GiB soft limit and purges only the
-disposable `.lake/cache` between rounds when the limit is reached or filesystem
-free space falls below 8 GiB. It fails closed before an authoring round if purging
-cannot restore that safety floor. The compressed Mathlib download cache is discarded
-when the checkout selects a different Lean toolchain; expanded `.lake/build` outputs
-remain warm. On a dedicated worker host,
+When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by
+default), the worker runs `lake clean` between rounds to remove every workspace
+package's build directory and separately removes `.lake/cache`. It restores Mathlib
+and TauCeti's public outputs, measures space again, and fails closed before authoring
+if the restored working set leaves less than the configured reserve. There is no
+independent artifact-cache size threshold. The compressed Mathlib download cache is
+discarded only when the checkout selects a different Lean toolchain. On a dedicated
+worker host,
 `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS=true` additionally removes official Lean
 toolchains that no worker checkout requests; custom and linked toolchains are
 always preserved. `tauceti doctor` shows the Lake path visible to the agent shell.
@@ -126,8 +128,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% < elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
-| `TAUCETI_LAKE_CACHE_MAX_GIB` | `10` | Soft high-water mark for the writable host `.lake/cache`, checked only between rounds. |
-| `TAUCETI_LAKE_CACHE_MIN_FREE_GIB` | `4` | Purge that disposable cache at a round boundary when the checkout filesystem has less free space. |
+| `TAUCETI_MIN_FREE_GIB` | `8` | At a round boundary, run `lake clean` and remove `.lake/cache` below this filesystem reserve; verify the reserve again after restoring public caches. |
 | `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS` | `false` | On a dedicated host, remove official Lean toolchains no worker checkout requests; never remove custom or linked toolchains. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |

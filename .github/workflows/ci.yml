@@ -149,7 +149,7 @@ jobs:
           docker compose config --format json | python3 -c \
             'import json, sys; services=json.load(sys.stdin)["services"]; assert all(s["logging"] == {"driver": "local", "options": {"max-file": "3", "max-size": "10m"}} for s in services.values())'
           docker compose config --format json | python3 -c \
-            'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_LAKE_CACHE_MIN_FREE_GIB"] == "8" and env["TAUCETI_LOG_RETENTION_DAYS"] == "14" and env["TAUCETI_LOG_MAX_GIB"] == "1"'
+            'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_MIN_FREE_GIB"] == "8" and env["TAUCETI_LOG_RETENTION_DAYS"] == "14" and env["TAUCETI_LOG_MAX_GIB"] == "1"'
           test ! -e .env
           trap 'rm -f .env' EXIT
           printf '%s\n' 'TAUCETI_WORKER_ARGS=--help' 'TAUCETI_PACE=0:10,100:90' >.env

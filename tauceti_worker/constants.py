@@ -135,10 +135,9 @@ PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get("TAUCETI_PRUNE_OBSOLETE_LEAN_TOO
     "yes",
 )
 
-# Persistent host-mode Lake artifact-cache storage policy. Environment overrides are parsed at the
-# round boundary so operators can tune dedicated workers without changing these defaults.
-HOST_LAKE_CACHE_MAX_BYTES = 10 * 1024**3
-HOST_LAKE_CACHE_MIN_FREE_BYTES = 8 * 1024**3
+# Persistent host-mode storage reserve. Environment overrides are parsed at the round boundary so
+# operators can tune dedicated workers without changing this default.
+HOST_MIN_FREE_BYTES = 8 * 1024**3
 
 # Completed worker transcripts are disposable after a useful debugging window.  The active session
 # log is always protected; these limits are enforced only between model rounds.

@@ -289,8 +289,8 @@ check(
     all("lake build" not in command for _, _, command, _ in calls),
 )
 
-# Cache retention is a soft high-water check at round boundaries. It removes only .lake/cache,
-# preserves the incremental build tree, and also responds to low free space independently.
+# Filesystem pressure triggers one simple round-boundary cleanup: `lake clean` removes every package's
+# build directory and the worker separately removes the artifact cache that Lake does not own.
 with tempfile.TemporaryDirectory() as td:
     cfg = temp_cfg(Path(td))
     artifact = cfg.checkout / ".lake" / "cache" / "artifacts" / "branch-output"
@@ -299,54 +299,66 @@ with tempfile.TemporaryDirectory() as td:
     build_output = cfg.checkout / ".lake" / "build" / "lib" / "lean" / "TauCeti.olean"
     build_output.parent.mkdir(parents=True)
     build_output.write_bytes(b"warm incremental build")
-    saved_max = tc.agents.HOST_LAKE_CACHE_MAX_BYTES
-    saved_min = tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES
+    dependency = cfg.checkout / ".lake" / "packages" / "mathlib"
+    dependency_build = dependency / ".lake" / "build" / "lib" / "lean" / "Mathlib.olean"
+    dependency_source = dependency / "Mathlib" / "Algebra.lean"
+    dependency_build.parent.mkdir(parents=True)
+    dependency_build.write_bytes(b"warm dependency build")
+    dependency_source.parent.mkdir(parents=True)
+    dependency_source.write_text("-- retained source checkout\n")
+    saved_min = tc.agents.HOST_MIN_FREE_BYTES
     saved_disk_usage = tc.agents.shutil.disk_usage
-    saved_limit_env = {
-        name: os.environ.pop(name, None) for name in ("TAUCETI_LAKE_CACHE_MAX_GIB", "TAUCETI_LAKE_CACHE_MIN_FREE_GIB")
-    }
-    try:
-        tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1
-        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 1
-        check("10 GiB is the default artifact-cache limit", saved_max == 10 * 1024**3)
-        check("8 GiB is the default filesystem safety floor", saved_min == 8 * 1024**3)
-        check("oversized artifact cache is purged", tc.maintain_host_lake_cache(cfg, phase="test"))
-        check("cache purge removes branch artifacts", not artifact.exists())
-        check("cache purge preserves incremental build outputs", build_output.exists())
+    saved_login_command = tc.agents._run_host_login_command
+    saved_min_env = os.environ.pop("TAUCETI_MIN_FREE_GIB", None)
+    clean_calls = []
 
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_bytes(b"new branch artifact")
-        tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1024**4
-        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 8 * 1024**3
-        tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=1024**3)
-        check("low filesystem space independently purges the cache", tc.maintain_host_lake_cache(cfg, phase="test"))
-
-        # Once the disposable artifact cache is gone, the preflight must still enforce the free-space
-        # floor instead of returning early and launching a model on a nearly full filesystem.
+    def fake_lake_clean(argv, **_kwargs):
         import shutil
 
-        shutil.rmtree(cfg.checkout / ".lake" / "cache")
-        try:
-            tc.maintain_host_lake_cache(cfg, phase="test", require_headroom=True)
-            no_cache_error = None
-        except Exception as exc:
-            no_cache_error = exc
-        check("low-space preflight fails closed without a disposable cache", isinstance(no_cache_error, tc.Die))
+        clean_calls.append(list(argv))
+        shutil.rmtree(cfg.checkout / ".lake" / "build", ignore_errors=True)
+        shutil.rmtree(dependency / ".lake" / "build", ignore_errors=True)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-        os.environ["TAUCETI_LAKE_CACHE_MAX_GIB"] = "12"
-        check(
-            "operator can raise the cache limit",
-            tc.agents._configured_gibibytes("TAUCETI_LAKE_CACHE_MAX_GIB", saved_max) == 12 * 1024**3,
-        )
+    try:
+        tc.agents._run_host_login_command = fake_lake_clean
+        check("8 GiB is the default filesystem safety floor", saved_min == 8 * 1024**3)
+        tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=20 * 1024**3)
+        check("healthy free space triggers no cleanup", not tc.maintain_host_lake_storage(cfg, phase="test"))
+        check("artifact cache size alone triggers no cleanup", artifact.exists() and build_output.exists())
+        check("healthy-space check invokes no Lake command", clean_calls == [])
+
+        os.environ["TAUCETI_MIN_FREE_GIB"] = "12"
+        check("operator can change the filesystem floor", tc.agents._host_min_free_bytes() == 12 * 1024**3)
+        os.environ["TAUCETI_MIN_FREE_GIB"] = "8"
+        free_readings = iter((1024**3, 12 * 1024**3))
+        tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=next(free_readings))
+        check("low free space triggers Lake cleanup", tc.maintain_host_lake_storage(cfg, phase="test"))
+        check("cleanup invokes plain `lake clean` once", clean_calls == [["lake", "clean"]])
+        check("cleanup removes the root build directory", not build_output.exists())
+        check("cleanup removes dependency build directories", not dependency_build.exists())
+        check("cleanup preserves dependency source checkouts", dependency_source.exists())
+        check("cleanup removes artifact-cache contents", not artifact.exists())
+        check("cleanup recreates an empty writable artifact cache", (cfg.checkout / ".lake" / "cache").is_dir())
+
+        tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=7 * 1024**3)
+        try:
+            tc.verify_host_storage_headroom(cfg, phase="after cache restoration")
+            restored_error = None
+        except Exception as exc:
+            restored_error = exc
+        check("post-restore check fails closed below the floor", isinstance(restored_error, tc.Die))
+        tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=9 * 1024**3)
+        tc.verify_host_storage_headroom(cfg, phase="after cache restoration")
+        check("post-restore check accepts adequate headroom", True)
     finally:
-        tc.agents.HOST_LAKE_CACHE_MAX_BYTES = saved_max
-        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = saved_min
+        tc.agents.HOST_MIN_FREE_BYTES = saved_min
         tc.agents.shutil.disk_usage = saved_disk_usage
-        for name, value in saved_limit_env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        tc.agents._run_host_login_command = saved_login_command
+        if saved_min_env is None:
+            os.environ.pop("TAUCETI_MIN_FREE_GIB", None)
+        else:
+            os.environ["TAUCETI_MIN_FREE_GIB"] = saved_min_env
 
 
 # dispatch() is the counter boundary.  Host preparation must happen before do_fix_ci, whose real
@@ -431,7 +443,7 @@ reuse_saved = {
     name: getattr(wu, name)
     for name in (
         "prepare_host_authoring",
-        "maintain_host_lake_cache",
+        "maintain_host_lake_storage",
         "maintain_worker_logs",
         "_host_agent_binary",
         "do_fix_ci",
@@ -460,7 +472,7 @@ def claimed_then_run(*_args):
 
 try:
     wu.prepare_host_authoring = record_prepare
-    wu.maintain_host_lake_cache = lambda *_args, **_kwargs: reuse_events.append("maintain")
+    wu.maintain_host_lake_storage = lambda *_args, **_kwargs: reuse_events.append("maintain")
     wu.maintain_worker_logs = lambda *_args, **_kwargs: reuse_events.append("maintain-logs")
     wu._host_agent_binary = lambda _stage, _model: None
     wu.do_fix_ci = claimed_then_run

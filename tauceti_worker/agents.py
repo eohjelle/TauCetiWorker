@@ -26,8 +26,7 @@ from .constants import (
     CLAUDE_CMD,
     CODEX_AUTHORING_FALLBACK_MODEL,
     CODEX_MODEL_ACCESS_TTL,
-    HOST_LAKE_CACHE_MAX_BYTES,
-    HOST_LAKE_CACHE_MIN_FREE_BYTES,
+    HOST_MIN_FREE_BYTES,
     OPENROUTER_MODELS,
     PI_RUN,
     PRUNE_OBSOLETE_LEAN_TOOLCHAINS,
@@ -49,7 +48,7 @@ from .quota import (
     mirror_creds,
 )
 from .runtime_status import report_failure
-from .storage import _allocated_tree_bytes, maintain_mathlib_download_cache
+from .storage import maintain_mathlib_download_cache
 from .transcript import AgentTranscriptRenderer
 
 # ============================================================================
@@ -748,9 +747,9 @@ def _host_shell() -> str:
 def host_lake_env(cfg: Config) -> dict[str, str]:
     """The host Lake cache environment shared by warmup and the work agent.
 
-    Writable artifact caching preserves the host-mode speedup across rounds.  An operator-supplied
-    value remains authoritative; otherwise host mode enables it and bounds the resulting storage
-    separately rather than silently changing Lake's behavior.
+    Writable artifact caching preserves the host-mode speedup across rounds. An operator-supplied
+    value remains authoritative; otherwise host mode enables it and round-boundary storage cleanup
+    reclaims it together with Lake builds only under filesystem pressure.
     """
     return {
         "LAKE_CONFIG": str((cfg.state / "lake-cache.toml").absolute()),
@@ -806,61 +805,91 @@ def _configured_gibibytes(name: str, default_bytes: int) -> int:
     return value * 1024**3
 
 
-def maintain_host_lake_cache(cfg: Config, *, phase: str, require_headroom: bool = False) -> bool:
-    """Purge the writable artifact cache only at a safe round boundary when storage is pressured.
+def _host_min_free_bytes() -> int:
+    return _configured_gibibytes("TAUCETI_MIN_FREE_GIB", HOST_MIN_FREE_BYTES)
 
-    The cache is deliberately one disposable unit because Lake has no artifact-level LRU.  This is a
-    high-water policy, not a filesystem quota: a running build may cross a threshold and is allowed to
-    finish before the post-round check removes the cache.
+
+def _host_free_bytes(cfg: Config) -> int:
+    return shutil.disk_usage(cfg.checkout).free
+
+
+def maintain_host_lake_storage(cfg: Config, *, phase: str, require_headroom: bool = False) -> bool:
+    """Clean all Lake builds plus the artifact cache when filesystem headroom is low.
+
+    Run only at a round boundary: ``lake clean`` removes every workspace package's build directory,
+    including dependency builds, while the explicit cache removal discards branch artifacts that
+    ``lake clean`` does not own. Dependency source checkouts and Mathlib's compressed download cache
+    remain available for restoration.
     """
     cache = cfg.checkout / ".lake" / "cache"
-    measurement_root = cache if cache.exists() else cfg.checkout
-    max_bytes = _configured_gibibytes("TAUCETI_LAKE_CACHE_MAX_GIB", HOST_LAKE_CACHE_MAX_BYTES)
-    min_free = _configured_gibibytes("TAUCETI_LAKE_CACHE_MIN_FREE_GIB", HOST_LAKE_CACHE_MIN_FREE_BYTES)
+    min_free = _host_min_free_bytes()
     try:
-        allocated = _allocated_tree_bytes(cache) if cache.exists() else 0
-        free = shutil.disk_usage(measurement_root).free
+        free_before = _host_free_bytes(cfg)
     except OSError as e:
         if require_headroom:
-            raise Die(f"preflight: could not measure host Lake cache storage: {e}") from e
-        log(f"warning: could not measure host Lake cache during {phase}: {e}")
+            raise Die(f"preflight: could not measure host filesystem storage: {e}") from e
+        log(f"warning: could not measure host filesystem storage during {phase}: {e}")
         return False
-    reasons = []
-    if allocated >= max_bytes:
-        reasons.append(f"{allocated / 1024**3:.1f} GiB >= {max_bytes / 1024**3:.0f} GiB limit")
-    if free < min_free:
-        reasons.append(f"only {free / 1024**3:.1f} GiB filesystem space remains")
-    if not reasons:
+    if free_before >= min_free:
         return False
-    if not cache.exists():
-        message = (
-            f"filesystem space is below the host Lake cache safety floor during {phase}, but no "
-            "disposable artifact cache exists"
-        )
+
+    env = host_agent_env()
+    cleaned = _run_host_login_command(["lake", "clean"], cwd=cfg.checkout, env=env)
+    clean_error = None
+    if cleaned.returncode:
+        detail = ((cleaned.stderr or "") + (cleaned.stdout or "")).strip()[-300:]
+        clean_error = f"lake clean exited {cleaned.returncode}" + (f" ({detail})" if detail else "")
+    try:
+        if cache.exists():
+            shutil.rmtree(cache)
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
         if require_headroom:
-            raise Die(f"preflight: {message} ({free / 1024**3:.1f} GiB free; {min_free / 1024**3:.0f} GiB required)")
+            raise Die(f"preflight: could not purge the host Lake artifact cache: {e}") from e
+        log(f"warning: could not purge the host Lake artifact cache during {phase}: {e}")
+        return False
+    try:
+        free_after = _host_free_bytes(cfg)
+    except OSError as e:
+        if require_headroom:
+            raise Die(f"preflight: could not measure filesystem space after Lake cleanup: {e}") from e
+        log(f"warning: could not measure filesystem space after Lake cleanup during {phase}: {e}")
+        return True
+    log(
+        f"Lake storage cleanup {phase}: free space {free_before / 1024**3:.1f} -> "
+        f"{free_after / 1024**3:.1f} GiB (floor {min_free / 1024**3:.0f} GiB)"
+    )
+    if clean_error:
+        message = f"could not clean every Lake build directory: {clean_error}"
+        if require_headroom:
+            raise Die(f"preflight: {message}")
         log(f"warning: {message}")
         return False
-    try:
-        shutil.rmtree(cache)
-        cache.mkdir(parents=True)
-    except OSError as e:
+    if free_after < min_free:
+        message = (
+            "filesystem space remains below the safety floor after cleaning every Lake build "
+            f"and artifact cache ({free_after / 1024**3:.1f} GiB free; "
+            f"{min_free / 1024**3:.0f} GiB required)"
+        )
         if require_headroom:
-            raise Die(f"preflight: could not purge host Lake cache: {e}") from e
-        log(f"warning: could not purge host Lake cache during {phase}: {e}")
-        return False
-    log(f"host Lake cache purged {phase}: {'; '.join(reasons)}")
-    if require_headroom:
-        try:
-            remaining = shutil.disk_usage(cache).free
-        except OSError as e:
-            raise Die(f"preflight: could not verify filesystem space after purging the host Lake cache: {e}") from e
-        if remaining < min_free:
-            raise Die(
-                "preflight: filesystem space remains below the host Lake cache safety floor after "
-                f"purging ({remaining / 1024**3:.1f} GiB free; {min_free / 1024**3:.0f} GiB required)"
-            )
+            raise Die(f"preflight: {message}")
+        log(f"warning: {message}")
     return True
+
+
+def verify_host_storage_headroom(cfg: Config, *, phase: str) -> None:
+    """Fail closed if restored caches leave too little room for an authoring round."""
+    min_free = _host_min_free_bytes()
+    try:
+        free = _host_free_bytes(cfg)
+    except OSError as e:
+        raise Die(f"preflight: could not measure host filesystem storage {phase}: {e}") from e
+    log(f"host storage {phase}: {free / 1024**3:.1f} GiB free (floor {min_free / 1024**3:.0f} GiB)")
+    if free < min_free:
+        raise Die(
+            f"preflight: filesystem space is below the safety floor {phase} "
+            f"({free / 1024**3:.1f} GiB free; {min_free / 1024**3:.0f} GiB required)"
+        )
 
 
 def host_login_shell_which(tool: str, env: dict | None = None) -> str | None:
@@ -979,8 +1008,9 @@ def prepare_host_authoring(cfg: Config) -> None:
     prune_obsolete_host_lean_toolchains(cfg)
     maintain_mathlib_download_cache(cfg)
     configure_host_lake_cache(cfg)
-    maintain_host_lake_cache(cfg, phase="before round", require_headroom=True)
+    maintain_host_lake_storage(cfg, phase="before round", require_headroom=True)
     fetch_host_lake_caches(cfg)
+    verify_host_storage_headroom(cfg, phase="after cache restoration")
 
 
 def bubble_cmd_is_disposable(cmd: list[str] | None = None) -> bool:

@@ -107,14 +107,20 @@ docker compose up -d --build
 ```
 
 After a successful replacement, reclaim stopped containers, unused images, and build
-cache on a dedicated worker host:
+cache on a dedicated worker host. Run this only after `docker compose up -d` has
+recreated the deployment and the long-lived services have been verified healthy and
+running:
 
 ```bash
 ./scripts/docker-storage-prune
 ```
 
-The command never prunes named volumes or running containers. Do not use it on a
-shared Docker host unless every unused image and stopped container is disposable.
+The command refuses to run if `tauceti` is stopped or if its image does not match the
+currently tagged Compose image. This matters because it removes stopped containers
+before unused images: running it after `docker compose stop` or `docker compose down`
+could otherwise discard the image needed by the next start. It never prunes named
+volumes or running containers. Do not use it on a shared Docker host unless every
+unused image and stopped container is disposable.
 
 Because the image copies the local checkout, inspect or switch to the intended fork
 branch before rebuilding. `git pull` is only an example update policy; Docker does not
@@ -151,12 +157,17 @@ and then deleted at a round boundary; if they reach 1 GiB sooner, the oldest com
 logs are removed first. The active session log is never removed. Override these
 defaults in `.env` with `TAUCETI_LOG_RETENTION_DAYS` and `TAUCETI_LOG_MAX_GIB`.
 
-The writable Lake artifact cache has a 10 GiB soft limit, and authoring requires at
-least 8 GiB of filesystem headroom. These defaults can be changed with
-`TAUCETI_LAKE_CACHE_MAX_GIB` and `TAUCETI_LAKE_CACHE_MIN_FREE_GIB`. The compressed
-Mathlib download cache is cleared when TauCeti changes Lean toolchain. Incremental
-`.lake/build` trees are deliberately retained because deleting them turns the next
-round into a large rebuild.
+When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
+the worker runs `lake clean` between rounds to remove the root and every dependency
+build directory, then separately deletes `.lake/cache`, which Lake does not own. There
+is no independent artifact-cache size threshold. Dependency source checkouts and
+Mathlib's compressed download cache remain available, so the next authoring preflight
+can restore Mathlib and TauCeti outputs without compiling everything from source.
+
+After restoring both caches, the worker measures space again and refuses to launch an
+agent if less than the configured reserve remains. Cleanup logs the free space before
+and after cleaning, and preflight logs it again after restoration. The compressed
+Mathlib download cache itself is cleared only when TauCeti changes Lean toolchain.
 
 On a dedicated systemd host, install the bundled journal limits once:
 
@@ -170,13 +181,9 @@ This caps the system journal at 250 MiB and asks journald to preserve 2 GiB of f
 space. Docker's own logs are managed by its log driver, not by deleting files below
 `/var/lib/docker`.
 
-If expanded Lean builds become the only way to recover urgently needed space, stop
-the worker first and remove the `checkouts` named volume manually. That discards the
-checkout and every incremental build but leaves credentials, scheduler state, logs,
-and downloaded Elan toolchains intact; the next authoring round reclones and restores
-public caches. This is an emergency operation, not routine maintenance. Inspect the
-resolved volume name with `docker compose config --volumes` and `docker volume ls`
-before deleting it, and never remove it while a round or agent is active.
+If space remains below the reserve after cache restoration, the restored working set
+does not fit safely on the host. Increase the disk or remove other data rather than
+repeatedly deleting and restoring the `checkouts` volume.
 
 Claude and Codex use rotating, single-consumer refresh tokens. One refresher owns
 each provider credential and publishes a refresh-token-free mirror; the worker never

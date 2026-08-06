@@ -26,9 +26,8 @@ services:
       TAUCETI_PACE: "${TAUCETI_PACE:-}"
       # This deployment's Lean installation is dedicated to TauCeti worker checkouts.
       TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "true"
-      # Storage limits are enforced only between model rounds.  Expanded .lake/build trees stay warm.
-      TAUCETI_LAKE_CACHE_MAX_GIB: "${TAUCETI_LAKE_CACHE_MAX_GIB:-10}"
-      TAUCETI_LAKE_CACHE_MIN_FREE_GIB: "${TAUCETI_LAKE_CACHE_MIN_FREE_GIB:-8}"
+      # Low-space cleanup runs only between model rounds, before an agent can touch Lake outputs.
+      TAUCETI_MIN_FREE_GIB: "${TAUCETI_MIN_FREE_GIB:-8}"
       TAUCETI_LOG_RETENTION_DAYS: "${TAUCETI_LOG_RETENTION_DAYS:-14}"
       TAUCETI_LOG_MAX_GIB: "${TAUCETI_LOG_MAX_GIB:-1}"
     volumes:
