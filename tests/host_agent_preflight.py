@@ -60,7 +60,7 @@ tc.agents.CLAUDE_CMD = _saved_cmd
 
 # --- dispatch() preflight -----------------------------------------------------------------------
 CAND = tc.Candidate(726, "deadbeef", "test")
-WORKER = SimpleNamespace(counters=SimpleNamespace(read=lambda key: 0, write=lambda *args: None))
+WORKER = SimpleNamespace(cfg=None, counters=SimpleNamespace(read=lambda key: 0, write=lambda *args: None))
 
 
 def opts(work_model="codex", sandbox_host=True):
@@ -81,7 +81,16 @@ def fake_stage(w, sv, c, o, bubble):
 
 
 _saved = {
-    k: getattr(wu, k) for k in ("do_review", "do_fix", "warn_red", "_progress_snapshot", "_progressed", "_bubble")
+    k: getattr(wu, k)
+    for k in (
+        "do_review",
+        "do_fix",
+        "warn_red",
+        "_progress_snapshot",
+        "_progressed",
+        "_bubble",
+        "maintain_worker_logs",
+    )
 }
 _saved_which = wu.shutil.which
 wu.do_review = fake_stage
@@ -89,6 +98,7 @@ wu.do_fix = fake_stage
 wu.warn_red = lambda msg: warns.append(msg)
 wu._progress_snapshot = lambda w, c: None
 wu._progressed = lambda w, c, pre: True  # stub out the "nothing landed on GitHub" guard
+wu.maintain_worker_logs = lambda *_args, **_kwargs: None
 
 
 def reset():
@@ -106,7 +116,7 @@ try:
     reset()
     raised, msg = False, ""
     try:
-        wu.dispatch("review", None, None, CAND, opts())
+        wu.dispatch("review", WORKER, None, CAND, opts())
     except tc.NoProgress as e:
         raised, msg = True, str(e)
     check("missing codex -> NoProgress", raised, True)
@@ -118,7 +128,7 @@ try:
     reset()
     raised = False
     try:
-        wu.dispatch("fix", None, None, CAND, opts())
+        wu.dispatch("fix", WORKER, None, CAND, opts())
     except tc.NoProgress:
         raised = True
     check("default fix with missing codex -> NoProgress before probe", raised, True)
@@ -147,7 +157,7 @@ try:
     reset()
     raised = False
     try:
-        wu.dispatch("fix", None, None, CAND, opts(work_model="deepseek"))
+        wu.dispatch("fix", WORKER, None, CAND, opts(work_model="deepseek"))
     except tc.NoProgress:
         raised = True
     check("fix deepseek missing pi -> NoProgress", raised, True)
