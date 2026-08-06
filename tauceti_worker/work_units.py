@@ -99,6 +99,7 @@ from .review_diagnostics import (
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
+from .storage import maintain_worker_logs
 from .survey import (
     TARGET_MARKER_RE,
     Candidate,
@@ -472,6 +473,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # steady state, so it is safe to run every round. Skipped under --dry-run, which must not mutate the
     # credential mirror.
     if not opts.dry_run:
+        maintain_worker_logs(w.cfg, phase="before round")
         mirror_creds(w.cfg)
         from .review_diagnostics import refund_stale_head_errors
 
