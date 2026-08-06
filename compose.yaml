@@ -1,5 +1,13 @@
 name: tauceti-worker
 
+x-tauceti-logging: &tauceti-logging
+  # Docker's local driver rotates and compresses its private log files.  Three 10 MiB segments bound
+  # each service at roughly 30 MiB without relying on an external cron job touching Docker internals.
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   tauceti:
     build:
@@ -7,6 +15,7 @@ services:
     image: tauceti-worker:local
     init: true
     restart: unless-stopped
+    logging: *tauceti-logging
     stop_grace_period: 2m
     command: ["./tauceti", "work", "--loop"]
     environment:
@@ -17,6 +26,11 @@ services:
       TAUCETI_PACE: "${TAUCETI_PACE:-}"
       # This deployment's Lean installation is dedicated to TauCeti worker checkouts.
       TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "true"
+      # Storage limits are enforced only between model rounds.  Expanded .lake/build trees stay warm.
+      TAUCETI_LAKE_CACHE_MAX_GIB: "${TAUCETI_LAKE_CACHE_MAX_GIB:-10}"
+      TAUCETI_LAKE_CACHE_MIN_FREE_GIB: "${TAUCETI_LAKE_CACHE_MIN_FREE_GIB:-8}"
+      TAUCETI_LOG_RETENTION_DAYS: "${TAUCETI_LOG_RETENTION_DAYS:-14}"
+      TAUCETI_LOG_MAX_GIB: "${TAUCETI_LOG_MAX_GIB:-1}"
     volumes:
       # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because
       # the worker keeps its shared quota-bootstrap ledger beside it; the renewable credential remains
@@ -40,6 +54,7 @@ services:
     profiles: [setup]
     stdin_open: true
     tty: true
+    logging: *tauceti-logging
     command: ["bash"]
     environment:
       TAUCETI_SKIP_GIT_IDENTITY: "1"
@@ -54,6 +69,7 @@ services:
     image: tauceti-worker:local
     init: true
     restart: unless-stopped
+    logging: *tauceti-logging
     # Exceed the refresher's 15-second HTTP timeout so Docker cannot kill it after
     # the server rotates a token but before the replacement is persisted.
     stop_grace_period: 60s
@@ -69,6 +85,7 @@ services:
     image: tauceti-worker:local
     init: true
     restart: unless-stopped
+    logging: *tauceti-logging
     stop_grace_period: 60s
     command: ["/usr/local/bin/tauceti-oauth-refresh", "codex"]
     environment:

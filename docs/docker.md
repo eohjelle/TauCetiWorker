@@ -106,6 +106,16 @@ git pull
 docker compose up -d --build
 ```
 
+After a successful replacement, reclaim stopped containers, unused images, and build
+cache on a dedicated worker host:
+
+```bash
+./scripts/docker-storage-prune
+```
+
+The command never prunes named volumes or running containers. Do not use it on a
+shared Docker host unless every unused image and stopped container is disposable.
+
 Because the image copies the local checkout, inspect or switch to the intended fork
 branch before rebuilding. `git pull` is only an example update policy; Docker does not
 fetch or select a branch itself.
@@ -132,6 +142,41 @@ next start.
 | `checkouts` | Worker repositories and incremental Lean build artifacts |
 | `state` | Scheduler state and isolated worker home |
 | `logs` | Per-round logs |
+
+## Storage policy
+
+Compose uses Docker's rotating, compressed `local` logging driver for every service,
+with three 10 MiB files per container. Completed worker logs are retained for 14 days
+and then deleted at a round boundary; if they reach 1 GiB sooner, the oldest completed
+logs are removed first. The active session log is never removed. Override these
+defaults in `.env` with `TAUCETI_LOG_RETENTION_DAYS` and `TAUCETI_LOG_MAX_GIB`.
+
+The writable Lake artifact cache has a 10 GiB soft limit, and authoring requires at
+least 8 GiB of filesystem headroom. These defaults can be changed with
+`TAUCETI_LAKE_CACHE_MAX_GIB` and `TAUCETI_LAKE_CACHE_MIN_FREE_GIB`. The compressed
+Mathlib download cache is cleared when TauCeti changes Lean toolchain. Incremental
+`.lake/build` trees are deliberately retained because deleting them turns the next
+round into a large rebuild.
+
+On a dedicated systemd host, install the bundled journal limits once:
+
+```bash
+sudo install -D -m 0644 deploy/tauceti-journald.conf /etc/systemd/journald.conf.d/tauceti-storage.conf
+sudo systemctl restart systemd-journald
+sudo journalctl --vacuum-size=250M
+```
+
+This caps the system journal at 250 MiB and asks journald to preserve 2 GiB of free
+space. Docker's own logs are managed by its log driver, not by deleting files below
+`/var/lib/docker`.
+
+If expanded Lean builds become the only way to recover urgently needed space, stop
+the worker first and remove the `checkouts` named volume manually. That discards the
+checkout and every incremental build but leaves credentials, scheduler state, logs,
+and downloaded Elan toolchains intact; the next authoring round reclones and restores
+public caches. This is an emergency operation, not routine maintenance. Inspect the
+resolved volume name with `docker compose config --volumes` and `docker volume ls`
+before deleting it, and never remove it while a round or agent is active.
 
 Claude and Codex use rotating, single-consumer refresh tokens. One refresher owns
 each provider credential and publishes a refresh-token-free mirror; the worker never

@@ -46,7 +46,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning tauceti-path.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/tauceti-axioms scripts/tauceti-lint-env scripts/curl-no-progress scripts/docker-entrypoint tests/*.sh tests/run-all
+        run: shellcheck --severity=warning tauceti-path.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/tauceti-axioms scripts/tauceti-lint-env scripts/curl-no-progress scripts/docker-entrypoint scripts/docker-storage-prune tests/*.sh tests/run-all
 
   build:
     runs-on: ubuntu-latest
@@ -146,6 +146,10 @@ jobs:
             'import json, sys; assert json.load(sys.stdin)["services"]["tauceti"]["environment"]["TAUCETI_PACE"] == "0:10,100:90"'
           docker compose config --format json | python3 -c \
             'import json, sys; mounts=json.load(sys.stdin)["services"]["tauceti"]["volumes"]; assert any(m["source"] == "elan-toolchains" and m["target"] == "/opt/elan/toolchains" for m in mounts)'
+          docker compose config --format json | python3 -c \
+            'import json, sys; services=json.load(sys.stdin)["services"]; assert all(s["logging"] == {"driver": "local", "options": {"max-file": "3", "max-size": "10m"}} for s in services.values())'
+          docker compose config --format json | python3 -c \
+            'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_LAKE_CACHE_MIN_FREE_GIB"] == "8" and env["TAUCETI_LOG_RETENTION_DAYS"] == "14" and env["TAUCETI_LOG_MAX_GIB"] == "1"'
           test ! -e .env
           trap 'rm -f .env' EXIT
           printf '%s\n' 'TAUCETI_WORKER_ARGS=--help' 'TAUCETI_PACE=0:10,100:90' >.env

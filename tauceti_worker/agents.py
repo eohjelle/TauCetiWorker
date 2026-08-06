@@ -49,6 +49,7 @@ from .quota import (
     mirror_creds,
 )
 from .runtime_status import report_failure
+from .storage import _allocated_tree_bytes, maintain_mathlib_download_cache
 from .transcript import AgentTranscriptRenderer
 
 # ============================================================================
@@ -805,21 +806,6 @@ def _configured_gibibytes(name: str, default_bytes: int) -> int:
     return value * 1024**3
 
 
-def _allocated_tree_bytes(root: Path) -> int:
-    """Return allocated bytes under ``root``, counting hard-linked inodes only once."""
-    total = 0
-    seen: set[tuple[int, int]] = set()
-    for dirpath, _, filenames in os.walk(root):
-        for filename in filenames:
-            stat = (Path(dirpath) / filename).lstat()
-            inode = (stat.st_dev, stat.st_ino)
-            if inode in seen:
-                continue
-            seen.add(inode)
-            total += stat.st_blocks * 512
-    return total
-
-
 def maintain_host_lake_cache(cfg: Config, *, phase: str, require_headroom: bool = False) -> bool:
     """Purge the writable artifact cache only at a safe round boundary when storage is pressured.
 
@@ -828,13 +814,12 @@ def maintain_host_lake_cache(cfg: Config, *, phase: str, require_headroom: bool 
     finish before the post-round check removes the cache.
     """
     cache = cfg.checkout / ".lake" / "cache"
-    if not cache.exists():
-        return False
+    measurement_root = cache if cache.exists() else cfg.checkout
     max_bytes = _configured_gibibytes("TAUCETI_LAKE_CACHE_MAX_GIB", HOST_LAKE_CACHE_MAX_BYTES)
     min_free = _configured_gibibytes("TAUCETI_LAKE_CACHE_MIN_FREE_GIB", HOST_LAKE_CACHE_MIN_FREE_BYTES)
     try:
-        allocated = _allocated_tree_bytes(cache)
-        free = shutil.disk_usage(cache).free
+        allocated = _allocated_tree_bytes(cache) if cache.exists() else 0
+        free = shutil.disk_usage(measurement_root).free
     except OSError as e:
         if require_headroom:
             raise Die(f"preflight: could not measure host Lake cache storage: {e}") from e
@@ -846,6 +831,15 @@ def maintain_host_lake_cache(cfg: Config, *, phase: str, require_headroom: bool 
     if free < min_free:
         reasons.append(f"only {free / 1024**3:.1f} GiB filesystem space remains")
     if not reasons:
+        return False
+    if not cache.exists():
+        message = (
+            f"filesystem space is below the host Lake cache safety floor during {phase}, but no "
+            "disposable artifact cache exists"
+        )
+        if require_headroom:
+            raise Die(f"preflight: {message} ({free / 1024**3:.1f} GiB free; {min_free / 1024**3:.0f} GiB required)")
+        log(f"warning: {message}")
         return False
     try:
         shutil.rmtree(cache)
@@ -983,6 +977,7 @@ def prepare_host_authoring(cfg: Config) -> None:
     if not prepare_checkout(cfg):
         raise Die("preflight: could not prepare the current-main host authoring checkout")
     prune_obsolete_host_lean_toolchains(cfg)
+    maintain_mathlib_download_cache(cfg)
     configure_host_lake_cache(cfg)
     maintain_host_lake_cache(cfg, phase="before round", require_headroom=True)
     fetch_host_lake_caches(cfg)
