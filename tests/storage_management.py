@@ -110,6 +110,8 @@ check("journald policy caps host logs", "SystemMaxUse=250M" in journal_policy)
 check("journald policy reserves recovery headroom", "SystemKeepFree=2G" in journal_policy)
 prune_script = (REPO / "scripts" / "docker-storage-prune").read_text()
 check("Docker cleanup never prunes volumes", "volume prune" not in prune_script and "--volumes" not in prune_script)
+check("Docker cleanup requires a running worker", "ps --status running --quiet tauceti" in prune_script)
+check("Docker cleanup verifies the deployed image", '[[ "$running_image" != "$tagged_image" ]]' in prune_script)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

@@ -24,7 +24,7 @@ from .agents import (
     fetch_ref,
     fill_prompt,
     host_agent_argv,
-    maintain_host_lake_cache,
+    maintain_host_lake_storage,
     prepare_checkout,
     prepare_host_authoring,
     resolve_authoring_profile,
@@ -818,10 +818,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     try:
         rc = fn(w, sv, c, opts, bubble)
     finally:
-        # A writable artifact cache may cross its soft limit while the agent builds.  The agent has
-        # exited (or failed) before this runs, so a whole-cache purge cannot race Lake file access.
+        # A build may consume the configured filesystem reserve. The agent has exited (or failed)
+        # before this runs, so cleaning workspace builds and the artifact cache cannot race Lake.
         if not bubble and opts.host_prepared:
-            maintain_host_lake_cache(w.cfg, phase="after round")
+            maintain_host_lake_storage(w.cfg, phase="after round")
         maintain_worker_logs(w.cfg, phase="after round")
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)

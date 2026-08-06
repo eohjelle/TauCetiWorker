@@ -140,12 +140,14 @@ values. OpenRouter's inference key reports key usage/limits; an optional
 
 ## Host storage management
 
-The worker retains those artifacts up to a 10 GiB soft limit and purges only the
-disposable `.lake/cache` between rounds when the limit is reached or filesystem
-free space falls below 8 GiB. It fails closed before an authoring round if purging
-cannot restore that safety floor. The compressed Mathlib download cache is discarded
-when the checkout selects a different Lean toolchain; expanded `.lake/build` outputs
-remain warm. On a dedicated worker host,
+When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by
+default), the worker runs `lake clean` between rounds to remove every workspace
+package's build directory and separately removes `.lake/cache`. It restores Mathlib
+and TauCeti's public outputs, measures space again, and fails closed before authoring
+if the restored working set leaves less than the configured reserve. There is no
+independent artifact-cache size threshold. The compressed Mathlib download cache is
+discarded only when the checkout selects a different Lean toolchain. On a dedicated
+worker host,
 `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS=true` additionally removes official Lean
 toolchains that no worker checkout requests; custom and linked toolchains are
 always preserved. `tauceti doctor` shows the Lake path visible to the agent shell.
@@ -192,6 +194,8 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `TAUCETI_MIN_FREE_GIB` | `8` | At a round boundary, run `lake clean` and remove `.lake/cache` below this filesystem reserve; verify the reserve again after restoring public caches. |
+| `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS` | `false` | On a dedicated host, remove official Lean toolchains no worker checkout requests; never remove custom or linked toolchains. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
