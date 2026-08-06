@@ -55,6 +55,7 @@ from .quota import (
 )
 from .review_diagnostics import failure_summary
 from .runtime_status import report_failure
+from .storage import _allocated_tree_bytes, maintain_mathlib_download_cache
 from .transcript import AgentTranscriptRenderer
 from .usage import UsageError, kiro_data_dir, kiro_process_env, snapshot_kiro_auth_db
 

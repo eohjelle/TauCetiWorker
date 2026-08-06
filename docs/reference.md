@@ -321,6 +321,17 @@ Keep scanning merge-ready PRs for new contests. Validate a selective picker agai
 picker in shadow mode before changing selection; track missed candidates, time to selection,
 oldest uninspected PR and requests per productive round. This bounds discovery delays without
 turning a missing/deleted comment or a stale cache into permission to spend.
+## Host storage management
+
+The worker retains those artifacts up to a 10 GiB soft limit and purges only the
+disposable `.lake/cache` between rounds when the limit is reached or filesystem
+free space falls below 8 GiB. It fails closed before an authoring round if purging
+cannot restore that safety floor. The compressed Mathlib download cache is discarded
+when the checkout selects a different Lean toolchain; expanded `.lake/build` outputs
+remain warm. On a dedicated worker host,
+`TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS=true` additionally removes official Lean
+toolchains that no worker checkout requests; custom and linked toolchains are
+always preserved. `tauceti doctor` shows the Lake path visible to the agent shell.
 
 ## Codex accounts
 
