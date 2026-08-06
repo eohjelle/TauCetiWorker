@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Reclaim Docker residue on a dedicated TauCeti host without touching named volumes or live containers.
+set -euo pipefail
+
+docker container prune --force
+docker image prune --all --force
+docker builder prune --all --force
+docker system df

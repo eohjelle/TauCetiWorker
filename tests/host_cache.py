@@ -309,6 +309,7 @@ with tempfile.TemporaryDirectory() as td:
         tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1
         tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 1
         check("10 GiB is the default artifact-cache limit", saved_max == 10 * 1024**3)
+        check("8 GiB is the default filesystem safety floor", saved_min == 8 * 1024**3)
         check("oversized artifact cache is purged", tc.maintain_host_lake_cache(cfg, phase="test"))
         check("cache purge removes branch artifacts", not artifact.exists())
         check("cache purge preserves incremental build outputs", build_output.exists())
@@ -316,9 +317,21 @@ with tempfile.TemporaryDirectory() as td:
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(b"new branch artifact")
         tc.agents.HOST_LAKE_CACHE_MAX_BYTES = 1024**4
-        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 4 * 1024**3
+        tc.agents.HOST_LAKE_CACHE_MIN_FREE_BYTES = 8 * 1024**3
         tc.agents.shutil.disk_usage = lambda _path: SimpleNamespace(free=1024**3)
         check("low filesystem space independently purges the cache", tc.maintain_host_lake_cache(cfg, phase="test"))
+
+        # Once the disposable artifact cache is gone, the preflight must still enforce the free-space
+        # floor instead of returning early and launching a model on a nearly full filesystem.
+        import shutil
+
+        shutil.rmtree(cfg.checkout / ".lake" / "cache")
+        try:
+            tc.maintain_host_lake_cache(cfg, phase="test", require_headroom=True)
+            no_cache_error = None
+        except Exception as exc:
+            no_cache_error = exc
+        check("low-space preflight fails closed without a disposable cache", isinstance(no_cache_error, tc.Die))
 
         os.environ["TAUCETI_LAKE_CACHE_MAX_GIB"] = "12"
         check(
@@ -419,6 +432,7 @@ reuse_saved = {
     for name in (
         "prepare_host_authoring",
         "maintain_host_lake_cache",
+        "maintain_worker_logs",
         "_host_agent_binary",
         "do_fix_ci",
         "_progress_snapshot",
@@ -447,6 +461,7 @@ def claimed_then_run(*_args):
 try:
     wu.prepare_host_authoring = record_prepare
     wu.maintain_host_lake_cache = lambda *_args, **_kwargs: reuse_events.append("maintain")
+    wu.maintain_worker_logs = lambda *_args, **_kwargs: reuse_events.append("maintain-logs")
     wu._host_agent_binary = lambda _stage, _model: None
     wu.do_fix_ci = claimed_then_run
     wu._progress_snapshot = lambda *_args: None
@@ -456,7 +471,16 @@ try:
     check("second candidate completes without another host warmup", second == 1)
     check(
         "claim-raced candidates reuse one host cache preparation and check storage after each stage",
-        reuse_events == ["prepare", "stage", "maintain", "stage", "maintain"],
+        reuse_events
+        == [
+            "prepare",
+            "stage",
+            "maintain",
+            "maintain-logs",
+            "stage",
+            "maintain",
+            "maintain-logs",
+        ],
     )
 finally:
     for name, value in reuse_saved.items():

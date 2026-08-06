@@ -84,6 +84,7 @@ from .review_diagnostics import (
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
+from .storage import maintain_worker_logs
 from .survey import (
     TARGET_MARKER_RE,
     Candidate,
@@ -314,6 +315,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # steady state, so it is safe to run every round. Skipped under --dry-run, which must not mutate the
     # credential mirror.
     if not opts.dry_run:
+        maintain_worker_logs(w.cfg, phase="before round")
         mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
@@ -820,6 +822,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         # exited (or failed) before this runs, so a whole-cache purge cannot race Lake file access.
         if not bubble and opts.host_prepared:
             maintain_host_lake_cache(w.cfg, phase="after round")
+        maintain_worker_logs(w.cfg, phase="after round")
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
