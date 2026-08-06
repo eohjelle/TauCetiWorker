@@ -2,6 +2,23 @@
 # Reclaim Docker residue on a dedicated TauCeti host without touching named volumes or live containers.
 set -euo pipefail
 
+mapfile -t tauceti_images < <(docker compose config --images | sort -u)
+if ((${#tauceti_images[@]} != 1)); then
+  echo "docker-storage-prune: expected one Compose image, found ${#tauceti_images[@]}; refusing cleanup" >&2
+  exit 1
+fi
+tauceti_container="$(docker compose ps --status running --quiet tauceti)"
+if [[ -z "$tauceti_container" ]]; then
+  echo "docker-storage-prune: tauceti is not running; run and verify docker compose up -d first" >&2
+  exit 1
+fi
+running_image="$(docker inspect --format '{{.Image}}' "$tauceti_container")"
+tagged_image="$(docker image inspect --format '{{.Id}}' "${tauceti_images[0]}")"
+if [[ "$running_image" != "$tagged_image" ]]; then
+  echo "docker-storage-prune: running tauceti does not use the currently tagged image; recreate it first" >&2
+  exit 1
+fi
+
 docker container prune --force
 docker image prune --all --force
 docker builder prune --all --force
