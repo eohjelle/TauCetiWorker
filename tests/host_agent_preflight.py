@@ -11,6 +11,7 @@ raises before any stage work. Exit 0 = every case agrees; 1 = a mismatch.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -58,6 +59,7 @@ tc.agents.CLAUDE_CMD = _saved_cmd
 
 # --- dispatch() preflight -----------------------------------------------------------------------
 CAND = tc.Candidate(726, "deadbeef", "test")
+WORKER = SimpleNamespace(cfg=None)
 
 
 def opts(work_model="codex", sandbox_host=True):
@@ -78,7 +80,16 @@ def fake_stage(w, sv, c, o, bubble):
 
 
 _saved = {
-    k: getattr(wu, k) for k in ("do_review", "do_fix", "warn_red", "_progress_snapshot", "_progressed", "_bubble")
+    k: getattr(wu, k)
+    for k in (
+        "do_review",
+        "do_fix",
+        "warn_red",
+        "_progress_snapshot",
+        "_progressed",
+        "_bubble",
+        "maintain_worker_logs",
+    )
 }
 _saved_which = wu.shutil.which
 wu.do_review = fake_stage
@@ -86,6 +97,7 @@ wu.do_fix = fake_stage
 wu.warn_red = lambda msg: warns.append(msg)
 wu._progress_snapshot = lambda w, c: None
 wu._progressed = lambda w, c, pre: True  # stub out the "nothing landed on GitHub" guard
+wu.maintain_worker_logs = lambda *_args, **_kwargs: None
 
 
 def reset():
@@ -100,7 +112,7 @@ try:
     reset()
     raised, msg = False, ""
     try:
-        wu.dispatch("review", None, None, CAND, opts())
+        wu.dispatch("review", WORKER, None, CAND, opts())
     except tc.NoProgress as e:
         raised, msg = True, str(e)
     check("missing codex -> NoProgress", raised, True)
@@ -112,7 +124,7 @@ try:
     reset()
     raised = False
     try:
-        wu.dispatch("fix", None, None, CAND, opts())
+        wu.dispatch("fix", WORKER, None, CAND, opts())
     except tc.NoProgress:
         raised = True
     check("default fix with missing codex -> NoProgress before probe", raised, True)
@@ -121,7 +133,7 @@ try:
     # 2) host + binary PRESENT -> proceeds to the stage, no warning.
     wu.shutil.which = lambda name: f"/usr/bin/{name}"
     reset()
-    rc = wu.dispatch("review", None, None, CAND, opts())
+    rc = wu.dispatch("review", WORKER, None, CAND, opts())
     check("present codex -> stage runs", runs["n"], 1)
     check("present codex -> rc from stage", rc, 0)
     check("present codex -> no red warning", len(warns), 0)
@@ -131,7 +143,7 @@ try:
     wu._bubble = lambda stage, o: True
     wu.shutil.which = lambda name: None
     reset()
-    rc = wu.dispatch("review", None, None, CAND, opts(sandbox_host=False))
+    rc = wu.dispatch("review", WORKER, None, CAND, opts(sandbox_host=False))
     check("bubble -> host preflight skipped, stage runs", runs["n"], 1)
     check("bubble -> no red warning", len(warns), 0)
 
@@ -141,7 +153,7 @@ try:
     reset()
     raised = False
     try:
-        wu.dispatch("fix", None, None, CAND, opts(work_model="deepseek"))
+        wu.dispatch("fix", WORKER, None, CAND, opts(work_model="deepseek"))
     except tc.NoProgress:
         raised = True
     check("fix deepseek missing pi -> NoProgress", raised, True)

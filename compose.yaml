@@ -29,7 +29,7 @@ services:
       # Low-space cleanup runs only between model rounds, before an agent can touch Lake outputs.
       TAUCETI_MIN_FREE_GIB: "${TAUCETI_MIN_FREE_GIB:-8}"
       TAUCETI_LOG_RETENTION_DAYS: "${TAUCETI_LOG_RETENTION_DAYS:-14}"
-      TAUCETI_LOG_MAX_GIB: "${TAUCETI_LOG_MAX_GIB:-1}"
+      TAUCETI_LOG_MAX_MIB: "${TAUCETI_LOG_MAX_MIB:-256}"
     volumes:
       # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because
       # the worker keeps its shared quota-bootstrap ledger beside it; the renewable credential remains

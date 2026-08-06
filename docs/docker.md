@@ -152,10 +152,13 @@ next start.
 ## Storage policy
 
 Compose uses Docker's rotating, compressed `local` logging driver for every service,
-with three 10 MiB files per container. Completed worker logs are retained for 14 days
-and then deleted at a round boundary; if they reach 1 GiB sooner, the oldest completed
-logs are removed first. The active session log is never removed. Override these
-defaults in `.env` with `TAUCETI_LOG_RETENTION_DAYS` and `TAUCETI_LOG_MAX_GIB`.
+with three 10 MiB files per container. Completed TauCeti transcripts and explicitly
+disposable Claude/Codex session histories and diagnostics share a 256 MiB budget. They
+are retained for 14 days and then deleted at a round boundary; if they reach the budget
+sooner, the oldest completed files are removed first. Cleanup never targets credentials,
+configuration, Claude memory, or quota/ledger state, and the active TauCeti session log
+is always preserved. Override these defaults in `.env` with
+`TAUCETI_LOG_RETENTION_DAYS` and `TAUCETI_LOG_MAX_MIB`.
 
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
 the worker runs `lake clean` between rounds to remove the root and every dependency

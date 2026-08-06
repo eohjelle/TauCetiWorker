@@ -139,10 +139,11 @@ PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get("TAUCETI_PRUNE_OBSOLETE_LEAN_TOO
 # operators can tune dedicated workers without changing this default.
 HOST_MIN_FREE_BYTES = 8 * 1024**3
 
-# Completed worker transcripts are disposable after a useful debugging window.  The active session
-# log is always protected; these limits are enforced only between model rounds.
-WORKER_LOG_RETENTION_DAYS = 14
-WORKER_LOG_MAX_BYTES = 1 * 1024**3
+# Completed worker transcripts and provider session histories are disposable after a useful debugging
+# window.  The active TauCeti session log is always protected; these limits are enforced only between
+# model rounds, when no Claude or Codex child is running.
+AGENT_LOG_RETENTION_DAYS = 14
+AGENT_LOG_MAX_BYTES = 256 * 1024**2
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
