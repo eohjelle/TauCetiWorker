@@ -718,8 +718,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
 
 def _next_auto_stage(sv: Survey) -> str | None:
     for stage in AUTO_STAGES:
+        if stage == "roadmap":
+            if not sv.roadmap_backpressure:
+                return stage
+            continue
         if sv.kind(stage).actionable:
             return stage
-    if not sv.roadmap_backpressure:
-        return "roadmap"
     return None

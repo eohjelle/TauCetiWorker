@@ -32,7 +32,9 @@ list is in `tauceti work -h`. For persistent workers, see
 
 ## Roadmap backpressure
 
-The open-PR backpressure limit follows the roadmap scope you select. A pinned
+Roadmap authoring is preferred to review while fewer than eight of your non-draft
+roadmap PRs are open in the selected scope; at eight, an unrestricted worker falls
+through to review. The open-PR backpressure limit follows the roadmap scope you select. A pinned
 area counts only your open PRs identified for that area; an all-areas or
 automatic run counts roadmap PRs in every non-skipped area. Drafts, non-roadmap
 PRs, and PRs for roadmaps outside the selected scope do not consume its authoring

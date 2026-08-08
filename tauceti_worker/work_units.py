@@ -193,27 +193,35 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # discover the clash). This only reorders WITHIN a stage — the cascade's stage priority below is
     # unchanged — and the real de-contention (marker / branch claim) remains the authority and backstop.
     for stage in AUTO_STAGES:
+        if stage == "roadmap":
+            continue
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
-    # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
-    # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
-    # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
+    # The cascade: first actionable stage wins, does ONE unit, returns its rc. Roadmap is an always-
+    # available authoring stage below its open-PR cap, so it is handled inline without a surveyed PR
+    # candidate; at the cap it falls through to review. A candidate that is claimed elsewhere is
+    # skipped to the next one (COOP dedup); progress also returns None when its fresh plan re-check
+    # finds the cached due verdict stale, so useful lower-priority work still runs.
+    roadmap_backpressured = False
     for stage in AUTO_STAGES:
         if not want(opts.only, stage):
+            continue
+        if stage == "roadmap":
+            if sv.roadmap_backpressure:
+                roadmap_backpressured = True
+                continue
+            rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
+            if rc is not None:
+                return rc
             continue
         for c in sv.kind(stage).actionable:
             rc = dispatch(stage, w, sv, c, opts)
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
-    if want(opts.only, "roadmap"):
-        if sv.roadmap_backpressure:
-            raise NoProgress(
-                f"roadmap: {sv.n_mine_open} open PRs in selected scope "
-                f"(>= {MAX_OPEN_PRS}) — backpressure, not authoring"
-            )
-        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
-        if rc is not None:
-            return rc
+    if roadmap_backpressured:
+        raise NoProgress(
+            f"roadmap: {sv.n_mine_open} open PRs in selected scope (>= {MAX_OPEN_PRS}) — backpressure, not authoring"
+        )
 
     raise NoProgress(f"no eligible work this round under --only={','.join(opts.only) or '(all)'}")
 

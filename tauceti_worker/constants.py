@@ -73,7 +73,7 @@ MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across head
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
-# are open.
+# are open. At the limit, an unrestricted worker falls through to review instead.
 MAX_OPEN_PRS = 8
 
 # The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
@@ -199,10 +199,10 @@ WORK_TASKS = list(ALLOWED_TASKS)
 
 # Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
 # honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains
-# ahead of fleet-wide reviews so awaiting-author work cannot be starved by unrelated reviews. Roadmap
-# is the final fallback and is handled separately after these stages. The durable attempt breaker
-# keeps a stuck or rejected progress report from burning every round.
-AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
+# ahead of new roadmap work so awaiting-author work cannot be starved. Below the authoring cap,
+# roadmap work is preferred to fleet-wide reviews; at the cap, roadmap falls through to review. The
+# durable attempt breaker keeps a stuck or rejected progress report from burning every round.
+AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "roadmap", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted

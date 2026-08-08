@@ -28,7 +28,7 @@ checks = [
     check(
         "single shared auto order",
         tc.AUTO_STAGES,
-        ("rebase", "bump", "progress", "fix-ci", "fix", "review"),
+        ("rebase", "bump", "progress", "fix-ci", "fix", "roadmap", "review"),
     ),
 ]
 if "TAUCETI_PROGRESS_GAP" not in os.environ:
@@ -124,15 +124,46 @@ checks.append(check("bump beats a due progress report", tc._next_auto_stage(busy
 busy.rebaseable.actionable.append(candidate)
 checks.append(check("rebase remains first", tc._next_auto_stage(busy), "rebase"))
 
-# But with the queue empty it must be chosen ahead of roadmap authoring, or the open-ended fallback
-# (which always has work) would defer it for ever.
+# But with the queue empty it must be chosen ahead of roadmap authoring, or the open-ended stage
+# (which always has work below its cap) would defer it for ever.
 quiet = tc.Survey(worker_id="test")
 quiet.progress.actionable.append(tc.Candidate(0, "", "due"))
 checks.append(check("progress beats roadmap authoring", tc._next_auto_stage(quiet), "progress"))
 
-# And when no report is due, the fallback is roadmap authoring as before.
+# And when no report is due, roadmap authoring comes before review while it has capacity.
 idle = tc.Survey(worker_id="test")
 checks.append(check("no report due falls back to roadmap", tc._next_auto_stage(idle), "roadmap"))
+
+idle.reviewable.actionable.append(candidate)
+checks.append(check("roadmap beats review below the cap", tc._next_auto_stage(idle), "roadmap"))
+
+saved_survey = tc.work_units.survey
+saved_dispatch = tc.work_units.dispatch
+seen = []
+tc.work_units.survey = lambda *_a, **_k: idle
+tc.work_units.dispatch = lambda stage, *_a, **_k: seen.append(stage) or 0
+try:
+    tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("runtime authors roadmap before review below the cap", seen, ["roadmap"]))
+
+idle.n_mine_open = tc.MAX_OPEN_PRS
+idle.roadmap_backpressure = True
+checks.append(check("review wins when roadmap is at capacity", tc._next_auto_stage(idle), "review"))
+
+saved_survey = tc.work_units.survey
+saved_dispatch = tc.work_units.dispatch
+seen = []
+tc.work_units.survey = lambda *_a, **_k: idle
+tc.work_units.dispatch = lambda stage, *_a, **_k: seen.append(stage) or 0
+try:
+    tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("runtime reviews when roadmap is at capacity", seen, ["review"]))
 
 sv.red_ci.actionable.append(candidate)
 checks.append(check("red CI beats review findings", tc._next_auto_stage(sv), "fix-ci"))
