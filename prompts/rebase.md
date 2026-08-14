@@ -17,11 +17,8 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
 ## Verify before pushing (after the merge/rebase)
-List the branch's changed Lean files with
-`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
-For each changed `.lean` file, convert its path to the dotted module name and run
-`lake build TauCeti.<Module>`. Build any specific downstream module implicated by the resolved
-conflicts, too. Do not run a bare `lake build`; CI performs the authoritative repository-wide build.
+Run `lake build` only on the Lean modules changed by this branch and any specific downstream module
+implicated by the resolved conflicts. CI performs the authoritative repository-wide build.
 ```
 lake exe cache get
 tauceti-axioms --changed-since-merge-base origin/main

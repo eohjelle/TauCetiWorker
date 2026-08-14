@@ -12,9 +12,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   Resolve any conflicts without discarding either main's changes or the PR's intent.
 - Start with those logs before running an expensive local build. Identify the failing step, module, and
   declaration from CI, then reproduce only the smallest relevant command:
-  - For an elaboration/build failure, run
-    `lake build TauCeti.<Module>` (or
-    `lake env lean TauCeti/Path/To/Module.lean`).
+  - For an elaboration/build failure, reproduce only the smallest failing Lean module or declaration.
   - For an axiom or lint failure, run only the corresponding changed-module check:
     `tauceti-axioms --changed-since-merge-base origin/main` or
     `tauceti-lint-env --changed-since-merge-base origin/main`.
@@ -37,12 +35,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
 ## Final gate before pushing
-Only after the targeted failure is fixed, list the branch's changed Lean files with
-`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`. For each
-changed `.lean` file, convert its path to the dotted module name and run
-`lake build TauCeti.<Module>`. Rebuild the original failing module too if it is not in that list. Do not
-run a bare `lake build`; CI performs the authoritative repository-wide build and module-system audit.
-Then run the changed-module axiom and lint checks:
+Only after the targeted failure is fixed, perform the final local checks. Run `lake build` only on the
+Lean modules changed by this branch and the original failing module. CI performs the authoritative
+repository-wide build and module-system audit. Then run the changed-module axiom and lint checks:
 ```
 lake exe cache get
 tauceti-axioms --changed-since-merge-base origin/main
