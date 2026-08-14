@@ -69,12 +69,17 @@ beats a padded one. If nothing needs changing, say so and move on. Then verify, 
 
 ## Verify before pushing
 The worker fetched the Mathlib cache before launching you; do not repeat `lake exe cache get`.
+List the branch's changed Lean files with
+`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
+For each changed `.lean` file, convert its path to the dotted module name and run
+`lake build TauCeti.<Module>`. Build any specific downstream module you already know the change affects,
+too. Do not run a bare `lake build`; CI performs the authoritative repository-wide build.
 ```
-lake build
 tauceti-axioms --changed-since-merge-base origin/main
 tauceti-lint-env --changed-since-merge-base origin/main
 ```
-If `lake build` is red, FIX IT or retreat (below). Never push red.
+The axiom and lint commands check declarations in changed modules. If a targeted build is red, FIX IT
+or retreat (below). Never push a known-red branch.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 

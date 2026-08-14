@@ -187,9 +187,10 @@ Mathlib's compressed download cache remain available, so the next authoring pref
 can restore Mathlib and TauCeti outputs without compiling everything from source.
 
 After restoring both caches, the worker measures space again and refuses to launch an
-agent if less than the configured reserve remains. Cleanup logs the free space before
-and after cleaning, and preflight logs it again after restoration. The compressed
-Mathlib download cache itself is cleared only when TauCeti changes Lean toolchain.
+agent if either fetch failed or less than the configured reserve remains. Cleanup logs
+the free space before and after cleaning, and preflight logs it again after restoration.
+The compressed Mathlib download cache itself is cleared only when TauCeti changes Lean
+toolchain.
 
 On a dedicated systemd host, install the bundled journal limits once:
 

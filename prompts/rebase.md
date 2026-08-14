@@ -22,15 +22,19 @@ If the branch already includes current `main` and no concrete repair is needed, 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
 ## Verify before pushing (after the merge/rebase)
+List the branch's changed Lean files with
+`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
+For each changed `.lean` file, convert its path to the dotted module name and run
+`lake build TauCeti.<Module>`. Build any specific downstream module implicated by the resolved
+conflicts, too. Do not run a bare `lake build`; CI performs the authoritative repository-wide build.
 ```
 lake exe cache get
-lake build
 tauceti-axioms --changed-since-merge-base origin/main
 tauceti-lint-env --changed-since-merge-base origin/main
 ```
-Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
-declarations in changed modules; CI runs their repository-wide forms. Iterate until green — a botched
-conflict resolution that builds red is worse than the conflict.
+The axiom and lint commands check declarations in changed modules; CI runs their repository-wide forms.
+Iterate until every targeted check is green — a known-broken conflict resolution is worse than the
+conflict.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

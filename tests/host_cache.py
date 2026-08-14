@@ -3,7 +3,7 @@
 
 This pins the host-only contract: the generated public Lake configuration and cache directory are
 outside isolated HOME, all Lake restore variables reach the agent, Mathlib download failure is fatal
-after one retry, a TauCeti cache miss is advisory, and no eager full build is introduced.  It also
+after one retry, a TauCeti cache miss is fatal, and no eager full build is introduced.  It also
 guards the dispatch ordering that keeps machine-wide setup failures out of fix-CI attempt counters.
 """
 
@@ -175,10 +175,9 @@ def exercise_prepare(mathlib_rcs, tauceti_rc):
     return result, error, order, calls
 
 
-# Successful setup: current main first, then Mathlib, then TauCeti. A public cache miss only
-# means more compilation later, so it must not prevent the semantic repair agent from launching.
-_, error, order, calls = exercise_prepare([0], 1)
-check("TauCeti cache miss is nonfatal", error is None)
+# Successful setup: current main first, then both mandatory caches.
+_, error, order, calls = exercise_prepare([0], 0)
+check("successful TauCeti cache fetch completes preflight", error is None)
 check(
     "current main and toolchains are prepared before either cache fetch",
     order[:5] == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "tauceti"],
@@ -227,6 +226,19 @@ check(
 check(
     "cache fetch invokes plain Lake",
     all(argv[-1].startswith("exec lake ") for kind, argv, _, _ in calls if kind in ("mathlib", "tauceti")),
+)
+
+# A TauCeti cache failure must stop before the model starts. The loop retries the round after backoff,
+# rather than spending a model turn rebuilding repository outputs from source.
+_, error, order, calls = exercise_prepare([0], 1)
+check("TauCeti cache failure raises Die", isinstance(error, tc.Die))
+check(
+    "fatal TauCeti path follows the successful Mathlib fetch",
+    order == ["prepare-main", "elan-list", "elan-uninstall", "mathlib", "tauceti"],
+)
+check(
+    "fatal TauCeti path still has no full build",
+    all("lake build" not in command for _, _, command, _ in calls),
 )
 
 # A shared Elan installation must retain the predecessor while a sibling worker checkout still names it.

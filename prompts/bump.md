@@ -11,20 +11,24 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
   Resolve conflicts without losing the forward pin changes that this PR exists to test.
 
 ## Reproduce and adapt
+- Read the failing check's logs first: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then
+  `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
+- Fetch Mathlib's artifacts with `lake exe cache get`, then reproduce each reported failure with
+  `lake build TauCeti.<Module>` for the smallest implicated module. Do not run a bare `lake build`; CI
+  performs the authoritative repository-wide build.
+- The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating
+  the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
+Run the shim-expiry check as well:
 ```
-lake exe cache get
 git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"
 base_ref="$(git merge-base origin/main HEAD)"
 if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
-lake build
 ```
-- Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
-- The shim-expiry command may be the only failing check even when `lake build` succeeds. Its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
-- For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
-- If the failure is genuinely transient infra (e.g. a cache fetch timeout), both `lake build` and the shim-expiry command succeed locally, and the failed logs contain no actionable migration, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
+- The shim-expiry command may be the only failing check even when the targeted builds succeed. Its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
+- If the failure is genuinely transient infra (e.g. a cache fetch timeout) and the targeted builds and shim-expiry check pass locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
 
 ## Rules of the repo (hard constraints)
 - Adapt code under `TauCeti/`. Do NOT edit the root `TauCeti.lean`: it is intentionally empty, and the lakefile's glob (`TauCeti.*`) builds every module under `TauCeti/` without it. The only files outside `TauCeti/` you may leave changed are the pins the bot already bumped. Do NOT touch `Scripts/`, `.github/`, or the lakefile (`lakefile.toml`/`lakefile.lean`).
@@ -33,6 +37,10 @@ lake build
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
 ## Verify before pushing
+List the branch's changed Lean files with
+`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
+For each changed `.lean` file, convert its path to the dotted module name and run
+`lake build TauCeti.<Module>`. Also rebuild every module identified by the failing CI logs.
 ```
 lake exe cache get
 git fetch -q origin main
@@ -41,12 +49,11 @@ base_ref="$(git merge-base origin/main HEAD)"
 if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
-lake build
 tauceti-axioms --changed-since-merge-base origin/main
 tauceti-lint-env --changed-since-merge-base origin/main
 ```
-Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
-declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.
+The axiom and lint commands check declarations in changed modules; CI runs their repository-wide forms.
+Iterate until every targeted check is green. Never push a known-red branch.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

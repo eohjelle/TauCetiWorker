@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authoring workers build globally but run axiom/lint checks on changed modules."""
+"""Authoring workers build changed modules and leave repository-wide checks to CI."""
 
 import re
 from pathlib import Path
@@ -24,8 +24,16 @@ for name in PROMPTS:
         f"{name}: missing changed-module environment lint",
     )
     check(
-        re.search(r"(?m)^lake build(?: --iofail)?$", text) is not None,
-        f"{name}: global incremental build must remain in the gate",
+        "lake build TauCeti.<Module>" in text,
+        f"{name}: missing targeted module-build guidance",
+    )
+    check(
+        re.search(r"(?m)^lake build(?: --iofail)?$", text) is None,
+        f"{name}: repository-wide local build returned",
+    )
+    check(
+        re.search(r"Do\s+not\s+run a bare `lake build`", text) is not None,
+        f"{name}: missing explicit global-build prohibition",
     )
     check(
         re.search(r"(?m)^lake exe axioms$", text) is None,
