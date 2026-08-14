@@ -76,7 +76,8 @@ Credential-home isolation leaves Elan in its original `ELAN_HOME`. Before a host
 authoring round, the worker verifies that ordinary `lake` is available in the
 agent's login shell, resets the persistent checkout to current main, and restores
 Mathlib plus TauCeti's public Lake artifacts. The agent then uses that checkout
-and its writable Lake cache while working on the PR branch.
+and its writable Lake cache while working on the PR branch. If either cache fetch
+fails, the round stops before launching an agent and the loop retries after backoff.
 
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by
 default), the worker runs `lake clean` between rounds to remove every workspace

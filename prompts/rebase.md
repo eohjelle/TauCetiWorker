@@ -17,15 +17,19 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
 ## Verify before pushing (after the merge/rebase)
+List the branch's changed Lean files with
+`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
+For each changed `.lean` file, convert its path to the dotted module name and run
+`lake build TauCeti.<Module>`. Build any specific downstream module implicated by the resolved
+conflicts, too. Do not run a bare `lake build`; CI performs the authoritative repository-wide build.
 ```
 lake exe cache get
-lake build
 tauceti-axioms --changed-since-merge-base origin/main
 tauceti-lint-env --changed-since-merge-base origin/main
 ```
-Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
-declarations in changed modules; CI runs their repository-wide forms. Iterate until green — a botched
-conflict resolution that builds red is worse than the conflict.
+The axiom and lint commands check declarations in changed modules; CI runs their repository-wide forms.
+Iterate until every targeted check is green — a known-broken conflict resolution is worse than the
+conflict.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

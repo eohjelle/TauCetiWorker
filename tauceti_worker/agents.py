@@ -992,16 +992,19 @@ def fetch_host_lake_caches(cfg: Config) -> None:
         env=env,
     )
     if own.returncode:
-        detail = ((own.stderr or "") + (own.stdout or "")).strip()[-300:]
-        suffix = f" ({detail})" if detail else ""
-        log(f"warning: TauCeti Lake cache miss; the agent will build missing outputs{suffix}")
+        detail = ((own.stderr or "") + (own.stdout or "")).strip()[-500:]
+        suffix = f"\n  lake said: {detail}" if detail else ""
+        raise Die(
+            "preflight: TauCeti cache fetch failed in the current-main host checkout; "
+            f"refusing to launch an agent that would rebuild missing repository outputs.{suffix}"
+        )
 
 
 def prepare_host_authoring(cfg: Config) -> None:
     """Warm host authoring from current main without running a full pre-agent build.
 
-    Mathlib's cache is mandatory: falling back to compiling Mathlib would waste the model round. TauCeti's
-    public root-package cache is an optimization and follows CI/Bubble's non-fatal miss semantics.
+    Both caches are mandatory in host mode: a missing Mathlib cache would rebuild dependencies, while a
+    missing TauCeti cache would make targeted agent checks rebuild repository outputs from source.
     """
     if not prepare_checkout(cfg):
         raise Die("preflight: could not prepare the current-main host authoring checkout")

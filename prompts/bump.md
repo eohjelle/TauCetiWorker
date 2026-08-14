@@ -11,12 +11,13 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
   Resolve conflicts without losing the forward pin changes that this PR exists to test.
 
 ## Reproduce and adapt
-```
-lake exe cache get
-lake build
-```
-- Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
-- For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
+- Read the failing check's logs first: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then
+  `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
+- Fetch Mathlib's artifacts with `lake exe cache get`, then reproduce each reported failure with
+  `lake build TauCeti.<Module>` for the smallest implicated module. Do not run a bare `lake build`; CI
+  performs the authoritative repository-wide build.
+- The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating
+  the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and the code builds clean locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
 
 ## Rules of the repo (hard constraints)
@@ -25,14 +26,17 @@ lake build
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
 ## Verify before pushing
+List the branch's changed Lean files with
+`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
+For each changed `.lean` file, convert its path to the dotted module name and run
+`lake build TauCeti.<Module>`. Also rebuild every module identified by the failing CI logs.
 ```
 lake exe cache get
-lake build
 tauceti-axioms --changed-since-merge-base origin/main
 tauceti-lint-env --changed-since-merge-base origin/main
 ```
-Run the build globally so downstream effects are rebuilt. The axiom and lint commands check
-declarations in changed modules; CI runs their repository-wide forms. Iterate until green. Never push red.
+The axiom and lint commands check declarations in changed modules; CI runs their repository-wide forms.
+Iterate until every targeted check is green. Never push a known-red branch.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

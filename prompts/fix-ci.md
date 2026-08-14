@@ -37,18 +37,20 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
 ## Final gate before pushing
-Only after the targeted failure is fixed, run the global build and module-system audit plus the
-changed-module axiom and lint checks:
+Only after the targeted failure is fixed, list the branch's changed Lean files with
+`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`. For each
+changed `.lean` file, convert its path to the dotted module name and run
+`lake build TauCeti.<Module>`. Rebuild the original failing module too if it is not in that list. Do not
+run a bare `lake build`; CI performs the authoritative repository-wide build and module-system audit.
+Then run the changed-module axiom and lint checks:
 ```
 lake exe cache get
-lake build --iofail
 tauceti-axioms --changed-since-merge-base origin/main
-lake exe module-system
 tauceti-lint-env --changed-since-merge-base origin/main
 ```
 If this gate exposes another failure, return to the smallest targeted command, fix it, then rerun the
-gate. A green `lake build` alone is NOT enough — the changed-module audits must pass too. CI remains the
-authoritative repository-wide axiom and lint audit.
+gate. A green targeted build alone is NOT enough — the changed-module audits must pass too. CI remains
+the authoritative repository-wide build, axiom, lint, and module-system audit.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
