@@ -69,11 +69,8 @@ beats a padded one. If nothing needs changing, say so and move on. Then verify, 
 
 ## Verify before pushing
 The worker fetched the Mathlib cache before launching you; do not repeat `lake exe cache get`.
-List the branch's changed Lean files with
-`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
-For each changed `.lean` file, convert its path to the dotted module name and run
-`lake build TauCeti.<Module>`. Build any specific downstream module you already know the change affects,
-too. Do not run a bare `lake build`; CI performs the authoritative repository-wide build.
+Run `lake build` only on the Lean modules changed by this branch and any specific downstream module you
+know the change affects. CI performs the authoritative repository-wide build.
 ```
 tauceti-axioms --changed-since-merge-base origin/main
 tauceti-lint-env --changed-since-merge-base origin/main

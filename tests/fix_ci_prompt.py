@@ -24,10 +24,14 @@ lint_wrapper = (REPO / "scripts" / "tauceti-lint-env").read_text()
 
 for prompt_name in PROMPT_NAMES:
     prompt = (REPO / "prompts" / prompt_name).read_text()
-    check(f"{prompt_name} requires targeted module builds", "lake build TauCeti.<Module>" in prompt)
+    check(f"{prompt_name} requires scoped module builds", "Run `lake build` only on" in prompt)
     check(
         f"{prompt_name} has no bare repository-wide build",
         re.search(r"(?m)^lake build(?: --iofail)?$", prompt) is None,
+    )
+    check(
+        f"{prompt_name} does not prescribe change-discovery mechanics",
+        "git diff --name-only" not in prompt and "TauCeti.<Module>" not in prompt,
     )
     check(f"{prompt_name} uses changed-module axiom wrapper", axioms in prompt)
     check(f"{prompt_name} uses changed-module lint wrapper", lint in prompt)
@@ -66,15 +70,15 @@ check(
     0
     <= diagnosis.find("gh run view <run-id>")
     < diagnosis.find("git rebase origin/main")
-    < diagnosis.find("lake build TauCeti.<Module>"),
+    < diagnosis.find("smallest failing Lean module or declaration"),
 )
-check("fix-ci diagnosis keeps targeted module builds", "lake build TauCeti.<Module>" in diagnosis)
+check("fix-ci diagnosis keeps targeted reproduction", "smallest failing Lean module or declaration" in diagnosis)
 check("fix-ci diagnosis uses scoped-check wrappers", axioms in diagnosis and lint in diagnosis)
 check("fix-ci diagnosis does not run the complete gate", "lake exe cache get" not in diagnosis)
 check(
     "fix-ci final gate orders targeted build guidance and audits",
     0
-    <= final_gate.find("lake build TauCeti.<Module>")
+    <= final_gate.find("Run `lake build` only on")
     < final_gate.find(axioms)
     < final_gate.find(lint),
 )

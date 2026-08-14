@@ -24,16 +24,16 @@ for name in PROMPTS:
         f"{name}: missing changed-module environment lint",
     )
     check(
-        "lake build TauCeti.<Module>" in text,
-        f"{name}: missing targeted module-build guidance",
+        "Run `lake build` only on" in text,
+        f"{name}: missing scoped build policy",
     )
     check(
         re.search(r"(?m)^lake build(?: --iofail)?$", text) is None,
         f"{name}: repository-wide local build returned",
     )
     check(
-        re.search(r"Do\s+not\s+run a bare `lake build`", text) is not None,
-        f"{name}: missing explicit global-build prohibition",
+        "git diff --name-only" not in text and "TauCeti.<Module>" not in text,
+        f"{name}: scoped build policy prescribes implementation mechanics",
     )
     check(
         re.search(r"(?m)^lake exe axioms$", text) is None,

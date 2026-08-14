@@ -13,9 +13,8 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 ## Reproduce and adapt
 - Read the failing check's logs first: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then
   `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
-- Fetch Mathlib's artifacts with `lake exe cache get`, then reproduce each reported failure with
-  `lake build TauCeti.<Module>` for the smallest implicated module. Do not run a bare `lake build`; CI
-  performs the authoritative repository-wide build.
+- Fetch Mathlib's artifacts with `lake exe cache get`, then reproduce each reported failure by building
+  only the smallest implicated module. CI performs the authoritative repository-wide build.
 - The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating
   the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 Run the shim-expiry check as well:
@@ -37,10 +36,8 @@ rm -f "$base_shims"; rm -rf "$base_root"
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
 ## Verify before pushing
-List the branch's changed Lean files with
-`git diff --name-only --diff-filter=ACMR "$(git merge-base HEAD origin/main)" -- TauCeti`.
-For each changed `.lean` file, convert its path to the dotted module name and run
-`lake build TauCeti.<Module>`. Also rebuild every module identified by the failing CI logs.
+Run `lake build` only on the Lean modules changed by this branch and every module identified by the
+failing CI logs. CI performs the authoritative repository-wide build.
 ```
 lake exe cache get
 git fetch -q origin main
