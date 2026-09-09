@@ -60,7 +60,7 @@ RUN set -eux; \
 # when a pinned client or its service contract stops working. Keep this after Elan so a client-version
 # bump does not invalidate the installer layer.
 ARG CLAUDE_CODE_VERSION=2.1.220
-ARG CODEX_VERSION=0.145.0
+ARG CODEX_VERSION=0.153.4
 RUN npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "@openai/codex@${CODEX_VERSION}"
