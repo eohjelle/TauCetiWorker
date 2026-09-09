@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Default Codex authoring probes Sol safely, caches access, and runs no authoring prompt itself."""
+"""Default Codex authoring probes Astra safely, caches access, and runs no authoring prompt itself."""
 
 import json
 import os
@@ -13,7 +13,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 
-SOL = "gpt-5.6-sol"
+ASTRA = "gpt-6-astra"
 TERRA = "gpt-5.6-terra"
 fails = 0
 
@@ -26,7 +26,7 @@ def check(name, got, want):
 
 
 def unavailable(status=400, message=None):
-    message = message or f"The '{SOL}' model is not supported when using Codex with a ChatGPT account."
+    message = message or f"The '{ASTRA}' model is not supported when using Codex with a ChatGPT account."
     payload = {"status": status, "error": {"type": "invalid_request_error", "message": message}}
     return json.dumps({"type": "turn.failed", "error": {"message": json.dumps(payload)}})
 
@@ -60,7 +60,7 @@ def run(sequence, *, repeat=False, explicit=False):
         cfg = SimpleNamespace(home=home, quota_cache=cache, state=state)
         profile = tc.AuthoringProfile(
             provider="codex",
-            model=SOL,
+            model=ASTRA,
             effort="high",
             model_source="--author-model" if explicit else "repository default",
             effort_source="repository default",
@@ -97,10 +97,10 @@ def run(sequence, *, repeat=False, explicit=False):
 
 
 selected, again, error, calls, remaining = run([OK], repeat=True)
-check("successful Sol probe selects Sol", (selected.model, error), (SOL, None))
-check("successful Sol access is cached", (again.model, len(calls), len(remaining)), (SOL, 1, 0))
+check("successful Astra probe selects Astra", (selected.model, error), (ASTRA, None))
+check("successful Astra access is cached", (again.model, len(calls), len(remaining)), (ASTRA, 1, 0))
 argv, kwargs = calls[0]
-check("probe uses the requested Sol model", argv[argv.index("--model") + 1], SOL)
+check("probe uses the requested Astra model", argv[argv.index("--model") + 1], ASTRA)
 check("probe is JSON + read-only + ephemeral", all(x in argv for x in ("--json", "read-only", "--ephemeral")), True)
 check("probe ignores user config and rules", all(x in argv for x in ("--ignore-user-config", "--ignore-rules")), True)
 check("probe prompt is trivial, not an authoring prompt", argv[-1], "Reply with exactly OK. Do not use tools.")
@@ -110,10 +110,10 @@ check("probe strips API-key billing", "OPENAI_API_KEY" in kwargs.get("env", {}),
 selected, again, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE], repeat=True)
 check("two confirmed entitlement misses select Terra", (selected.model, error), (TERRA, None))
 check("Terra decision is cached without a third request", (again.model, len(calls), len(remaining)), (TERRA, 2, 0))
-check("both confirmations probe Sol only", [c[0][c[0].index("--model") + 1] for c in calls], [SOL, SOL])
+check("both confirmations probe Astra only", [c[0][c[0].index("--model") + 1] for c in calls], [ASTRA, ASTRA])
 
 selected, _, error, calls, _ = run([UNAVAILABLE, OK])
-check("a successful confirmation keeps Sol", (selected.model, len(calls), error), (SOL, 2, None))
+check("a successful confirmation keeps Astra", (selected.model, len(calls), error), (ASTRA, 2, None))
 
 for name, outcome in (
     ("ordinary failure", ORDINARY),
@@ -125,7 +125,7 @@ for name, outcome in (
     check(f"{name} does not downgrade", (selected, len(calls), error is not None), (None, 1, True))
 
 selected, _, error, calls, remaining = run([], explicit=True)
-check("explicit model bypasses probe and fallback", (selected.model, len(calls), error), (SOL, 0, None))
+check("explicit model bypasses probe and fallback", (selected.model, len(calls), error), (ASTRA, 0, None))
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

@@ -41,6 +41,7 @@ from .config import (
     Config,
     Die,
     NoProgress,
+    auto_stages,
     is_git_url,
     log,
     one_line,
@@ -56,7 +57,6 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
-    MAX_OPEN_PRS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_REF,
@@ -432,26 +432,31 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
-    for stage in AUTO_STAGES:
+    roadmap_backpressured = False
+    for stage in auto_stages():
         if not want(opts.only, stage):
+            continue
+        if stage == "roadmap":
+            # --pr never authorizes an unrelated new PR, regardless of the priority setting.
+            if targets:
+                continue
+            if sv.roadmap_backpressure:
+                roadmap_backpressured = True
+                continue
+            rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
+            if rc is not None:
+                return rc
             continue
         for c in sv.kind(stage).actionable:
             rc = dispatch(stage, w, sv, c, opts)
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
             declined.append((stage, c.pr))
-    # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
-    # A targeted round that finds nothing to do on its targets stops rather than falling through to
-    # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
-    if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
-        if sv.roadmap_backpressure:
-            raise NoProgress(
-                f"roadmap: {sv.n_mine_open} open PRs in selected scope "
-                f"(>= {MAX_OPEN_PRS}) — backpressure, not authoring"
-            )
-        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
-        if rc is not None:
-            return rc
+    if roadmap_backpressured:
+        raise NoProgress(
+            f"roadmap: {sv.n_mine_open} open PRs in selected scope "
+            f"(>= {sv.roadmap_pr_cap}) — backpressure, not authoring"
+        )
 
     scope = f"--only={','.join(opts.only) or '(all)'}"
     if targets:
@@ -760,7 +765,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if not _still_actionable(stage, w, sv, c):
         return None
     if needs_codex_probe:
-        # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
+        # Resolve Astra/Terra before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
         opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
     if needs_kiro_probe:

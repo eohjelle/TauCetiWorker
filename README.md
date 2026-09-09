@@ -103,6 +103,10 @@ A round does exactly one unit of work: the first of these that applies.
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
+Pass `--roadmap-before-review` to prefer new roadmap work over reviews while below
+the scoped five-open-PR limit (`--roadmap-pr-cap N` to change it). Maintenance still
+takes priority; without the flag the existing eight-PR cap is unchanged.
+
 Review selection is cooperative across community workers. The worker named by
 the latest scoreboard gets a 20-minute first-refusal window on that PR's next
 green head or contest reply. After that window, every worker may take it;
@@ -206,8 +210,8 @@ rather than wandering onto other work.
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
-| `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
+| `auto` (default) | Codex (`gpt-6-astra` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
+| `codex` | `gpt-6-astra`, high effort; Terra fallback if Astra is unavailable | subscription, paced |
 | `claude` | `claude-opus-5`, high effort | subscription, paced |
 | `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-5` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |

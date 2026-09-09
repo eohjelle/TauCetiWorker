@@ -144,7 +144,7 @@ def resolve_authoring_profile(
         if resolved_fallback_model:
             # Internal loop-child handoff: the parent already resolved whether its model was a default
             # (eligible for fallback) or an operator pin. Without this provenance, pinning the resolved
-            # Sol model into the child would accidentally turn the default into an explicit override.
+            # Astra model into the child would accidentally turn the default into an explicit override.
             fallback_model = resolved_fallback_model
         elif model_source == "repository default" and model == AUTHORING_DEFAULTS["codex"][0]:
             fallback_model = CODEX_AUTHORING_FALLBACK_MODEL
@@ -273,7 +273,7 @@ def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -
 
 
 def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
-    """Resolve a default Sol profile to Sol or Terra before the real task runs.
+    """Resolve a default Astra profile to Astra or Terra before the real task runs.
 
     Explicit model pins have no fallback and bypass this probe. A confirmed result is cached per worker
     and account; failures that might be transient are never cached and never cause a downgrade.

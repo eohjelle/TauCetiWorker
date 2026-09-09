@@ -195,6 +195,7 @@ with tempfile.TemporaryDirectory() as td:
             saved,
         )
         replace(tc.cli, "_claude_keychain_creds", lambda: None, saved)
+        replace(tc.cli, "Quota", lambda _cfg: SimpleNamespace(codex_account=lambda: None), saved)
 
         calls.clear()
         login_result["lake"] = None

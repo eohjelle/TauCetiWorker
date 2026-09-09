@@ -38,7 +38,7 @@ try:
     codex = tc.resolve_authoring_profile("codex")
     claude = tc.resolve_authoring_profile("claude")
     kiro = tc.resolve_authoring_profile("kiro")
-    check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-sol", "high"))
+    check("committed Codex default", (codex.model, codex.effort), ("gpt-6-astra", "high"))
     check("committed Codex fallback", codex.fallback_model, "gpt-5.6-terra")
     check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
     check("committed Kiro default is exact Sol", (kiro.model, kiro.effort), ("gpt-5.6-sol", "high"))
@@ -47,10 +47,10 @@ try:
     default_claude_host, _ = tc.host_agent_argv("PROMPT", claude)
     default_claude_bubble = tc.agent_inner_cmd(claude)
     check("default Codex host launch is direct", default_host[:4], ["codex", "exec", "--json", "--model"])
-    check("default Codex host launch prefers Sol", "gpt-5.6-sol" in default_host, True)
+    check("default Codex host launch prefers Astra", "gpt-6-astra" in default_host, True)
     check("default Codex host launch carries one model", "gpt-5.6-terra" in default_host, False)
     check("default Codex bubble launch is direct", "codex exec" in default_bubble, True)
-    check("default Codex bubble launch prefers Sol", "--model gpt-5.6-sol" in default_bubble, True)
+    check("default Codex bubble launch prefers Astra", "--model gpt-6-astra" in default_bubble, True)
     check("default Codex bubble launch carries one model", "gpt-5.6-terra" in default_bubble, False)
     check(
         "Codex host requests detailed reasoning summaries", 'model_reasoning_summary="detailed"' in default_host, True
@@ -203,7 +203,7 @@ try:
         ["--author-model", "claude-custom", "--author-effort", "max"],
     )
 
-    # The default Codex profile remains fallback-eligible after the loop parent pins Sol into its child.
+    # The default Codex profile remains fallback-eligible after the loop parent pins Astra into its child.
     captured.clear()
     tc.loop.choose_model = lambda *_a, **_k: ("codex", {})
     tc.loop.github_budget = lambda: {}
@@ -228,7 +228,7 @@ try:
         ["--author-effort", "high", "--resolved-author-fallback-model", "gpt-5.6-terra"],
     )
     child_profile = tc.resolve_authoring_profile(
-        "codex", cli_model="gpt-5.6-sol", resolved_fallback_model="gpt-5.6-terra"
+        "codex", cli_model="gpt-6-astra", resolved_fallback_model="gpt-5.6-terra"
     )
     check("loop child restores fallback eligibility", child_profile.fallback_model, "gpt-5.6-terra")
 finally:

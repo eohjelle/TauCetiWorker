@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import ROADMAP
+from .constants import AUTO_STAGES, MAX_OPEN_PRS, ROADMAP
 from .paths import HERE
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
@@ -25,6 +25,35 @@ def is_git_url(value: str) -> bool:
     except ValueError:
         return False
     return scheme in {"http", "https", "ssh", "git", "file"} or bool(_SCP_GIT_URL_RE.fullmatch(value))
+
+
+def roadmap_before_review() -> bool:
+    return os.environ.get("TAUCETI_ROADMAP_BEFORE_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def roadmap_pr_cap() -> int:
+    """Scoped roadmap authoring limit; invalid explicit limits fail before any work."""
+    raw = os.environ.get("TAUCETI_ROADMAP_PR_CAP")
+    if raw is None:
+        return 5 if roadmap_before_review() else MAX_OPEN_PRS
+    try:
+        cap = int(raw)
+        if cap > 0:
+            return cap
+    except ValueError:
+        pass
+    raise Die("--roadmap-pr-cap / $TAUCETI_ROADMAP_PR_CAP must be a positive integer")
+
+
+def auto_stages() -> tuple[str, ...]:
+    """Effective priority, read live so the loop and its children agree with the survey.
+
+    Maintenance always comes first. Roadmap authoring normally follows reviews; the explicit
+    opt-in moves it just ahead of reviews without bypassing its scoped open-PR limit.
+    """
+    if roadmap_before_review():
+        return (*AUTO_STAGES[:-1], "roadmap", "review")
+    return (*AUTO_STAGES, "roadmap")
 
 
 def roadmap_only() -> str | None:

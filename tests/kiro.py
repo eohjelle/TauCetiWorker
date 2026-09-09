@@ -86,7 +86,11 @@ with tempfile.TemporaryDirectory() as root:
         private_root=root / "private",
     )
     check("API key gets a private KIRO_HOME", env["KIRO_HOME"], str(root / "private" / "home"))
-    check("API key cannot be shadowed by browser auth", env["XDG_DATA_HOME"], str(root / "private" / "data"))
+    if sys.platform == "darwin":
+        check("API key isolates native browser auth", env["HOME"], str(root / "private" / "profile"))
+        check("API key drops the operator's XDG data override", "XDG_DATA_HOME" in env, False)
+    else:
+        check("API key cannot be shadowed by browser auth", env["XDG_DATA_HOME"], str(root / "private" / "data"))
     check(
         "Kiro receives no unrelated provider keys",
         any(key in env for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")),

@@ -102,7 +102,10 @@ TAUCETI_PACE=0:10,100:90
 
 Compose passes this directly to the worker. You can also put `--pace 0:10,100:90`
 in `TAUCETI_WORKER_ARGS`; the command-line value wins if both are present. A blank or
-unset `TAUCETI_PACE` keeps the default identity curve (`used% < elapsed%`).
+unset `TAUCETI_PACE` keeps the default `60:40` curve.
+
+To prioritize authoring for a focused worker, include `--roadmap-before-review`
+alongside `--roadmap-only ReductiveGroups` in `TAUCETI_WORKER_ARGS`.
 
 The bundled Compose service runs one worker loop directly because Docker already
 provides supervision. It therefore does not read `workers.toml` or the legacy

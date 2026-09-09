@@ -264,10 +264,10 @@ CODEX_AUTHORING_FALLBACK_MODEL = "gpt-5.6-terra"
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
 CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Prefer flagship Sol for authoring. A cached preflight probe selects Terra only when Codex confirms
+    # Prefer flagship Astra for authoring. A cached preflight probe selects Terra only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     # Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-5.6-sol", "high"),
+    "codex": ("gpt-6-astra", "high"),
     "claude": ("claude-opus-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.

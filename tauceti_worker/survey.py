@@ -13,9 +13,8 @@ from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
 
-from .config import Config, log, roadmap_only, roadmap_skip
+from .config import Config, auto_stages, log, roadmap_only, roadmap_pr_cap, roadmap_skip
 from .constants import (
-    AUTO_STAGES,
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
@@ -24,7 +23,6 @@ from .constants import (
     MAX_CI_ATTEMPTS,
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
-    MAX_OPEN_PRS,
     MAX_PROGRESS_ERRORS,
     MAX_REBASE_ATTEMPTS,
     MAX_REVIEW_CONTESTS,
@@ -209,6 +207,7 @@ class Survey:
     # run is the number of our open, non-draft roadmap PRs that belong to that run's selected areas,
     # not the number of every PR we have open across the project.
     n_mine_open: int = 0
+    roadmap_pr_cap: int = field(default_factory=roadmap_pr_cap)
     roadmap_backpressure: bool = False
     next_auto_stage: str | None = None
     github_failed: bool = False
@@ -257,7 +256,8 @@ class Survey:
     def rescope_roadmap(self) -> None:
         """Recompute authoring pressure after roadmap-only/skip changes, including live TUI dials."""
         self.n_mine_open = roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
-        self.roadmap_backpressure = self.n_mine_open >= MAX_OPEN_PRS
+        self.roadmap_pr_cap = roadmap_pr_cap()
+        self.roadmap_backpressure = self.n_mine_open >= self.roadmap_pr_cap
         self.next_auto_stage = _next_auto_stage(self)
 
     def status_label_line(self) -> str:
@@ -803,9 +803,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
-    for stage in AUTO_STAGES:
-        if sv.kind(stage).actionable:
+    for stage in auto_stages():
+        if stage == "roadmap":
+            if not sv.roadmap_backpressure:
+                return stage
+        elif sv.kind(stage).actionable:
             return stage
-    if not sv.roadmap_backpressure:
-        return "roadmap"
     return None

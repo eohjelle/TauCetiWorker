@@ -20,6 +20,8 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--roadmap-before-review` | Prefer new roadmap work to reviews below the scoped open-PR limit (five by default in this mode). Maintenance still comes first; the default remains reviews before roadmap. |
+| `--roadmap-pr-cap N` | Set the positive open-roadmap-PR limit in the selected scope. Defaults to five with `--roadmap-before-review`, otherwise eight. |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
@@ -33,6 +35,12 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
 
 ## Roadmap backpressure
+
+With `--roadmap-before-review`, the order is rebase, bump, progress, fix-ci, fix,
+roadmap, review. At the five-PR limit, roadmap yields to review; change the limit
+with `--roadmap-pr-cap N`. Task selection
+(`--only`/`--skip`) and PR targeting still apply; the flag never permits unrelated
+authoring in a `--pr` round. For managed workers, include the flag in `args`.
 
 The open-PR backpressure limit follows the roadmap scope you select. A pinned
 area counts only your open PRs identified for that area; an all-areas or
@@ -97,8 +105,8 @@ the hold becomes inactive.
 
 ## Codex model selection
 
-The committed Codex authoring profile defaults to `gpt-5.6-sol`. Before the real
-authoring task, the worker makes a tiny read-only Sol access probe and caches the
+The committed Codex authoring profile defaults to `gpt-6-astra`. Before the real
+authoring task, the worker makes a tiny read-only Astra access probe and caches the
 result for one hour for that worker and ChatGPT account. It selects
 `gpt-5.6-terra` only after two consecutive structured 400, 403, or 404 rejections
 that identify a model-access problem. Rate limits, server errors, context errors,
@@ -194,6 +202,8 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_BEFORE_REVIEW` | _(unset)_ | `1` enables `--roadmap-before-review`; inherited by loop children. |
+| `TAUCETI_ROADMAP_PR_CAP` | `5` with roadmap-first, otherwise `8` | Positive scoped open-roadmap-PR limit; `--roadmap-pr-cap` takes precedence. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
@@ -212,7 +222,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_INHERIT_CLAUDE_CONFIG` | _(unset)_ | `1` gives an isolated worker your own `CLAUDE.md`, `settings.json`, and skills instead of its own. Off by default: a round should not depend on whose config dir it ran from, and personal instructions can contradict the task prompt. |
-| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-6-astra` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
 | `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-5` selects Opus; Kiro Auto is never used. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin, independent of the authoring model. Unset preserves the review engine's own default and fallback. |

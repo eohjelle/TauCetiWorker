@@ -17,8 +17,8 @@ def check(name, ok):
     print(f"[{'OK ' if ok else 'XX '}] {name}")
 
 
-axioms = "tauceti-axioms --changed-from origin/main"
-lint = "tauceti-lint-env --changed-from origin/main"
+axioms = "tauceti-axioms --changed-since-merge-base origin/main"
+lint = "tauceti-lint-env --changed-since-merge-base origin/main"
 axiom_wrapper = (REPO / "scripts" / "tauceti-axioms").read_text()
 lint_wrapper = (REPO / "scripts" / "tauceti-lint-env").read_text()
 
@@ -38,11 +38,11 @@ for prompt_name in PROMPT_NAMES:
     check(f"{prompt_name} no longer uses the bundled helper", "tauceti-local-checks" not in prompt)
     check(
         f"{prompt_name} does not bypass the axiom wrapper",
-        "lake exe axioms --changed-from" not in prompt,
+        "lake exe axioms --changed-since-merge-base" not in prompt,
     )
     check(
         f"{prompt_name} does not bypass the lint wrapper",
-        "scripts/lint-env.sh --changed-from" not in prompt,
+        "scripts/lint-env.sh --changed-since-merge-base" not in prompt,
     )
     check(
         f"{prompt_name} has no repository-wide axiom command",
@@ -77,10 +77,7 @@ check("fix-ci diagnosis uses scoped-check wrappers", axioms in diagnosis and lin
 check("fix-ci diagnosis does not run the complete gate", "lake exe cache get" not in diagnosis)
 check(
     "fix-ci final gate orders targeted build guidance and audits",
-    0
-    <= final_gate.find("Run `lake build` only on")
-    < final_gate.find(axioms)
-    < final_gate.find(lint),
+    0 <= final_gate.find("Run `lake build` only on") < final_gate.find(axioms) < final_gate.find(lint),
 )
 check(
     "only fix-ci retains targeted module-system failure diagnosis",

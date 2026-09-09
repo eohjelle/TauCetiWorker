@@ -64,4 +64,4 @@ Iterate until every targeted check is green. Never push a known-red branch.
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry / `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary of which Mathlib changes broke or superseded `TauCeti/` and how you adapted each.

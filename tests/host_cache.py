@@ -460,6 +460,8 @@ reuse_saved = {
         "_host_agent_binary",
         "do_fix_ci",
         "_progress_snapshot",
+        "_checkout_head",
+        "log_round_file_changes",
     )
 }
 reuse_events = []
@@ -489,6 +491,8 @@ try:
     wu._host_agent_binary = lambda _stage, _model: None
     wu.do_fix_ci = claimed_then_run
     wu._progress_snapshot = lambda *_args: None
+    wu._checkout_head = lambda *_args: "before-head"
+    wu.log_round_file_changes = lambda *_args: None
     first = wu.dispatch("fix-ci", SimpleNamespace(cfg=SimpleNamespace()), SimpleNamespace(), c, reuse_opts)
     second = wu.dispatch("fix-ci", SimpleNamespace(cfg=SimpleNamespace()), SimpleNamespace(), c, reuse_opts)
     check("claim-raced candidate asks the caller to continue", first is None)
