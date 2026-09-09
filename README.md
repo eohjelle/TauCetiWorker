@@ -164,6 +164,10 @@ A round does exactly one unit of work: the first of these that applies.
 | **Overlap scan** | Examine up to 160 consecutive Mathlib commits after the shared cursor, publish actionable overlaps as issues, then advance the cursor through the completed batch. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
+Pass `--roadmap-before-review` to prefer new roadmap work over reviews while below
+the scoped five-open-PR limit (`--roadmap-pr-cap N` to change it). Maintenance still
+takes priority; without the flag the existing eight-PR cap is unchanged.
+
 Review selection is cooperative across community workers. The worker named by
 the latest scoreboard gets a 20-minute first-refusal window on that PR's next
 green head or contest reply. After that window, every worker may take it;

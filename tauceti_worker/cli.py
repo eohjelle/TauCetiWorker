@@ -59,6 +59,7 @@ from .config import (
     is_git_url,
     log,
     roadmap_only,
+    roadmap_pr_cap,
     sanitize_wid,
     security_audit_problem,
     set_log_file,
@@ -287,6 +288,20 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="stream the agent's (noisy) conversation log to the terminal; "
         "default redirects it to a file under logs/ and prints the path (or $TAUCETI_STREAM=1)",
+    )
+    p.add_argument(
+        "--roadmap-before-review",
+        action="store_true",
+        help="prefer new roadmap PRs to reviews while below the scoped open-PR limit; maintenance "
+        "still comes first (default: reviews before roadmap, or $TAUCETI_ROADMAP_BEFORE_REVIEW=1)",
+    )
+    p.add_argument(
+        "--roadmap-pr-cap",
+        type=int,
+        default=None,
+        metavar="N",
+        help="maximum open roadmap PRs in the selected scope; positive integer "
+        "(default: 5 with --roadmap-before-review, otherwise 8; or $TAUCETI_ROADMAP_PR_CAP)",
     )
     p.add_argument(
         "--roadmap-only",
@@ -1274,6 +1289,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # live via roadmap_only()). Empty string is a meaningful value: "all areas".
     if getattr(args, "roadmap_only", None) is not None:
         os.environ["TAUCETI_ROADMAP_ONLY"] = args.roadmap_only
+    if getattr(args, "roadmap_before_review", False):
+        os.environ["TAUCETI_ROADMAP_BEFORE_REVIEW"] = "1"
+    if getattr(args, "roadmap_pr_cap", None) is not None:
+        os.environ["TAUCETI_ROADMAP_PR_CAP"] = str(args.roadmap_pr_cap)
+    roadmap_pr_cap()  # validate before isolation, GitHub calls, or launching a loop child
     source = resolve_source(args, only)
     if source is not None:
         args.source = source
