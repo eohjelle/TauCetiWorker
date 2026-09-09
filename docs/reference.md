@@ -21,6 +21,8 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--roadmap-before-review` | Prefer new roadmap work to reviews below the scoped open-PR limit (five by default in this mode). Maintenance still comes first; the default remains reviews before roadmap. |
+| `--roadmap-pr-cap N` | Set the positive open-roadmap-PR limit in the selected scope. Defaults to five with `--roadmap-before-review`, otherwise eight. |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
 | `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from. Re-read every round; an empty value means no list. |
 | `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
@@ -37,6 +39,12 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
 
 ## Roadmap backpressure
+
+With `--roadmap-before-review`, the order is rebase, bump, progress, fix-ci, fix,
+roadmap, review. At the five-PR limit, roadmap yields to review; change the limit
+with `--roadmap-pr-cap N`. Task selection
+(`--only`/`--skip`) and PR targeting still apply; the flag never permits unrelated
+authoring in a `--pr` round. For managed workers, include the flag in `args`.
 
 The open-PR backpressure limit follows the roadmap scope you select. A pinned
 area counts only your open PRs identified for that area; an all-areas or
@@ -391,6 +399,8 @@ Most variables are tuning knobs with sane defaults.
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
 | `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the operator target list, for `--roadmap-targets`; blank means no list. |
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
+| `TAUCETI_ROADMAP_BEFORE_REVIEW` | _(unset)_ | `1` enables `--roadmap-before-review`; inherited by loop children. |
+| `TAUCETI_ROADMAP_PR_CAP` | `5` with roadmap-first, otherwise `8` | Positive scoped open-roadmap-PR limit; `--roadmap-pr-cap` takes precedence. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |

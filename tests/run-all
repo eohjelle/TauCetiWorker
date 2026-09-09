@@ -244,6 +244,7 @@ RUN_STDLIB=(
   roadmap_backpressure.py
   roadmap_claims.py
   roadmap_claim_namespace.py
+  roadmap_priority.py
   round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
