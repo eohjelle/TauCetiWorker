@@ -2,10 +2,12 @@
 """Storage cleanup is bounded, toolchain-aware, and safe around live worker output."""
 
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -24,6 +26,90 @@ def write_allocated(path: Path, text: str = "log") -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return path.stat().st_blocks * 512
+
+
+with patch.dict(os.environ, {"TAUCETI_CLEAN_ROUND_TMP": "0"}):
+    check("temporary cleanup is disabled outside the Compose opt-in", tc.snapshot_round_temp() is None)
+
+with patch.dict(os.environ, {"TAUCETI_CLEAN_ROUND_TMP": "1"}), patch.object(tc.storage, "Path") as path:
+    path.return_value.is_file.return_value = False
+    try:
+        tc.snapshot_round_temp()
+    except tc.Die:
+        check("temporary cleanup refuses a non-Docker host", True)
+    else:
+        check("temporary cleanup refuses a non-Docker host", False)
+
+
+def check_round_temp_cleanup(outcome):
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "tmp"
+        root.mkdir()
+        existing = root / "existing" / "keep"
+        outside = Path(td) / "persistent-checkout" / "keep"
+        write_allocated(existing)
+        write_allocated(outside)
+        created = root / "review" / "source.lean"
+        events = []
+
+        def spawn(_tail):
+            events.append("spawn")
+            write_allocated(root / "spawn-output")
+            return SimpleNamespace(pid=123456, returncode=-15, wait=wait)
+
+        def wait(_timeout):
+            events.append("wait")
+            write_allocated(created)
+            write_allocated(root / "existing" / "new-but-shared")
+            (root / "outside-link").symlink_to(outside.parent, target_is_directory=True)
+            (created.parent / "nested-link").symlink_to(outside.parent, target_is_directory=True)
+            check(f"{outcome}: temporary files survive while the round is running", created.exists())
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired("round", 1)
+            if outcome == "interrupt":
+                raise KeyboardInterrupt
+            return 1 if outcome == "failure" else 0
+
+        def reap(_pgid):
+            events.append("reap")
+            check(f"{outcome}: process teardown precedes file cleanup", created.exists())
+
+        group_state = "sent" if outcome == "survivor" else "denied" if outcome == "denied" else "gone"
+        with (
+            patch.object(tc.storage, "_round_temp_dir", return_value=root),
+            patch.object(tc.round, "spawn_round", side_effect=spawn),
+            patch.object(tc.round, "kill_round_group", side_effect=lambda _p: events.append("kill")),
+            patch.object(tc.round, "reap_round_group", side_effect=reap),
+            patch.object(tc.round, "signal_group", return_value=group_state),
+        ):
+            try:
+                rc = tc.run_round_subprocess([], timeout=1)
+            except KeyboardInterrupt:
+                check("interruption is propagated after cleanup", outcome == "interrupt")
+            else:
+                expected = 124 if outcome == "timeout" else 1 if outcome == "failure" else 0
+                check(f"{outcome}: round exit status is preserved", rc == expected)
+
+        if outcome in ("survivor", "denied"):
+            check(f"{outcome}: possibly active temporary files are preserved", created.exists())
+        else:
+            check(f"{outcome}: completed temporary trees are removed", not created.parent.exists())
+            check(f"{outcome}: top-level temporary files are removed", not (root / "spawn-output").exists())
+            check(f"{outcome}: new symlinks are unlinked", not (root / "outside-link").is_symlink())
+        check(f"{outcome}: pre-existing entries and their contents are preserved", existing.exists())
+        check(
+            f"{outcome}: new files within pre-existing entries are preserved",
+            (root / "existing" / "new-but-shared").exists(),
+        )
+        check(f"{outcome}: symlink targets are preserved", outside.exists())
+        expected_events = (
+            ["spawn", "wait", "kill", "reap"] if outcome in ("timeout", "interrupt") else ["spawn", "wait", "reap"]
+        )
+        check(f"{outcome}: cleanup follows round teardown", events == expected_events)
+
+
+for outcome in ("success", "failure", "timeout", "interrupt", "survivor", "denied"):
+    check_round_temp_cleanup(outcome)
 
 
 saved_agent_env = {name: os.environ.get(name) for name in ("TAUCETI_LOG_FILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME")}
