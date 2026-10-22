@@ -8,6 +8,7 @@
 #   - dashboard uses the project's rich/textual/Tools dependencies -> `uv run python`
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
 #   - egress needs the bubble sandbox/proxy              -> skipped here
+#   - docker_round_temp runs in the CI Docker image      -> skipped here
 # The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
 #
 # Usage: tests/run-all [--fail-fast]
@@ -160,7 +161,7 @@ RUN_SPECIAL=(parity_selectors.py dashboard.py)
 RUN_SH=(docker_entrypoint.sh lifecycle.sh)
 # Deliberate manual checks: egress needs the bubble sandbox/proxy; the cross-repo
 # repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
-SKIP=(egress.sh integration_repair_fixture.py)
+SKIP=(egress.sh integration_repair_fixture.py docker_round_temp.py)
 
 pass=0; fail=0; failed=()
 
