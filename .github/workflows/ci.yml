@@ -187,6 +187,10 @@ jobs:
           printf '%s\n' 'TAUCETI_WORKER_ARGS=--help' 'TAUCETI_PACE=0:10,100:90' >.env
           docker compose config --format json | python3 -c \
             'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_WORKER_ARGS"] == "--help" and env["TAUCETI_PACE"] == "0:10,100:90"'
+      - name: Smoke-test round temporary cleanup
+        run: |
+          docker run --rm -i --network none -e TAUCETI_CLEAN_ROUND_TMP=1 \
+            --entrypoint python3 tauceti-worker:ci - < tests/docker_round_temp.py
       # Exercise the actual tini -> uv -> Python process tree used by Compose. The
       # unit test invokes Python directly and cannot prove that SIGTERM crosses uv.
       - name: Graceful stop reaches the worker loop

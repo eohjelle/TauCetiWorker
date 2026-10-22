@@ -16,6 +16,7 @@ from .config import Config, Die, log
 from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
 from .github import claims_repo
 from .paths import CLAIM_SH, self_argv, self_env
+from .storage import clean_round_temp, snapshot_round_temp
 
 # ============================================================================
 # Round lifecycle — flock (one round per worker), signal handling, cleanup, and
@@ -364,6 +365,7 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
             ensure_supervisor(budget_dir())
         except Exception as error:
             log(f"usage supervisor startup pending: {error}")
+    temporary = snapshot_round_temp()
     p = spawn_round(argv_tail, timeout=timeout)
     owner = process_identity(p.pid) if accounting else None
     ending = "exit"
@@ -401,3 +403,8 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
                 ensure_supervisor(budget_dir())
             except Exception as error:
                 log(f"usage supervisor recovery pending: {error}")
+        if temporary is not None:
+            if signal_group(pgid, 0) == "gone":
+                clean_round_temp(temporary)
+            else:
+                log(f"WARNING: round group {pgid} still exists; preserving its temporary files")
