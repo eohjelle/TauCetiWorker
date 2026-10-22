@@ -7,9 +7,47 @@ import shutil
 import time
 from pathlib import Path
 
-from .config import Config, log
+from .config import Config, Die, log
 from .constants import AGENT_LOG_MAX_BYTES, AGENT_LOG_RETENTION_DAYS
 from .quota import claude_dir, codex_dir
+
+
+def _round_temp_dir() -> Path | None:
+    """Temporary storage belongs exclusively to the single worker in the Compose container."""
+    if os.environ.get("TAUCETI_CLEAN_ROUND_TMP") != "1":
+        return None
+    if not Path("/.dockerenv").is_file():
+        raise Die("TAUCETI_CLEAN_ROUND_TMP requires a dedicated Docker worker container")
+    return Path("/tmp")
+
+
+def snapshot_round_temp() -> tuple[Path, set[Path]] | None:
+    """Record pre-existing entries so a round can discard only its own temporary output."""
+    root = _round_temp_dir()
+    return None if root is None else (root, set(root.iterdir()))
+
+
+def clean_round_temp(snapshot: tuple[Path, set[Path]]) -> int:
+    """Remove newly created entries after the round's entire process group has exited.
+
+    Pre-existing entries are preserved, including changes inside them. Symlinks are unlinked,
+    never traversed. Persistent checkouts, caches, credentials and logs live outside this directory.
+    """
+    root, before = snapshot
+    removed = 0
+    removed_bytes = 0
+    for path in sorted(set(root.iterdir()) - before):
+        if path.is_symlink() or not path.is_dir():
+            allocated = path.lstat().st_blocks * 512
+            path.unlink()
+        else:
+            allocated = _allocated_tree_bytes(path)
+            shutil.rmtree(path)
+        removed += 1
+        removed_bytes += allocated
+    if removed:
+        log(f"round temporary cleanup: removed {removed} entries, reclaimed {removed_bytes / 1024**2:.1f} MiB")
+    return removed
 
 
 def _configured_positive_int(name: str, default: int, *, unit: str) -> int:

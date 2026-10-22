@@ -182,6 +182,14 @@ configuration, Claude memory, or quota/ledger state, and the active TauCeti sess
 is always preserved. Override these defaults in `.env` with
 `TAUCETI_LOG_RETENTION_DAYS` and `TAUCETI_LOG_MAX_MIB`.
 
+Compose enables `TAUCETI_CLEAN_ROUND_TMP=1` for its single worker. The loop records
+the entries already in the container's private `/tmp` before each round and removes
+new entries after the round and its background processes have exited, including failed
+and timed-out rounds. Pre-existing entries and symlink targets are preserved. Temporary
+review checkouts and lint drivers must not be used to store work needed by later rounds;
+use the persistent checkout or state directory instead. Do not run a second worker or
+unrelated temporary-file-producing work inside the same container.
+
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
 the worker runs `lake clean` between rounds to remove the root and every dependency
 build directory, then separately deletes `.lake/cache`, which Lake does not own. There
