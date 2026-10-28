@@ -188,7 +188,7 @@ jobs:
           docker compose config --format json | python3 -c \
             'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_MIN_FREE_GIB"] == "8" and env["TAUCETI_LOG_RETENTION_DAYS"] == "14" and env["TAUCETI_LOG_MAX_MIB"] == "256"'
           docker compose config --format json | python3 -c \
-            'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_BUILD_CACHE_ROOT"] == "/opt/tauceti/state/build-cache"'
+            'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_BUILD_CACHE_ROOT"] == "/opt/tauceti/checkouts/build-cache" and env["TAUCETI_LAKE_CACHE_ROOT"] == "/opt/tauceti/checkouts/lake-cache"'
           TAUCETI_SHARED_ARTIFACTS=0 docker compose config --format json | python3 -c \
             'import json, sys; assert json.load(sys.stdin)["services"]["tauceti"]["environment"]["TAUCETI_SHARED_ARTIFACTS"] == "0"'
           test ! -e .env
@@ -200,6 +200,26 @@ jobs:
         run: |
           docker run --rm -i --network none -e TAUCETI_CLEAN_ROUND_TMP=1 \
             --entrypoint python3 tauceti-worker:ci - < tests/docker_round_temp.py
+      - name: Lake artifacts share the checkout mount
+        run: |
+          docker compose run --rm --no-deps -T --entrypoint python3 tauceti - <<'PY'
+          import os
+          import tempfile
+          from contextlib import ExitStack
+          from pathlib import Path
+
+          with ExitStack() as stack:
+              roots = ["/opt/tauceti/checkouts", os.environ["TAUCETI_LAKE_CACHE_ROOT"], os.environ["TAUCETI_BUILD_CACHE_ROOT"]]
+              paths = []
+              for root in roots:
+                  Path(root).mkdir(parents=True, exist_ok=True)
+                  paths.append(Path(stack.enter_context(tempfile.TemporaryDirectory(dir=root))) / "artifact")
+              paths[0].write_bytes(b"compiled output")
+              os.link(paths[0], paths[1])
+              os.link(paths[1], paths[2])
+              assert len({(p.stat().st_dev, p.stat().st_ino) for p in paths}) == 1
+          print("PASS: checkout, private cache and shared cache use one inode")
+          PY
       # Exercise the actual tini -> uv -> Python process tree used by Compose. The
       # unit test invokes Python directly and cannot prove that SIGTERM crosses uv.
       - name: Graceful stop reaches the worker loop
