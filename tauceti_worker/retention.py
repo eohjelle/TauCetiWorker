@@ -238,7 +238,10 @@ def cache_roots(cfg):
     if located is None:
         return []
     home, anchor = located
-    return [(home / ".cache" / name, anchor) for name in ("lake", "mathlib")]
+    roots = [(home / ".cache" / name, anchor) for name in ("lake", "mathlib")]
+    if root := os.environ.get("TAUCETI_LAKE_CACHE_ROOT"):
+        roots.append((Path(root) / cfg.wid, Path(root)))
+    return roots
 
 
 def expire_transcripts(cfg, report, *, now, dry=False, opened=None, mounts=...):

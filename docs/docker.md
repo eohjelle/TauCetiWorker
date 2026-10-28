@@ -199,17 +199,22 @@ unrelated temporary-file-producing work inside the same container.
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
 the worker runs `lake clean` between rounds to remove the root and every dependency
 build directory, then separately deletes `.lake/cache` and the worker's private
-`~/.cache/lake` artifact store, which Lake does not own. Dependency source checkouts and
+artifact store under `/opt/tauceti/checkouts/lake-cache`. Dependency source checkouts and
 Mathlib's compressed download cache remain available after this cleanup, so the next authoring preflight
 can restore Mathlib and TauCeti outputs without compiling everything from source.
 
 After restoring both caches, the worker measures space again and refuses to launch an
 agent if less than the configured reserve remains. Cleanup logs the free space before
-and after cleaning, and preflight logs it again after restoration.
+and after cleaning, and preflight logs it again after restoration. Cache downloads and
+host authoring processes are also checked every second while running. If free space
+falls below the reserve, their process group is stopped, without deleting source edits
+or live build files. Normal cleanup runs at the next quiescent round boundary.
 
-The shared build cache lives at `/opt/tauceti/state/build-cache`, alongside the private
-Lake cache on the existing `state` volume. Immutable artifacts use hard links instead
-of duplicate copies and survive container replacement. Upstream's cache retention also
+The shared build cache lives at `/opt/tauceti/checkouts/build-cache`. It, the private
+Lake cache, and checkout build outputs all use the same `checkouts` mount. Lake can
+therefore hard-link binary artifacts instead of making duplicate copies; separate
+Docker volume mounts prevent hard links even on the same host filesystem. All three
+survive container replacement. Upstream's cache retention also
 expires unused shared entries after 72 hours and reclaims caches under disk pressure;
 see [cache retention](workers.md#shared-artifacts-and-storage-cleanup) for its thresholds and lifecycle.
 
