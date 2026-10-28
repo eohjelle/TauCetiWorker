@@ -1,8 +1,6 @@
-# GitHub-hosted Ubuntu runners restrict nested sandbox mounts and loopback setup.
+# GitHub-hosted Ubuntu runners require an explicit user-namespace AppArmor profile.
 # This override applies only to the disposable CI worker, not normal deployments.
 services:
   tauceti:
     security_opt:
-      - apparmor=unconfined
-    cap_add:
-      - NET_ADMIN
+      - apparmor=tauceti-ci
