@@ -41,6 +41,7 @@ services:
       TAUCETI_CLEAN_ROUND_TMP: "1"
       # Hard-link immutable artifacts to the private Lake cache on this same mount.
       TAUCETI_BUILD_CACHE_ROOT: /opt/tauceti/state/build-cache
+      TAUCETI_SHARED_ARTIFACTS: "${TAUCETI_SHARED_ARTIFACTS:-1}"
     volumes:
       # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because
       # the worker keeps its shared quota-bootstrap ledger beside it; the renewable credential remains
