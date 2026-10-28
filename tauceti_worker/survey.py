@@ -15,8 +15,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import Config, log, roadmap_only, roadmap_skip
-from .config import max_open_prs as configured_max_open_prs
+from .config import Config, auto_stages, log, roadmap_only, roadmap_skip
+from .config import roadmap_pr_cap as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
     BUMP_HEAD_PREFIX,
@@ -1191,9 +1191,11 @@ def survey(
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
-    for stage in AUTO_STAGES:
+    for stage in auto_stages():
+        if stage == "roadmap":
+            if not sv.roadmap_backpressure:
+                return stage
+            continue
         if sv.kind(stage).actionable:
             return stage
-    if not sv.roadmap_backpressure:
-        return "roadmap"
     return None

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -18,7 +20,7 @@ def _round_temp_dir() -> Path | None:
         return None
     if not Path("/.dockerenv").is_file():
         raise Die("TAUCETI_CLEAN_ROUND_TMP requires a dedicated Docker worker container")
-    return Path("/tmp")
+    return Path(tempfile.mkdtemp(prefix="tauceti-round-", dir="/tmp"))
 
 
 def snapshot_round_temp() -> tuple[Path, set[Path]] | None:
@@ -47,6 +49,8 @@ def clean_round_temp(snapshot: tuple[Path, set[Path]]) -> int:
         removed_bytes += allocated
     if removed:
         log(f"round temporary cleanup: removed {removed} entries, reclaimed {removed_bytes / 1024**2:.1f} MiB")
+    if not any(root.iterdir()):
+        root.rmdir()
     return removed
 
 
@@ -63,6 +67,75 @@ def _configured_positive_int(name: str, default: int, *, unit: str) -> int:
         log(f"warning: ignoring invalid {name}={raw!r}; expected a positive whole number of {unit}")
         return default
     return value
+
+
+def _storage_reserve() -> int:
+    return _configured_positive_int("TAUCETI_MIN_FREE_GIB", 8, unit="GiB") * 1024**3
+
+
+def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
+    """Clean a quiescent checkout's builds and private Lake caches below the free-space reserve."""
+    if "TAUCETI_MIN_FREE_GIB" not in os.environ:
+        return False
+    before = shutil.disk_usage(cfg.checkout).free
+    if before >= _storage_reserve():
+        return False
+    subprocess.run(["lake", "clean"], cwd=cfg.checkout, check=True)
+    data_home = cfg.data_home
+    for cache in (cfg.checkout / ".lake" / "cache", data_home / ".cache" / "lake"):
+        if cache.is_dir() and not cache.is_symlink():
+            shutil.rmtree(cache)
+    after = shutil.disk_usage(cfg.checkout).free
+    log(f"Lake storage cleanup {phase}: free space {before / 1024**3:.1f} -> {after / 1024**3:.1f} GiB")
+    return True
+
+
+def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
+    """Retire unused official installations on an explicitly dedicated worker host."""
+    from .constants import PRUNE_OBSOLETE_LEAN_TOOLCHAINS
+
+    if not PRUNE_OBSOLETE_LEAN_TOOLCHAINS:
+        return
+    # Retained work can need older toolchains even when canonical main has moved on.
+    recovery = (cfg.state / "recovery", cfg.state / "verification-pending", cfg.checkout.parent / "retained-checkouts")
+    if any(path.is_dir() and any(path.iterdir()) for path in recovery):
+        return
+    files = {cfg.checkout / "lean-toolchain", *cfg.checkout.parent.parent.glob("*/TauCeti/lean-toolchain")}
+    required = {path.read_text().strip() for path in files if path.is_file()}
+    if not required:
+        return
+    listed = subprocess.run(["elan", "toolchain", "list"], capture_output=True, text=True, check=True)
+    root = Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"
+    # A separate recovery/verification process may still be using an older installation.
+    for executable in Path("/proc").glob("[0-9]*/exe"):
+        try:
+            if executable.resolve(strict=True).is_relative_to(root):
+                return
+        except OSError:
+            continue
+    for line in listed.stdout.splitlines():
+        name = line.split()[0] if line.split() else ""
+        installation = root / name.replace("/", "--").replace(":", "---")
+        if name.startswith("leanprover/lean4:") and name not in required and not installation.is_symlink():
+            subprocess.run(["elan", "toolchain", "uninstall", name], check=True)
+            log(f"uninstalled obsolete Lean toolchain {name}")
+
+
+def verify_host_storage_headroom(checkout: Path, env: dict, *, phase: str) -> None:
+    """Do not launch inference when restored artifacts leave less than the configured reserve."""
+    if "TAUCETI_MIN_FREE_GIB" not in env:
+        return
+    from .agents import BuildCacheUnavailable
+
+    reserve = int(env["TAUCETI_MIN_FREE_GIB"]) * 1024**3
+    if reserve <= 0:
+        raise Die("TAUCETI_MIN_FREE_GIB must be a positive integer")
+    free = shutil.disk_usage(checkout).free
+    log(f"host storage {phase}: {free / 1024**3:.1f} GiB free (floor {reserve / 1024**3:.0f} GiB)")
+    if free < reserve:
+        raise BuildCacheUnavailable(
+            f"only {free / 1024**3:.1f} GiB free after restoration; {reserve / 1024**3:.0f} GiB required"
+        )
 
 
 def _allocated_tree_bytes(root: Path) -> int:
@@ -114,8 +187,8 @@ def _disposable_agent_files(cfg: Config, *, phase: str) -> list[Path]:
     """Return only files safe to discard; credentials, config, memory, and ledgers are excluded."""
     roots = (
         (cfg.logdir, lambda _path: True),
-        (claude_dir(cfg.home), _is_disposable_claude_file),
-        (codex_dir(cfg.home), _is_disposable_codex_file),
+        (claude_dir(cfg.data_home), _is_disposable_claude_file),
+        (codex_dir(cfg.data_home), _is_disposable_codex_file),
     )
     candidates: list[Path] = []
     seen: set[Path] = set()
@@ -164,6 +237,9 @@ def maintain_worker_logs(
         max_mib = _configured_positive_int("TAUCETI_LOG_MAX_MIB", default_mib, unit="MiB")
         max_bytes = max_mib * 1024**2
     active = _active_log_path()
+    from .retention import open_files
+
+    opened = open_files()
     cutoff = (time.time() if now is None else now) - retention_days * 86400
     retained: list[tuple[float, Path, int, bool]] = []
     removed = 0
@@ -172,7 +248,9 @@ def maintain_worker_logs(
         try:
             stat = path.stat()
             allocated = stat.st_blocks * 512
-            protected = active is not None and path.resolve(strict=False) == active
+            protected = (active is not None and path.resolve(strict=False) == active) or (
+                opened is not None and (stat.st_dev, stat.st_ino) in opened
+            )
             if stat.st_mtime < cutoff and not protected:
                 path.unlink()
                 removed += 1
@@ -230,7 +308,7 @@ def maintain_mathlib_download_cache(cfg: Config) -> bool:
         previous = marker.read_text().strip() if marker.is_file() else None
         if previous == requested:
             return False
-        cache = cfg.home / ".cache" / "mathlib"
+        cache = cfg.data_home / ".cache" / "mathlib"
         removed_bytes = _allocated_tree_bytes(cache) if previous and cache.is_dir() else 0
         if previous and cache.exists():
             shutil.rmtree(cache)

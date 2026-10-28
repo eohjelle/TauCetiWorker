@@ -7,6 +7,9 @@ trap 'rm -rf "$temporary"' EXIT
 
 printf '%s\n' '#!/usr/bin/env bash' 'printf "<%s>\\n" "$@"' >"$temporary/tauceti"
 chmod +x "$temporary/tauceti"
+printf '%s\n' '#!/usr/bin/env bash' 'exit "${SANDBOX_TEST_RC:-0}"' >"$temporary/codex"
+chmod +x "$temporary/codex"
+export PATH="$temporary:$PATH"
 
 output="$({
   cd "$temporary"
@@ -57,3 +60,13 @@ test "$status" -ne 0
 [[ "$error" == tauceti-entrypoint:*TAUCETI_WORKER_ARGS*invalid\ quoting* ]]
 [[ "$error" != *Traceback* ]]
 echo "[OK ] malformed quoting fails closed with a useful error"
+
+set +e
+error="$(cd "$temporary" && TAUCETI_SKIP_GIT_IDENTITY=1 SANDBOX_TEST_RC=1 \
+  "$ROOT/scripts/docker-entrypoint" ./tauceti work --loop 2>&1)"
+status=$?
+set -e
+test "$status" -ne 0
+[[ "$error" == *"Codex sandbox failed; refusing to start the worker"* ]]
+[[ "$error" != *"<work>"* ]]
+echo "[OK ] broken reviewer sandbox prevents worker startup"

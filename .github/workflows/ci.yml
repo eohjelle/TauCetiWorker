@@ -12,8 +12,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Reuse existing Namespace profiles. Leaving priority unspecified keeps these
-# checks behind Bors control (priority 0) and compilation (priority 1).
+# The fork uses GitHub-hosted runners; no upstream Namespace runner access is required.
 jobs:
   test:
     # Storage fixtures require native, consistent inode/device metadata.
@@ -32,9 +31,7 @@ jobs:
         run: ./tests/run-all
 
   prices:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the review engine's price table
@@ -55,9 +52,7 @@ jobs:
           fi
 
   lint:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -77,9 +72,7 @@ jobs:
         run: shellcheck --severity=warning tauceti-path.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/curl-no-progress scripts/docker-entrypoint scripts/docker-storage-prune tests/*.sh tests/run-all
 
   build:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -109,9 +102,7 @@ jobs:
           PY
 
   docker:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,7 +125,7 @@ jobs:
         run: |
           docker compose run --rm --no-deps \
             -e HOME=/tmp/isolated-home \
-            tauceti bash -euo pipefail -c '
+            tauceti bash -euo pipefail -lc '
             mkdir -p "$HOME"
             test "$ELAN_HOME" = /opt/elan
             test "$TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS" = true
@@ -159,6 +150,7 @@ jobs:
             ./tauceti --help >/dev/null
             claude auth login --help >/dev/null
             codex login --help 2>&1 | grep -F -- --device-auth >/dev/null
+            codex sandbox -- ls / >/dev/null
             doctor_output="$(./tauceti doctor || true)"
             printf "%s\n" "$doctor_output"
             printf "%s\n" "$doctor_output" | grep -F "[ok     ] lake"

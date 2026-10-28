@@ -1504,6 +1504,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # file read, so it costs a dry run nothing.
         raise_on_account_mismatch(cfg, opts.account, opts.work_model, "account")
         if not dry:
+            from .storage import maintain_worker_logs
+
+            maintain_worker_logs(cfg, phase="before round")
             preflight(cfg, opts)
         result = run_round(w, opts)  # NoProgress/Die propagate to main()'s handler
         if ctx.activity:

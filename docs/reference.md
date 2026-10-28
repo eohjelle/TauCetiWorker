@@ -394,7 +394,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
 | `TAUCETI_VERIFY_CACHE_DIR` | actual host identity under `/tmp` | Shared immutable-installation identity cache; no verification admission limit. Bubble mounts it automatically. |
 | `TAUCETI_MIN_FREE_GIB` | `8` | At a round boundary, run `lake clean` and remove `.lake/cache` below this filesystem reserve; verify the reserve again after restoring public caches. |
-| `TAUCETI_CLEAN_ROUND_TMP` | unset (`1` in Compose) | Dedicated Docker workers only: remove new `/tmp` entries after each loop round's process group exits. Pre-existing entries are preserved. |
+| `TAUCETI_CLEAN_ROUND_TMP` | unset (`1` in Compose) | Dedicated Docker workers only: give each loop round a private `TMPDIR`, removed after its process group exits. Other temporary directories and recovery work are preserved. |
 | `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS` | `false` | On a dedicated host, remove official Lean toolchains no worker checkout requests; never remove custom or linked toolchains. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |

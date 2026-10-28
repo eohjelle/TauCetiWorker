@@ -68,7 +68,7 @@ def roadmap_pr_cap() -> int:
     """Scoped roadmap authoring limit; invalid explicit limits fail before any work."""
     raw = os.environ.get("TAUCETI_ROADMAP_PR_CAP")
     if raw is None:
-        return 5 if roadmap_before_review() else MAX_OPEN_PRS
+        return 5 if roadmap_before_review() else max_open_prs()
     try:
         cap = int(raw)
         if cap > 0:
@@ -85,7 +85,8 @@ def auto_stages() -> tuple[str, ...]:
     opt-in moves it just ahead of reviews without bypassing its scoped open-PR limit.
     """
     if roadmap_before_review():
-        return (*AUTO_STAGES[:-1], "roadmap", "review")
+        review = AUTO_STAGES.index("review")
+        return (*AUTO_STAGES[:review], "roadmap", *AUTO_STAGES[review:])
     return (*AUTO_STAGES, "roadmap")
 
 

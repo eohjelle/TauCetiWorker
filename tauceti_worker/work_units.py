@@ -46,6 +46,7 @@ from .config import (
     Die,
     NoProgress,
     SharedStateUnavailable,
+    auto_stages,
     is_git_url,
     log,
     one_line,
@@ -94,7 +95,6 @@ from .review_diagnostics import (
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
-from .storage import maintain_worker_logs
 from .survey import (
     TARGET_MARKER_RE,
     Candidate,
@@ -391,7 +391,6 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # steady state, so it is safe to run every round. Skipped under --dry-run, which must not mutate the
     # credential mirror.
     if not opts.dry_run:
-        maintain_worker_logs(w.cfg, phase="before round")
         mirror_creds(w.cfg)
     global_pick = False
     scope = roadmap_only()
@@ -549,8 +548,20 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
-    for stage in round_stages(opts):
+    for stage in auto_stages():
         if not want(opts.only, stage):
+            continue
+        if stage == "roadmap":
+            if getattr(opts, "prs", ()) or sv.roadmap_backpressure:
+                continue
+            if global_pick and scope in (None, "auto") and not opts.dry_run:
+                all_areas = roadmap_areas(w.gh)
+                areas = [area for area in all_areas if area not in roadmap_skip()]
+                sv.roadmap_only = random.choice(areas) if areas else ("auto" if all_areas else "any")
+                log(f"Authoring roadmap: {sv.roadmap_only}")
+            rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
+            if rc is not None:
+                return rc
             continue
         for c in sv.kind(stage).actionable:
             if (
@@ -586,16 +597,6 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
                 f"(>= {sv.max_open_prs}) — backpressure, not authoring"
             )
-        if global_pick:
-            log("No available maintenance or reviews; proceeding to roadmap authoring")
-            if scope in (None, "auto") and not opts.dry_run:
-                all_areas = roadmap_areas(w.gh)
-                areas = [area for area in all_areas if area not in roadmap_skip()]
-                sv.roadmap_only = random.choice(areas) if areas else ("auto" if all_areas else "any")
-                log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
-        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
-        if rc is not None:
-            return rc
 
     scope = f"--only={','.join(opts.only) or '(all)'}"
     if targets:

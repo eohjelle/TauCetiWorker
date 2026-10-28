@@ -67,6 +67,7 @@ RUN_STDLIB=(
   fleet_capacity.py
   github_accounts.py
   github_failure_reason.py
+  git_identity.py
   github_ratelimit.py
   github_shared_transport.py
   github_cli_metadata.py
@@ -85,6 +86,7 @@ RUN_STDLIB=(
   ignore_quota_hardblock.py
   infra_failure_budget.py
   isolate_home_macos.py
+  isolate_home_elan.py
   isolate_home_paths.py
   kiro.py
   local_verification_scope.py

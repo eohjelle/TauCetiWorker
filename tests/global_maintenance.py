@@ -165,7 +165,7 @@ class GlobalMaintenance(unittest.TestCase):
         live = dict(state="OPEN", headRefOid=HEAD, isDraft=False, labels=[], author={"login": "science"})
         live.update(changes)
         self.w.gh.pr_view = lambda *_: dict(live)
-        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = work.MAX_FIX_ATTEMPTS
         self.w.rs = SimpleNamespace(
             gh_meta=lambda *a, **k: SimpleNamespace(
                 data={"head_sha": HEAD, "states": {"reuse": "blocking_request"}}, provenance="fresh"
@@ -206,7 +206,7 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertEqual(work._close_spent_pr(self.w, sv, c), 0)
         mutation.assert_called_once()
         self.w.claims.release.assert_called_once()
-        self.assertEqual(self.counter_values[f"fix-10-{HEAD[:12]}"], 3)
+        self.assertEqual(self.counter_values[f"fix-10-{HEAD[:12]}"], work.MAX_FIX_ATTEMPTS)
 
     def test_exhausted_closure_preserves_live_author_head_and_holds(self):
         for changes in (
@@ -243,7 +243,7 @@ class GlobalMaintenance(unittest.TestCase):
             row(10, "Topology"),
             row(15, "Geometry", contest={"id": 1, "rubric": "reuse"}),
         ]
-        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = work.MAX_FIX_ATTEMPTS
         _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (10, 20) else 0)
         self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20), ("fix", 30)])
         self.assertEqual(set(query.call_args.kwargs["stages"]), set(self.opts.only) - {"roadmap"})

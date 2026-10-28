@@ -237,10 +237,6 @@ PRUNE_OBSOLETE_LEAN_TOOLCHAINS = os.environ.get("TAUCETI_PRUNE_OBSOLETE_LEAN_TOO
     "yes",
 )
 
-# Persistent host-mode storage reserve. Environment overrides are parsed at the round boundary so
-# operators can tune dedicated workers without changing this default.
-HOST_MIN_FREE_BYTES = 8 * 1024**3
-
 # Completed worker transcripts and provider session histories are disposable after a useful debugging
 # window.  The active TauCeti session log is always protected; these limits are enforced only between
 # model rounds, when no Claude or Codex child is running.
