@@ -81,6 +81,15 @@ jobs:
           cache-suffix: build
       - name: Build the wheel
         run: uv build
+      - name: Check source and installed Tools pins agree
+        run: |
+          uv run python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          deps = tomllib.loads(Path("pyproject.toml").read_text())["project"]["dependencies"]
+          tools = next(dep for dep in deps if dep.startswith("tauceti-tools @"))
+          assert tools in Path("tauceti").read_text(), "source launcher has a different Tools pin"
+          PY
       # uv build proves the artifact builds; this proves the force-include mapping (prompts/ and
       # scripts/ into the tauceti_worker package) works once installed, and that the console script
       # runs. Run the import check from /tmp with -P so the source-tree tauceti_worker/ on the
