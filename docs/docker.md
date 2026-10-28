@@ -213,6 +213,10 @@ of duplicate copies and survive container replacement. Upstream's cache retentio
 expires unused shared entries after 72 hours and reclaims caches under disk pressure;
 see [cache retention](workers.md#shared-artifacts-and-storage-cleanup) for its thresholds and lifecycle.
 
+On small disks, set `TAUCETI_SHARED_ARTIFACTS=0` in `.env` to disable eager expansion
+of the shared artifact cache. Normal Lake downloads remain enabled; Lake decompresses
+artifacts when needed instead of preparing the whole expanded cache in advance.
+
 On a dedicated systemd host, install the bundled journal limits once:
 
 ```bash
