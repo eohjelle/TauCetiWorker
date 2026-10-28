@@ -189,6 +189,8 @@ jobs:
             'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_MIN_FREE_GIB"] == "8" and env["TAUCETI_LOG_RETENTION_DAYS"] == "14" and env["TAUCETI_LOG_MAX_MIB"] == "256"'
           docker compose config --format json | python3 -c \
             'import json, sys; env=json.load(sys.stdin)["services"]["tauceti"]["environment"]; assert env["TAUCETI_BUILD_CACHE_ROOT"] == "/opt/tauceti/state/build-cache"'
+          TAUCETI_SHARED_ARTIFACTS=0 docker compose config --format json | python3 -c \
+            'import json, sys; assert json.load(sys.stdin)["services"]["tauceti"]["environment"]["TAUCETI_SHARED_ARTIFACTS"] == "0"'
           test ! -e .env
           trap 'rm -f .env' EXIT
           printf '%s\n' 'TAUCETI_WORKER_ARGS=--help' 'TAUCETI_PACE=0:10,100:90' >.env
