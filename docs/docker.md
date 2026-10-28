@@ -199,15 +199,19 @@ unrelated temporary-file-producing work inside the same container.
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
 the worker runs `lake clean` between rounds to remove the root and every dependency
 build directory, then separately deletes `.lake/cache` and the worker's private
-`~/.cache/lake` artifact store, which Lake does not own. There
-is no independent artifact-cache size threshold. Dependency source checkouts and
-Mathlib's compressed download cache remain available, so the next authoring preflight
+`~/.cache/lake` artifact store, which Lake does not own. Dependency source checkouts and
+Mathlib's compressed download cache remain available after this cleanup, so the next authoring preflight
 can restore Mathlib and TauCeti outputs without compiling everything from source.
 
 After restoring both caches, the worker measures space again and refuses to launch an
 agent if less than the configured reserve remains. Cleanup logs the free space before
-and after cleaning, and preflight logs it again after restoration. The compressed
-Mathlib download cache itself is cleared only when TauCeti changes Lean toolchain.
+and after cleaning, and preflight logs it again after restoration.
+
+The shared build cache lives at `/opt/tauceti/state/build-cache`, alongside the private
+Lake cache on the existing `state` volume. Immutable artifacts use hard links instead
+of duplicate copies and survive container replacement. Upstream's cache retention also
+expires unused shared entries after 72 hours and reclaims caches under disk pressure;
+see [cache retention](workers.md#shared-artifacts-and-storage-cleanup) for its thresholds and lifecycle.
 
 On a dedicated systemd host, install the bundled journal limits once:
 
