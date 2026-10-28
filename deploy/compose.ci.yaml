@@ -1,0 +1,6 @@
+# GitHub-hosted Ubuntu runners also restrict nested sandbox mounts through AppArmor.
+# This override applies only to the disposable CI worker, not normal deployments.
+services:
+  tauceti:
+    security_opt:
+      - apparmor=unconfined
