@@ -240,7 +240,7 @@ with tempfile.TemporaryDirectory() as td:
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
-    cfg = SimpleNamespace(checkout=root / "checkout", state=root / "state", data_home=root / "home")
+    cfg = SimpleNamespace(wid="test", checkout=root / "checkout", state=root / "state", data_home=root / "home")
     cached = cfg.checkout / ".lake" / "cache" / "artifact"
     private_cache = cfg.data_home / ".cache" / "lake" / "artifact"
     mathlib = cfg.data_home / ".cache" / "mathlib" / "download"
@@ -265,6 +265,16 @@ with tempfile.TemporaryDirectory() as td:
         run.assert_called_once_with(["lake", "clean"], cwd=cfg.checkout, check=True)
     check("low-space cleanup deletes both private artifact stores", not cached.exists() and not private_cache.exists())
     check("Mathlib downloads remain available for restoration", mathlib.exists())
+    with patch.dict(os.environ, {"TAUCETI_LAKE_CACHE_ROOT": str(root / "lake-stores")}):
+        relocated = tc.agents.build_caches.lake_cache(cfg.wid, cfg.data_home) / "artifact"
+        write_allocated(relocated)
+        with (
+            patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "5"}),
+            patch.object(tc.storage.shutil, "disk_usage", return_value=SimpleNamespace(free=4 * gib)),
+            patch.object(tc.storage.subprocess, "run"),
+        ):
+            tc.storage.maintain_host_lake_storage(cfg, phase="relocated cache test")
+        check("low-space cleanup follows the managed Lake cache location", not relocated.exists())
     with patch.object(tc.storage.shutil, "disk_usage", return_value=SimpleNamespace(free=4 * gib)):
         try:
             tc.storage.verify_host_storage_headroom(cfg.checkout, {"TAUCETI_MIN_FREE_GIB": "5"}, phase="test")
@@ -293,6 +303,43 @@ with tempfile.TemporaryDirectory() as td:
         tc.storage.prune_obsolete_host_lean_toolchains(cfg)
         check("retained recovery work protects older toolchains", not run.called)
 
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    source = root / "unfinished.lean"
+    source.write_text("-- unfinished source\n")
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True) as proc:
+        with patch.object(tc.storage.shutil, "disk_usage", return_value=SimpleNamespace(free=4 * 1024**3)):
+            try:
+                with tc.storage.guard_host_storage(proc, root, {"TAUCETI_MIN_FREE_GIB": "5"}, interval=0.01):
+                    proc.wait(timeout=5)
+            except tc.NoProgress as error:
+                check("disk guard reports infrastructure pressure", "disk pressure" in str(error))
+            else:
+                check("disk guard reports infrastructure pressure", False)
+        check("disk guard terminates the owned subprocess", proc.returncode < 0)
+        check("disk guard preserves unfinished source", source.exists())
+    with (
+        patch.object(tc.storage.shutil, "disk_usage") as usage,
+        tc.storage.guard_host_storage(None, root, {}),
+    ):
+        usage.assert_not_called()
+    check("disk guard is opt-in", True)
+    with patch.object(tc.storage.shutil, "disk_usage", return_value=SimpleNamespace(free=4 * 1024**3)):
+        for label in ("agent", "cache download"):
+            env = {**os.environ, "TAUCETI_MIN_FREE_GIB": "5"}
+            argv = [sys.executable, "-c", "import time; time.sleep(30)"]
+            try:
+                if label == "agent":
+                    tc.agents.run_agent_proc(
+                        argv, env=env, cwd=root, logdir=root, label="guard-test", provider="deepseek"
+                    )
+                else:
+                    tc.agents._cache_fetch(argv, root, env, subprocess.DEVNULL, 5)
+            except tc.NoProgress:
+                check(f"{label} integrates the storage guard", True)
+            else:
+                check(f"{label} integrates the storage guard", False)
 
 journal_policy = (REPO / "deploy" / "tauceti-journald.conf").read_text()
 check("journald policy caps host logs", "SystemMaxUse=250M" in journal_policy)

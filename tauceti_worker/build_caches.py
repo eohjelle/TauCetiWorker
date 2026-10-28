@@ -69,6 +69,12 @@ def walk(root: Path, skip=None):
                 yield rel
 
 
+def lake_cache(wid: str, data_home: Path) -> Path:
+    """Keep each worker's mutable Lake store private, optionally on its checkout mount."""
+    root = os.environ.get("TAUCETI_LAKE_CACHE_ROOT")
+    return Path(root) / wid if root else data_home / ".cache" / "lake"
+
+
 def same_device(a: Path, b: Path) -> bool:
     """Do *a* and *b* live on one filesystem? Walks up to the nearest existing ancestor of each."""
 

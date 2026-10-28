@@ -87,6 +87,20 @@ def main():
         check("Lake's own store stays per-worker", Path(env["LAKE_CACHE_DIR"]).is_relative_to(data_home))
         check("returns the resolved mapping (for the log line)", resolved == {v: env[v] for v in CACHE_VARS})
 
+        clear(env)
+        env["TAUCETI_LAKE_CACHE_ROOT"] = "/srv/tauceti/checkouts/lake-cache"
+        try:
+            tc.agents.share_build_caches("worker1", data_home)
+            check(
+                "managed Lake cache can share the checkout mount",
+                env["LAKE_CACHE_DIR"] == "/srv/tauceti/checkouts/lake-cache/worker1",
+            )
+            env["LAKE_CACHE_DIR"] = "/operator/cache"
+            tc.agents.share_build_caches("worker1", data_home)
+            check("explicit Lake cache still wins", env["LAKE_CACHE_DIR"] == "/operator/cache")
+        finally:
+            env.pop("TAUCETI_LAKE_CACHE_ROOT")
+
         # An operator's own values win — the opt-out for a host with caches elsewhere, and for tests.
         clear(env)
         env["ELAN_HOME"] = "/mnt/big/elan"
@@ -176,7 +190,7 @@ def main():
         artifact.write_bytes(b"old")
         toolchain = checkout / "lean-toolchain"
         toolchain.write_text("leanprover/lean4:v4.34.0-rc1\n")
-        cfg = types.SimpleNamespace(checkout=checkout, state=state, data_home=data_home)
+        cfg = types.SimpleNamespace(wid="worker1", checkout=checkout, state=state, data_home=data_home)
         saved_lake = env.get("LAKE_CACHE_DIR")
         env["LAKE_CACHE_DIR"] = str(cache)
         messages = []

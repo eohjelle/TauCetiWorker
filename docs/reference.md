@@ -393,7 +393,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_VERIFY_CONTINUATION` | `1` | Set `0` to pause new mechanical verification continuations, preserving pending jobs and active helpers. |
 | `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
 | `TAUCETI_VERIFY_CACHE_DIR` | actual host identity under `/tmp` | Shared immutable-installation identity cache; no verification admission limit. Bubble mounts it automatically. |
-| `TAUCETI_MIN_FREE_GIB` | `8` | At a round boundary, run `lake clean` and remove `.lake/cache` below this filesystem reserve; verify the reserve again after restoring public caches. |
+| `TAUCETI_MIN_FREE_GIB` | `8` | At a round boundary, clean builds and private Lake artifacts below this filesystem reserve; check after restoration and stop running host authoring/download process groups below the reserve. |
 | `TAUCETI_CLEAN_ROUND_TMP` | unset (`1` in Compose) | Dedicated Docker workers only: give each loop round a private `TMPDIR`, removed after its process group exits. Other temporary directories and recovery work are preserved. |
 | `TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS` | `false` | On a dedicated host, remove official Lean toolchains no worker checkout requests; never remove custom or linked toolchains. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
@@ -401,6 +401,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
 | `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
+| `TAUCETI_LAKE_CACHE_ROOT` | unset (`/opt/tauceti/checkouts/lake-cache` in Compose) | Place managed private Lake caches at `<root>/<worker id>`, on the checkout mount for hard links. Explicit `LAKE_CACHE_DIR` takes precedence. |
 | `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |

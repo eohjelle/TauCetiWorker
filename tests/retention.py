@@ -156,6 +156,11 @@ class Retention(unittest.TestCase):
         retention.recycle(self.cfg, now=self.clock + retention.LIFETIME)
         self.assertFalse(cache.exists())
 
+    def test_managed_lake_cache_root_is_included(self):
+        root = self.root / "checkouts" / "lake-cache"
+        with patch.dict(os.environ, {"TAUCETI_LAKE_CACHE_ROOT": str(root)}):
+            self.assertIn((root / self.cfg.wid, root), retention.cache_roots(self.cfg))
+
     def test_legacy_generation_gets_one_grace_period(self):
         cache = self.cache()
         os.utime(cache, (0, 0))

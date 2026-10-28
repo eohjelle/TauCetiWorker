@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
-from .config import Config, Die, log
+from .config import Config, Die, NoProgress, log
 from .constants import AGENT_LOG_MAX_BYTES, AGENT_LOG_RETENTION_DAYS
 from .quota import claude_dir, codex_dir
 
@@ -81,13 +84,51 @@ def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
     if before >= _storage_reserve():
         return False
     subprocess.run(["lake", "clean"], cwd=cfg.checkout, check=True)
-    data_home = cfg.data_home
-    for cache in (cfg.checkout / ".lake" / "cache", data_home / ".cache" / "lake"):
+    from .build_caches import lake_cache
+
+    for cache in (cfg.checkout / ".lake" / "cache", lake_cache(cfg.wid, cfg.data_home)):
         if cache.is_dir() and not cache.is_symlink():
             shutil.rmtree(cache)
     after = shutil.disk_usage(cfg.checkout).free
     log(f"Lake storage cleanup {phase}: free space {before / 1024**3:.1f} -> {after / 1024**3:.1f} GiB")
     return True
+
+
+@contextlib.contextmanager
+def guard_host_storage(proc, checkout: Path | None, env: dict, *, interval: float = 1.0):
+    """Stop an owned build/agent group below the reserve; never delete live outputs."""
+    if checkout is None or "TAUCETI_MIN_FREE_GIB" not in env:
+        yield
+        return
+    reserve = int(env["TAUCETI_MIN_FREE_GIB"]) * 1024**3
+    if reserve <= 0:
+        raise Die("TAUCETI_MIN_FREE_GIB must be a positive integer")
+    finished = threading.Event()
+    reason = []
+
+    def monitor():
+        while not finished.wait(interval):
+            free = shutil.disk_usage(checkout).free
+            if free >= reserve or proc.poll() is not None:
+                continue
+            reason.append(f"disk pressure: {free / 1024**3:.1f} GiB free; {reserve / 1024**3:.0f} GiB required")
+            log(reason[0] + " — stopping process group; source edits are preserved")
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            if not finished.wait(2):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            return
+
+    thread = threading.Thread(target=monitor, daemon=True, name="storage-guard")
+    thread.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        thread.join()
+    if reason:
+        raise NoProgress(reason[0])
 
 
 def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:

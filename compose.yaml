@@ -39,8 +39,9 @@ services:
       TAUCETI_LOG_MAX_MIB: "${TAUCETI_LOG_MAX_MIB:-256}"
       # Each round gets a private TMPDIR, removed after its processes exit.
       TAUCETI_CLEAN_ROUND_TMP: "1"
-      # Hard-link immutable artifacts to the private Lake cache on this same mount.
-      TAUCETI_BUILD_CACHE_ROOT: /opt/tauceti/state/build-cache
+      # Cache and build outputs must share ONE mount: separate Docker mounts prevent hard links.
+      TAUCETI_LAKE_CACHE_ROOT: /opt/tauceti/checkouts/lake-cache
+      TAUCETI_BUILD_CACHE_ROOT: /opt/tauceti/checkouts/build-cache
       TAUCETI_SHARED_ARTIFACTS: "${TAUCETI_SHARED_ARTIFACTS:-1}"
     volumes:
       # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because

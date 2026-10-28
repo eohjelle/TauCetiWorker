@@ -173,7 +173,10 @@ def cache_roots(cfg):
         if not safe(home, cfg.home):
             return []
         anchor = home
-    return [(home / ".cache" / name, anchor) for name in ("lake", "mathlib")]
+    roots = [(home / ".cache" / name, anchor) for name in ("lake", "mathlib")]
+    if root := os.environ.get("TAUCETI_LAKE_CACHE_ROOT"):
+        roots.append((Path(root) / cfg.wid, Path(root)))
+    return roots
 
 
 def merge_report(report, result):

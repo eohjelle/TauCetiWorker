@@ -56,6 +56,7 @@ from .quota import (
 from .review_diagnostics import failure_summary
 from .runtime_status import report_failure
 from .storage import (
+    guard_host_storage,
     maintain_host_lake_storage,
     maintain_mathlib_download_cache,
     prune_obsolete_host_lean_toolchains,
@@ -563,7 +564,7 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
     main would erase the cache every round.  The first observation only seeds the marker, so enabling
     this policy does not unexpectedly discard an established store.
 
-    Only the default per-worker path is ours to delete.  An explicit ``LAKE_CACHE_DIR`` can name an
+    Only the managed per-worker path is ours to delete. An explicit ``LAKE_CACHE_DIR`` can name an
     operator-managed or shared store, and is therefore reported but left untouched.
     """
     import hashlib
@@ -592,7 +593,7 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
         return
 
     old_label = str(previous.get("toolchain") or previous["sha256"][:12])
-    owned_cache = cfg.data_home / ".cache" / "lake"
+    owned_cache = build_caches.lake_cache(cfg.wid, cfg.data_home)
     configured_cache = Path(os.environ.get("LAKE_CACHE_DIR") or owned_cache)
     same_path = os.path.abspath(configured_cache) == os.path.abspath(owned_cache)
     if not same_path or configured_cache.is_symlink():
@@ -1124,6 +1125,7 @@ def run_agent_proc(
         except OSError as error:
             raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
         assert proc.stdout is not None
+        stack.enter_context(guard_host_storage(proc, cwd, env))
         finished = threading.Event()
 
         def cancel_on_lease_loss():
@@ -1427,7 +1429,8 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
     sweep = True
     try:
         try:
-            return proc.wait(timeout=timeout)
+            with guard_host_storage(proc, cwd, env):
+                return proc.wait(timeout=timeout)
         except BaseException:
             sweep = False
             with contextlib.suppress(ProcessLookupError):
@@ -2751,9 +2754,10 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
 
     Lake's cache is NOT shared, even though it normally sits under the toolchain directory and would
     otherwise follow `ELAN_HOME` there. It is written throughout a build rather than once at install,
-    and that its concurrent writers are safe is not established; `LAKE_CACHE_DIR` therefore stays in
-    the worker's own data root. That also keeps a per-worker experiment with `LAKE_ARTIFACT_CACHE`
-    honest, since the store it fills is then that worker's alone.
+    and that its concurrent writers are safe is not established; `LAKE_CACHE_DIR` therefore stays
+    per-worker. `TAUCETI_LAKE_CACHE_ROOT` places these stores on the checkout mount so artifacts
+    can be hard-linked; otherwise they live in the worker's data root. This keeps a per-worker
+    `LAKE_ARTIFACT_CACHE` experiment honest, since the store it fills is that worker's alone.
 
     Mathlib's `.ltar` cache also stays per-worker — as the download target. `lake exe cache get` takes
     no lock and, in any checkout older than mathlib4#42752, writes fixed-name temporaries, so pointing
@@ -2769,7 +2773,7 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
     pin_root(os.environ)
     os.environ.setdefault("ELAN_HOME", str(build_caches.elan_pool(host)))
     os.environ.setdefault("MATHLIB_CACHE_DIR", str(data_home / ".cache" / "mathlib"))
-    os.environ.setdefault("LAKE_CACHE_DIR", str(data_home / ".cache" / "lake"))
+    os.environ.setdefault("LAKE_CACHE_DIR", str(build_caches.lake_cache(wid, data_home)))
     return {var: os.environ[var] for var in ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR")}
 
 
