@@ -1,0 +1,4 @@
+abi <abi/4.0>,
+profile tauceti-ci flags=(unconfined) {
+  userns,
+}
