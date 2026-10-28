@@ -2149,6 +2149,7 @@ class Fixture(unittest.TestCase):
             patch.object(agents, "CHECKOUT_URL", str(self.remote)),
             patch.object(agents, "sync_mathlib_pool"),
             patch.object(agents, "clean_lake_cache_after_toolchain_bump"),
+            patch.object(agents, "git_author_identity", return_value=("fixture", "fixture@example.com")),
         ):
             self.assertTrue(agents.prepare_checkout(self.cfg, work="fix", pr=11))
         self.assertIsNone(saved.source_receipt(self.record, self.journal()["handoff"]))
@@ -2340,6 +2341,7 @@ class Fixture(unittest.TestCase):
             patch.object(agents, "CHECKOUT_URL", str(self.remote)),
             patch.object(agents, "sync_mathlib_pool"),
             patch.object(agents, "clean_lake_cache_after_toolchain_bump"),
+            patch.object(agents, "git_author_identity", return_value=("fixture", "fixture@example.com")),
         ):
             self.assertTrue(agents.prepare_checkout(self.cfg, work="fix", pr=11))
         with (
