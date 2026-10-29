@@ -210,6 +210,9 @@ host authoring processes are also checked every second while running. If free sp
 falls below the reserve, their process group is stopped, without deleting source edits
 or live build files. Normal cleanup runs at the next quiescent round boundary.
 
+Overlap surveys retain the current source snapshot and any older versions leased by
+live reader processes. Unused versions are removed on the next snapshot request.
+
 The shared build cache lives at `/opt/tauceti/checkouts/build-cache`. It, the private
 Lake cache, and checkout build outputs all use the same `checkouts` mount. Lake can
 therefore hard-link binary artifacts instead of making duplicate copies; separate
