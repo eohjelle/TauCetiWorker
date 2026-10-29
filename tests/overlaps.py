@@ -25,6 +25,44 @@ from tauceti_worker.transcript import AgentTranscriptRenderer
 
 
 class CacheTests(unittest.TestCase):
+    def test_snapshots_collect_unused_versions_without_waiting_a_day(self):
+        from tauceti_worker import overlap_support as support
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for sha in ("current", "live", "dead", "unused"):
+                tree = base / "snapshots-v2" / sha
+                tree.mkdir(parents=True)
+                (tree / "source.lean").write_text("-- read-only source")
+                tree.chmod(0o555)
+            support.atomic(base / "leases" / "101-live.json", {"sha": "live"})
+            support.atomic(base / "leases" / "102-dead.json", {"sha": "dead"})
+
+            def probe(pid, _signal):
+                if pid == 102:
+                    raise ProcessLookupError
+                if pid == 101:
+                    raise PermissionError
+
+            with patch.object(support.os, "getpid", return_value=103), patch.object(support.os, "kill", probe):
+                support._pin_snapshot(base, "current")
+            self.assertEqual({p.name for p in (base / "snapshots-v2").iterdir()}, {"current", "live"})
+            self.assertFalse((base / "leases" / "102-dead.json").exists())
+            for tree in (base / "snapshots-v2").iterdir():
+                support._remove_snapshot(tree)
+
+    def test_one_process_can_hold_two_snapshot_versions(self):
+        from tauceti_worker import overlap_support as support
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "snapshots-v2" / "first").mkdir(parents=True)
+            support._pin_snapshot(base, "first")
+            (base / "snapshots-v2" / "second").mkdir()
+            support._pin_snapshot(base, "second")
+            self.assertEqual({p.name for p in (base / "snapshots-v2").iterdir()}, {"first", "second"})
+            self.assertEqual(len(list((base / "leases").glob("*.json"))), 2)
+
     def test_fresh_read_and_credential_boundary(self):
         from tauceti_worker import overlap_support as support
 
