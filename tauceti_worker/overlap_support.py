@@ -161,6 +161,28 @@ def _remove_snapshot(target: Path):
         shutil.rmtree(target)
 
 
+def _pin_snapshot(base: Path, sha: str):
+    """Keep every version held by a live caller; immediately collect unused versions.
+
+    The caller holds fetch.lock while publishing its lease and collecting old trees.
+    One process may still be reading an earlier snapshot when it requests a newer one.
+    """
+    atomic(base / "leases" / f"{os.getpid()}-{sha}.json", {"sha": sha})
+    pins = {sha}
+    for lease in (base / "leases").glob("*.json"):
+        try:
+            os.kill(int(lease.stem.split("-")[0]), 0)
+        except ProcessLookupError:
+            lease.unlink(missing_ok=True)
+            continue
+        except PermissionError:
+            pass  # A process we cannot signal is still a live reader.
+        pins.add(json.loads(lease.read_text())["sha"])
+    for old in (base / "snapshots-v2").iterdir():
+        if old.name not in pins:
+            _remove_snapshot(old)
+
+
 def snapshot(repo: str, *, ttl: int = 3600) -> Path | None:
     key = hashlib.sha256(repo.encode()).hexdigest()
     base = root() / "overlap" / "repositories" / key
@@ -224,18 +246,5 @@ def snapshot(repo: str, *, ttl: int = 3600) -> Path | None:
                 temporary.rename(target)
             finally:
                 _remove_snapshot(temporary)
-        # Process leases pin old versions across a refresh. GC only removes unpinned day-old trees.
-        atomic(base / "leases" / (str(os.getpid()) + ".json"), {"sha": state["sha"], "time": time.time()})
-        pins = {state["sha"]}
-        for lease in (base / "leases").glob("*.json"):
-            try:
-                os.kill(int(lease.stem), 0)
-                pins.add(json.loads(lease.read_text())["sha"])
-            except (ProcessLookupError, ValueError, OSError):
-                lease.unlink(missing_ok=True)
-        for old in target.parent.iterdir():
-            if old.name not in pins and time.time() - old.stat().st_mtime > 86400:
-                for directory, _, _ in os.walk(old):
-                    Path(directory).chmod(0o700)
-                shutil.rmtree(old)
+        _pin_snapshot(base, state["sha"])
         return target
