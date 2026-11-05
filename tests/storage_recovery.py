@@ -69,8 +69,9 @@ class StorageRecovery(unittest.TestCase):
         called = threading.Event()
         cfg = SimpleNamespace(state=self.root / "state/docker")
 
-        def housekeeping(root):
+        def housekeeping(root, **budgets):
             self.assertEqual(root, cfg.state.parent)
+            self.assertEqual(budgets, dict(seconds=2, entries=16384, bytes=1024**3))
             called.set()
             return {"removed_bytes": 0}
 
