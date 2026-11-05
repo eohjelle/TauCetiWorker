@@ -35,6 +35,8 @@ services:
       TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "true"
       # Low-space cleanup runs only between model rounds, before an agent can touch Lake outputs.
       TAUCETI_MIN_FREE_GIB: "${TAUCETI_MIN_FREE_GIB:-8}"
+      # State stays on the physical disk when checkouts use a compressed/sparse filesystem.
+      TAUCETI_STORAGE_GUARD_PATH: /opt/tauceti/state
       TAUCETI_LOG_RETENTION_DAYS: "${TAUCETI_LOG_RETENTION_DAYS:-14}"
       TAUCETI_LOG_MAX_MIB: "${TAUCETI_LOG_MAX_MIB:-256}"
       # Each round gets a private TMPDIR, removed after its processes exit.

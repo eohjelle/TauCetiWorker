@@ -76,6 +76,15 @@ def _storage_reserve() -> int:
     return _configured_positive_int("TAUCETI_MIN_FREE_GIB", 8, unit="GiB") * 1024**3
 
 
+def host_storage_free(checkout: Path, env=None) -> int:
+    """A thin/compressed build filesystem must also preserve its physical backing disk."""
+    env = os.environ if env is None else env
+    paths = [checkout]
+    if backing := env.get("TAUCETI_STORAGE_GUARD_PATH"):
+        paths.append(Path(backing))
+    return min(shutil.disk_usage(path).free for path in paths)
+
+
 def start_host_storage_maintenance(cfg: Config):
     """Standalone Docker loops run recovery housekeeping even while quota blocks rounds."""
     if "TAUCETI_MIN_FREE_GIB" not in os.environ:
@@ -122,7 +131,7 @@ def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
     """Clean a quiescent checkout's builds and private Lake caches below the free-space reserve."""
     if "TAUCETI_MIN_FREE_GIB" not in os.environ or not cfg.checkout.is_dir():
         return False
-    before = shutil.disk_usage(cfg.checkout).free
+    before = host_storage_free(cfg.checkout)
     if before >= _storage_reserve():
         return False
     clean_lake_outputs(cfg.checkout)
@@ -134,7 +143,7 @@ def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
     remove(cache, cache.parent, report)
     if report["errors"] or report["protected"]:
         raise NoProgress(f"Lake cache cleanup incomplete: {report['errors'] or report['protected']}")
-    after = shutil.disk_usage(cfg.checkout).free
+    after = host_storage_free(cfg.checkout)
     log(f"Lake storage cleanup {phase}: free space {before / 1024**3:.1f} -> {after / 1024**3:.1f} GiB")
     return True
 
@@ -153,7 +162,7 @@ def guard_host_storage(proc, checkout: Path | None, env: dict, *, interval: floa
 
     def monitor():
         while not finished.wait(interval):
-            free = shutil.disk_usage(checkout).free
+            free = host_storage_free(checkout, env)
             if free >= reserve or proc.poll() is not None:
                 continue
             reason.append(f"disk pressure: {free / 1024**3:.1f} GiB free; {reserve / 1024**3:.0f} GiB required")
@@ -221,7 +230,7 @@ def verify_host_storage_headroom(checkout: Path, env: dict, *, phase: str) -> No
     reserve = int(env["TAUCETI_MIN_FREE_GIB"]) * 1024**3
     if reserve <= 0:
         raise Die("TAUCETI_MIN_FREE_GIB must be a positive integer")
-    free = shutil.disk_usage(checkout).free
+    free = host_storage_free(checkout, env)
     log(f"host storage {phase}: {free / 1024**3:.1f} GiB free (floor {reserve / 1024**3:.0f} GiB)")
     if free < reserve:
         raise BuildCacheUnavailable(

@@ -204,6 +204,15 @@ Mathlib's compressed download cache remain available after this cleanup, so the 
 can restore Mathlib and TauCeti outputs without compiling everything from source.
 Cleanup never invokes Lean or Elan, so it cannot download a toolchain. The same configured
 reserve governs cleanup, admission and recovery from a low-space pause.
+`TAUCETI_STORAGE_GUARD_PATH=/opt/tauceti/state` also checks the physical backing disk
+when the checkout volume uses a sparse, compressed filesystem. Both filesystems must
+remain above the reserve; free space inside a sparse image is not physical headroom.
+
+For a storage-constrained host, the `checkouts` volume can be mounted on Btrfs with
+`compress=zstd:3`. Keep the checkout, private Lake store and shared build cache on that
+same mount so artifact hard links remain possible. Keep `state` on the backing disk.
+The mount must be a prerequisite of Docker startup: Docker must not silently create
+a fresh checkout on the underlying directory if the mount is unavailable.
 
 The standalone loop runs bounded recovery housekeeping every 30 seconds, including during
 quota waits. Retained checkouts are collected after their users exit: generated caches

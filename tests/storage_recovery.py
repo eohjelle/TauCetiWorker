@@ -96,6 +96,21 @@ class StorageRecovery(unittest.TestCase):
         with patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "3"}):
             self.assertFalse(storage.maintain_host_lake_storage(cfg, phase="first round"))
 
+    def test_compressed_volume_cannot_hide_physical_disk_pressure(self):
+        backing = self.root / "physical"
+        env = {"TAUCETI_MIN_FREE_GIB": "3", "TAUCETI_STORAGE_GUARD_PATH": str(backing)}
+        gib = 1024**3
+        with patch.object(
+            storage.shutil,
+            "disk_usage",
+            side_effect=lambda path: SimpleNamespace(free=(2 if path == backing else 40) * gib),
+        ):
+            self.assertEqual(storage.host_storage_free(self.checkout, env), 2 * gib)
+            from tauceti_worker.agents import BuildCacheUnavailable
+
+            with self.assertRaisesRegex(BuildCacheUnavailable, "2.0 GiB"):
+                storage.verify_host_storage_headroom(self.checkout, env, phase="compressed volume")
+
     def test_round_reclaims_space_before_admission_can_block_it(self):
         cfg = SimpleNamespace(state=self.root / "state/docker", checkout=self.checkout)
         events = []
