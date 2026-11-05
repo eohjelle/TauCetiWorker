@@ -36,6 +36,7 @@ from .quota import Provider, Quota, _hours, _unavail_reason, claude_usage_creden
 from .quota_wait import QuotaWait
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
+from .storage import start_host_storage_maintenance
 
 
 class _LoopTerminated(KeyboardInterrupt):
@@ -118,6 +119,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(DRAIN_SIGNAL, request_drain)
+    maintenance = start_host_storage_maintenance(cfg)
     try:
         while True:
             if drain["requested"]:
@@ -430,6 +432,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         log("loop interrupted — stopping")
         return 130
     finally:
+        if maintenance is not None:
+            stopping, thread = maintenance
+            stopping.set()
+            thread.join(timeout=35)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(DRAIN_SIGNAL, previous_drain)
