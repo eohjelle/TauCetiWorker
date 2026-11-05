@@ -214,8 +214,9 @@ same mount so artifact hard links remain possible. Keep `state` on the backing d
 The mount must be a prerequisite of Docker startup: Docker must not silently create
 a fresh checkout on the underlying directory if the mount is unavailable.
 
-The standalone loop runs bounded recovery housekeeping every 30 seconds, including during
-quota waits. Retained checkouts are collected after their users exit: generated caches
+The standalone loop runs recovery housekeeping every 30 seconds, in batches bounded by
+two seconds, 16,384 entries and 1 GiB, including during quota waits.
+Retained checkouts are collected after their users exit: generated caches
 are discarded and unfinished sources are saved in recovery records before checkout removal.
 Live readers, verification references and recovery locks prevent premature cleanup.
 
