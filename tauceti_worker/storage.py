@@ -191,9 +191,14 @@ def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
 
     if not PRUNE_OBSOLETE_LEAN_TOOLCHAINS:
         return
-    # Idle recovery source records retain lean-toolchain and can download it again when resumed.
-    # Only current worker checkouts and live toolchain users require installed copies.
+    # Archived source records do not pin installations, but materialized retryable work does.
+    from .runtime_status import read_json
+
     files = {cfg.checkout / "lean-toolchain", *cfg.checkout.parent.parent.glob("*/TauCeti/lean-toolchain")}
+    for toolchain in cfg.state.glob("recovery/*/checkout/lean-toolchain"):
+        state = read_json(toolchain.parent.parent / "recovery.json").get("state")
+        if state in {"eligible", "resuming", "verified", "publication-pending"}:
+            files.add(toolchain)
     required = {path.read_text().strip() for path in files if path.is_file()}
     if not required:
         return
