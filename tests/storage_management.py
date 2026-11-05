@@ -262,7 +262,7 @@ with tempfile.TemporaryDirectory() as td:
         patch.object(tc.storage.subprocess, "run") as run,
     ):
         check("low free space cleans Lake outputs", tc.storage.maintain_host_lake_storage(cfg, phase="test"))
-        run.assert_called_once_with(["lake", "clean"], cwd=cfg.checkout, check=True)
+        run.assert_not_called()  # Cleaning must never install a missing Lean toolchain.
     check("low-space cleanup deletes both private artifact stores", not cached.exists() and not private_cache.exists())
     check("Mathlib downloads remain available for restoration", mathlib.exists())
     with patch.dict(os.environ, {"TAUCETI_LAKE_CACHE_ROOT": str(root / "lake-stores")}):
@@ -301,7 +301,11 @@ with tempfile.TemporaryDirectory() as td:
         write_allocated(cfg.state / "recovery" / "unfinished")
         run.reset_mock()
         tc.storage.prune_obsolete_host_lean_toolchains(cfg)
-        check("retained recovery work protects older toolchains", not run.called)
+        check("idle recovery records do not pin installed toolchains forever", run.call_count == 2)
+        run.reset_mock()
+        with patch("tauceti_worker.work_recovery.live_users", return_value=["active Lean process"]):
+            tc.storage.prune_obsolete_host_lean_toolchains(cfg)
+        check("live toolchain users prevent uninstall", run.call_count == 1)
 
 
 with tempfile.TemporaryDirectory() as td:

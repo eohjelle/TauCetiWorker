@@ -76,19 +76,64 @@ def _storage_reserve() -> int:
     return _configured_positive_int("TAUCETI_MIN_FREE_GIB", 8, unit="GiB") * 1024**3
 
 
+def start_host_storage_maintenance(cfg: Config):
+    """Standalone Docker loops run recovery housekeeping even while quota blocks rounds."""
+    if "TAUCETI_MIN_FREE_GIB" not in os.environ:
+        return None
+    from .work_recovery import housekeep
+
+    stopping = threading.Event()
+
+    def run():
+        while not stopping.is_set():
+            try:
+                result = housekeep(cfg.state.parent)
+                if result.get("removed_bytes", 0):
+                    log(f"recovery storage cleanup: reclaimed {result['removed_bytes'] / 1024**2:.1f} MiB")
+            except Exception as error:
+                log(f"warning: recovery storage cleanup failed: {error}")
+            stopping.wait(30)
+
+    thread = threading.Thread(target=run, name="recovery-storage", daemon=True)
+    thread.start()
+    return stopping, thread
+
+
+def clean_lake_outputs(checkout: Path) -> None:
+    """Remove generated outputs without invoking Elan or downloading a missing toolchain."""
+    from .retention import fresh_report, remove
+    from .work_recovery import live_users
+
+    if live_users(checkout):
+        raise NoProgress("Lake cleanup incomplete: checkout still has live users")
+    report = fresh_report()
+    packages = checkout / ".lake" / "packages"
+    roots = [checkout]
+    if packages.is_dir() and not packages.is_symlink():
+        roots.extend(path for path in packages.iterdir() if path.is_dir() and not path.is_symlink())
+    for root in roots:
+        for name in ("build", "cache"):
+            remove(root / ".lake" / name, checkout, report)
+    if report["errors"] or report["protected"]:
+        raise NoProgress(f"Lake cleanup incomplete: {report['errors'] or report['protected']}")
+
+
 def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
     """Clean a quiescent checkout's builds and private Lake caches below the free-space reserve."""
-    if "TAUCETI_MIN_FREE_GIB" not in os.environ:
+    if "TAUCETI_MIN_FREE_GIB" not in os.environ or not cfg.checkout.is_dir():
         return False
     before = shutil.disk_usage(cfg.checkout).free
     if before >= _storage_reserve():
         return False
-    subprocess.run(["lake", "clean"], cwd=cfg.checkout, check=True)
+    clean_lake_outputs(cfg.checkout)
     from .build_caches import lake_cache
+    from .retention import fresh_report, remove
 
-    for cache in (cfg.checkout / ".lake" / "cache", lake_cache(cfg.wid, cfg.data_home)):
-        if cache.is_dir() and not cache.is_symlink():
-            shutil.rmtree(cache)
+    cache = lake_cache(cfg.wid, cfg.data_home)
+    report = fresh_report()
+    remove(cache, cache.parent, report)
+    if report["errors"] or report["protected"]:
+        raise NoProgress(f"Lake cache cleanup incomplete: {report['errors'] or report['protected']}")
     after = shutil.disk_usage(cfg.checkout).free
     log(f"Lake storage cleanup {phase}: free space {before / 1024**3:.1f} -> {after / 1024**3:.1f} GiB")
     return True
@@ -137,10 +182,8 @@ def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
 
     if not PRUNE_OBSOLETE_LEAN_TOOLCHAINS:
         return
-    # Retained work can need older toolchains even when canonical main has moved on.
-    recovery = (cfg.state / "recovery", cfg.state / "verification-pending", cfg.checkout.parent / "retained-checkouts")
-    if any(path.is_dir() and any(path.iterdir()) for path in recovery):
-        return
+    # Idle recovery source records retain lean-toolchain and can download it again when resumed.
+    # Only current worker checkouts and live toolchain users require installed copies.
     files = {cfg.checkout / "lean-toolchain", *cfg.checkout.parent.parent.glob("*/TauCeti/lean-toolchain")}
     required = {path.read_text().strip() for path in files if path.is_file()}
     if not required:
@@ -154,10 +197,17 @@ def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
                 return
         except OSError:
             continue
+    from .work_recovery import live_users
+
     for line in listed.stdout.splitlines():
         name = line.split()[0] if line.split() else ""
         installation = root / name.replace("/", "--").replace(":", "---")
-        if name.startswith("leanprover/lean4:") and name not in required and not installation.is_symlink():
+        if (
+            name.startswith("leanprover/lean4:")
+            and name not in required
+            and not installation.is_symlink()
+            and not live_users(installation)
+        ):
             subprocess.run(["elan", "toolchain", "uninstall", name], check=True)
             log(f"uninstalled obsolete Lean toolchain {name}")
 
