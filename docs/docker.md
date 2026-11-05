@@ -202,7 +202,9 @@ quiescent round boundary, then deletes `.lake/cache` and the worker's private
 artifact store under `/opt/tauceti/checkouts/lake-cache`. Dependency source checkouts and
 Mathlib's compressed download cache remain available after this cleanup, so the next authoring preflight
 can restore Mathlib and TauCeti outputs without compiling everything from source.
-Cleanup never invokes Lean or Elan, so it cannot download a toolchain. The same configured
+The same cleanup covers idle recovery checkouts, keeping their saved source and Git history.
+Recovery locks and live users protect active work. Cleanup never invokes Lean or Elan,
+so it cannot download a toolchain. The same configured
 reserve governs cleanup, admission and recovery from a low-space pause.
 `TAUCETI_STORAGE_GUARD_PATH=/opt/tauceti/state` also checks the physical backing disk
 when the checkout volume uses a sparse, compressed filesystem. Both filesystems must
