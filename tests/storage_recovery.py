@@ -65,6 +65,30 @@ class StorageRecovery(unittest.TestCase):
                 storage.clean_lake_outputs(self.checkout)
         self.assertTrue(output.exists())
 
+    def test_low_space_cleans_idle_recovery_builds_but_not_sources_or_live_work(self):
+        cfg = SimpleNamespace(
+            checkout=self.checkout, state=self.root / "state", data_home=self.root / "home", wid="test"
+        )
+        checkouts = {name: cfg.state / "recovery" / name / "checkout" for name in ("idle", "live", "locked")}
+        for checkout in checkouts.values():
+            (checkout / ".lake/build").mkdir(parents=True)
+            (checkout / ".lake/build/output").write_text("generated")
+            (checkout / "Draft.lean").write_text("unfinished source")
+        gib = 1024**3
+        with (
+            patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "3"}),
+            patch.object(storage, "host_storage_free", side_effect=[2 * gib, 10 * gib]),
+            patch("tauceti_worker.build_caches.lake_cache", return_value=self.root / "lake-cache/test"),
+            patch.object(
+                work_recovery, "live_users", side_effect=lambda p: ["verifier"] if p == checkouts["live"] else []
+            ),
+            retention.locked(checkouts["locked"].parent / "recovery.lock"),
+        ):
+            self.assertTrue(storage.maintain_host_lake_storage(cfg, phase="test"))
+        self.assertFalse((checkouts["idle"] / ".lake/build").exists())
+        self.assertTrue(all((checkout / "Draft.lean").exists() for checkout in checkouts.values()))
+        self.assertTrue(all((checkouts[name] / ".lake/build/output").exists() for name in ("live", "locked")))
+
     def test_housekeeping_runs_without_rounds_and_stops_cleanly(self):
         called = threading.Event()
         cfg = SimpleNamespace(state=self.root / "state/docker")
