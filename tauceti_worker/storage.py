@@ -136,7 +136,17 @@ def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
         return False
     clean_lake_outputs(cfg.checkout)
     from .build_caches import lake_cache
-    from .retention import fresh_report, remove
+    from .retention import fresh_report, locked, remove
+    from .work_recovery import live_users
+
+    # Recovery uses independent checkouts; their old builds must not strand the main loop.
+    for checkout in cfg.state.glob("recovery/*/checkout"):
+        if checkout.is_symlink() or checkout.parent.is_symlink():
+            continue
+        with contextlib.suppress(BlockingIOError):
+            with locked(checkout.parent / "recovery.lock"):
+                if not live_users(checkout):
+                    clean_lake_outputs(checkout)
 
     cache = lake_cache(cfg.wid, cfg.data_home)
     report = fresh_report()
