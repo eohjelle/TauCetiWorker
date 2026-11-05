@@ -268,9 +268,10 @@ Elan's executable and proxies remain image-owned, while only downloaded Lean too
 are persisted. This avoids baking a TauCeti version into the image, lets each checkout's
 `lean-toolchain` file remain authoritative, and prevents container replacement from
 re-downloading a multi-gigabyte toolchain. On this dedicated deployment, obsolete official
-toolchains are removed once no current worker checkout requests them and no process uses
-them. Idle recovery records preserve their `lean-toolchain` selection, not an installed
-copy; resuming old work can download its toolchain again.
+toolchains are removed once no current worker or materialized retryable recovery checkout
+requests them and no process uses them. Archived recovery records preserve their
+`lean-toolchain` selection, not an installed copy; restoring archived work can download
+its toolchain again.
 
 The refreshers check once a minute, renew within 90 minutes of expiry, avoid rotating
 more than once per 10 minutes, and back off to 15 minutes after errors. Advanced
