@@ -96,7 +96,7 @@ def start_host_storage_maintenance(cfg: Config):
     def run():
         while not stopping.is_set():
             try:
-                result = housekeep(cfg.state.parent)
+                result = housekeep(cfg.state.parent, seconds=2, entries=16384, bytes=1024**3)
                 if result.get("removed_bytes", 0):
                     log(f"recovery storage cleanup: reclaimed {result['removed_bytes'] / 1024**2:.1f} MiB")
             except Exception as error:
