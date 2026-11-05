@@ -302,6 +302,16 @@ with tempfile.TemporaryDirectory() as td:
         run.reset_mock()
         tc.storage.prune_obsolete_host_lean_toolchains(cfg)
         check("idle recovery records do not pin installed toolchains forever", run.call_count == 2)
+        recovery = cfg.state / "recovery" / "active"
+        write_allocated(recovery / "checkout" / "lean-toolchain", "leanprover/lean4:v4.old\n")
+        write_allocated(recovery / "recovery.json", '{"state":"eligible"}')
+        run.reset_mock()
+        tc.storage.prune_obsolete_host_lean_toolchains(cfg)
+        check("materialized pending recovery retains its toolchain between retries", run.call_count == 1)
+        write_allocated(recovery / "recovery.json", '{"state":"obsolete"}')
+        run.reset_mock()
+        tc.storage.prune_obsolete_host_lean_toolchains(cfg)
+        check("completed recovery no longer pins its toolchain", run.call_count == 2)
         run.reset_mock()
         with patch("tauceti_worker.work_recovery.live_users", return_value=["active Lean process"]):
             tc.storage.prune_obsolete_host_lean_toolchains(cfg)
