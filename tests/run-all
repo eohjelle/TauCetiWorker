@@ -41,6 +41,7 @@ RUN_STDLIB=(
   usage_supervisor.py
   expanded_cache.py
   cache_storage.py
+  storage_recovery.py
   local_lint.py
   shared_mathlib.py
   agent_cmds.py

@@ -18,7 +18,11 @@ MIN_PRIVATE_RECLAIM = 256 * 1024**2
 
 
 def headroom(total, fraction):
-    """Percentage thresholds on small disks, bounded free-byte reserves on fleet disks."""
+    """Use the explicit host reserve, otherwise percentage thresholds capped for fleet disks."""
+    if "TAUCETI_MIN_FREE_GIB" in os.environ:
+        from .storage import _storage_reserve
+
+        return _storage_reserve()
     ceiling = {CRITICAL: 20, LOW: 40, TARGET: 60}[fraction] * 1024**3
     return min(int(total * fraction), ceiling)
 

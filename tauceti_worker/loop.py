@@ -34,6 +34,7 @@ from .github import github_budget
 from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
+from .storage import start_host_storage_maintenance
 
 
 class _LoopTerminated(KeyboardInterrupt):
@@ -119,6 +120,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         raise _LoopTerminated
 
     signal.signal(signal.SIGTERM, terminate)
+    maintenance = start_host_storage_maintenance(cfg)
     try:
         while True:
             from .config import rotate_console_log
@@ -446,6 +448,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         from .verification_jobs import stop_continuations
 
         stop_continuations(cfg)
+        if maintenance is not None:
+            stopping, thread = maintenance
+            stopping.set()
+            thread.join(timeout=35)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
 

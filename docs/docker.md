@@ -197,11 +197,18 @@ use the persistent checkout or state directory instead. Do not run a second work
 unrelated temporary-file-producing work inside the same container.
 
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
-the worker runs `lake clean` between rounds to remove the root and every dependency
-build directory, then separately deletes `.lake/cache` and the worker's private
+the worker directly removes the root and dependency `.lake/build` directories at a
+quiescent round boundary, then deletes `.lake/cache` and the worker's private
 artifact store under `/opt/tauceti/checkouts/lake-cache`. Dependency source checkouts and
 Mathlib's compressed download cache remain available after this cleanup, so the next authoring preflight
 can restore Mathlib and TauCeti outputs without compiling everything from source.
+Cleanup never invokes Lean or Elan, so it cannot download a toolchain. The same configured
+reserve governs cleanup, admission and recovery from a low-space pause.
+
+The standalone loop runs bounded recovery housekeeping every 30 seconds, including during
+quota waits. Retained checkouts are collected after their users exit: generated caches
+are discarded and unfinished sources are saved in recovery records before checkout removal.
+Live readers, verification references and recovery locks prevent premature cleanup.
 
 After restoring both caches, the worker measures space again and refuses to launch an
 agent if less than the configured reserve remains. Cleanup logs the free space before
@@ -251,8 +258,9 @@ Elan's executable and proxies remain image-owned, while only downloaded Lean too
 are persisted. This avoids baking a TauCeti version into the image, lets each checkout's
 `lean-toolchain` file remain authoritative, and prevents container replacement from
 re-downloading a multi-gigabyte toolchain. On this dedicated deployment, obsolete official
-toolchains are removed once no worker checkout requests them and no retained recovery
-work could still require them.
+toolchains are removed once no current worker checkout requests them and no process uses
+them. Idle recovery records preserve their `lean-toolchain` selection, not an installed
+copy; resuming old work can download its toolchain again.
 
 The refreshers check once a minute, renew within 90 minutes of expiry, avoid rotating
 more than once per 10 minutes, and back off to 15 minutes after errors. Advanced

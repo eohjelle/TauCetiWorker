@@ -138,6 +138,25 @@ class Storage(unittest.TestCase):
         self.assertEqual(storage.headroom(3500 * gib, storage.LOW), 40 * gib)
         self.assertEqual(storage.headroom(3500 * gib, storage.TARGET), 60 * gib)
 
+    def test_explicit_reserve_controls_admission_and_clears_old_percentage_latch(self):
+        gib = 1024**3
+        cfg = SimpleNamespace(state=self.root)
+        marker = self.root / "activity" / f"critical-{self.root.stat().st_dev}.json"
+        with patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "3"}):
+            for threshold in (storage.CRITICAL, storage.LOW, storage.TARGET):
+                self.assertEqual(storage.headroom(38 * gib, threshold), 3 * gib)
+            with patch.object(
+                storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(38 * gib, 36 * gib, 2 * gib)
+            ):
+                with self.assertRaisesRegex(config.AdmissionUnavailable, "3.0 GiB"):
+                    storage.admit(cfg)
+            self.assertTrue(marker.exists())
+            with patch.object(
+                storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(38 * gib, 35 * gib, 3 * gib)
+            ):
+                storage.admit(cfg)
+            self.assertFalse(marker.exists())
+
     def test_live_checkout_hardlinks_do_not_flush_pool_or_request_recycle(self):
         entry = self.entry()
         canonical = self.pool / "artifacts/data"

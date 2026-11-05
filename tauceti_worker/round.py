@@ -74,8 +74,12 @@ class RoundContext:
                 log(f"retention: cache recycling deferred: {error}")
         if self.record_activity:
             from .cache_storage import admit
+            from .storage import maintain_host_lake_storage, prune_obsolete_host_lean_toolchains
 
             try:
+                if "TAUCETI_MIN_FREE_GIB" in os.environ:
+                    prune_obsolete_host_lean_toolchains(self.cfg)
+                maintain_host_lake_storage(self.cfg, phase="before round admission")
                 admit(self.cfg)
             except BaseException:
                 self._cleanup()
