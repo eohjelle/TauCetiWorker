@@ -1,0 +1,14 @@
+[Unit]
+Description=Start the Tau Ceti round before the 03:00 Oslo check-in
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 Europe/Oslo
+# 02:00 does not exist on the spring clock-change day. 01:00 is then
+# one elapsed hour before the 03:00 check-in.
+OnCalendar=Sun *-03-25..31 01:00:00 Europe/Oslo
+Persistent=true
+AccuracySec=1s
+Unit=tauceti-desktop-daily.service
+
+[Install]
+WantedBy=timers.target
