@@ -304,7 +304,8 @@ STATUS_EXHAUSTED = "exhausted"
 
 # Soft = real quota remains and only the burn-pace throttle is holding us; this is what --ignore-quota
 # may override. Hard = fail-closed: exhausted, or a window we cannot read / cannot legitimately spend
-# against. `unknown` is the generic fail-closed status the codex reader still emits.
+# against. Confirmed existing Codex credits are a separate explicit-override exception; they never
+# change these subscription statuses. `unknown` is the generic fail-closed status the codex reader emits.
 SOFT_STATUSES = (STATUS_AT_BUDGET, STATUS_OVER_PACE)
 
 HARD_STATUSES = (STATUS_EXHAUSTED, "idle-blocked", STATE_ABSENT, STATE_MALFORMED, "unknown")
@@ -364,6 +365,9 @@ class Provider:
     telemetry_unavailable: bool = False
     model_refusal: bool = False  # actual model refusal; bounded retry independent of usage polling
     credential_scope: str | None = None  # optional usage-login inspection or work-phase route
+    # Existing Codex credits can fund an exhausted subscription only when the operator explicitly
+    # pins Codex with --ignore-quota. This never makes the ordinary paced provider available.
+    credits_available: bool = False
 
 
 def _finite_num(x: object) -> bool:
@@ -1499,7 +1503,7 @@ class Quota:
     def _with_model_refusal(self, provider: str, result: Provider) -> Provider:
         # Preserve stronger evidence and authentication recovery, rather than hiding
         # a real 401 or an exhausted quota window behind the short model retry.
-        if result.available or result.telemetry_unavailable or _unavail_reason(result)[0]:
+        if result.available or result.credits_available or result.telemetry_unavailable or _unavail_reason(result)[0]:
             return self._model_refusal(provider) or result
         return result
 
@@ -2048,6 +2052,9 @@ class Quota:
         self._wait_identities = getattr(self, "_wait_identities", {}) | {"codex": auth}
         if not auth:
             return Provider("codex", False, None, error="no ~/.codex/auth.json")
+        tok = (auth.get("tokens") or {}).get("access_token")
+        if not tok:
+            return Provider("codex", False, None, error="no codex access_token")
         # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
         # token itself when no id is available.
         fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
@@ -2056,7 +2063,9 @@ class Quota:
         cached = self._cached_codex(fp)
         left, cooled_by = self._cooldown("codex", fp)
         if cached is not None and (left or not refresh):
-            return replace(self._codex_from_payload(*cached), rate_limited=cooled_by == 429)
+            # Credits are spend authorization, not a subscription pacing estimate. Require a fresh
+            # successful response so a prior failed read cannot later resurrect an old allowance.
+            return replace(self._codex_from_payload(*cached), rate_limited=cooled_by == 429, credits_available=False)
         if left:
             return self._cooling_provider("codex", left, cooled_by, fp)
         tok = (auth.get("tokens") or {}).get("access_token")
@@ -2081,7 +2090,7 @@ class Quota:
             # window's reset while we waited.
             still = self._cached_codex(fp)
             if still is not None:
-                return self._codex_from_payload(*still)
+                return replace(self._codex_from_payload(*still), credits_available=False)
             if isinstance(e, UsageTransportError):
                 return self._telemetry_failure("codex", fp, str(e), retry_after=self._cooldown("codex", fp)[0])
             return Provider("codex", False, None, error=str(e))
@@ -2095,7 +2104,7 @@ class Quota:
                 retry_after = None
             still = self._cached_codex(fp) if code != 401 else None
             if still is not None:
-                return replace(self._codex_from_payload(*still), rate_limited=code == 429)
+                return replace(self._codex_from_payload(*still), rate_limited=code == 429, credits_available=False)
             err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
             if code in _TRANSIENT_USAGE_STATUSES:
                 return self._telemetry_failure("codex", fp, err, code=code, retry_after=retry_after)
@@ -2136,8 +2145,11 @@ class Quota:
         the window's reset out to meet it."""
         now = time.time() if now is None else now
         rl = payload.get("rate_limit") or {}
+        if not isinstance(rl, dict):
+            return Provider("codex", False, None, error="codex usage rate_limit malformed")
         limit_reached = bool(rl.get("limit_reached"))
         wins = []
+        known_windows = True
         for key in ("primary_window", "secondary_window"):
             w = rl.get(key)
             # An explicitly null / absent window does not apply to this account, so SKIP it — do not emit
@@ -2158,6 +2170,8 @@ class Quota:
             # compute an elapsed fraction of its own, and at 100% elapsed the budget is the whole quota,
             # so a low usage figure beside a nonsense clock read as `under-pace`.
             clocks = _codex_clocks(w)
+            used = w.get("used_percent")
+            known_windows = known_windows and clocks is not None and _finite_num(used) and 0 <= used <= 100
             elapsed = None
             resets = None
             if clocks is not None:
@@ -2173,7 +2187,22 @@ class Quota:
         # is vacuously True.
         avail = bool(wins) and all(x.status == "under-pace" for x in wins) and not limit_reached
         nxt = self._next_eligible(wins, now, "codex")
-        return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
+        credits, control = payload.get("credits"), payload.get("spend_control")
+        # limit_reached alone masks malformed windows as exhausted in _classify_window. Confirm
+        # genuine subscription exhaustion independently before permitting existing credit use.
+        credit_ok = bool(
+            wins
+            and known_windows
+            and any(w.used == 100 for w in wins)
+            and rl.get("allowed") is False
+            and rl.get("limit_reached") is True
+            and isinstance(credits, dict)
+            and credits.get("has_credits") is True
+            and credits.get("overage_limit_reached") is False
+            and isinstance(control, dict)
+            and control.get("reached") is False
+        )
+        return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt, credits_available=credit_ok)
 
     # --- Claude ------------------------------------------------------------
     def _claude_creds(self) -> tuple[dict | None, bool]:

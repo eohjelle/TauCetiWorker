@@ -465,8 +465,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--ignore-quota",
         dest="ignore_quota",
         action="store_true",
-        help="ignore pacing and allow work through transient usage-telemetry outages; known exhaustion, "
-        "credential rejection and malformed usage still block (needs an explicit --agent codex|claude)",
+        help="ignore the quota PACER (run the requested --agent even when ahead of the burn pace); "
+        "explicit --agent codex may also use confirmed existing credits after subscription exhaustion; "
+        "unreadable usage, exhausted credits, reached spend controls, or a refusing usage endpoint "
+        "still backs off (needs an explicit paced --agent codex|claude — 'auto' can't choose without the pacer)",
     )
     p.add_argument("--loop-paced", action="store_true", help=argparse.SUPPRESS)
     # Accepted for older loop parents; new rounds ignore this retired internal flag.
