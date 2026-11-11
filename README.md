@@ -555,6 +555,9 @@ is never included. A round redirects this transcript to a timestamped file under
 `logs/` and prints the path, tailing it if the agent exits non-zero. Pass
 `--stream` to watch the identical transcript live instead.
 
+For a single overnight round on a shared desktop, see the fork's
+[desktop Docker deployment](docs/desktop-docker.md).
+
 ## Persistent workers
 
 Persistent workers are declarative and do not belong to a terminal session. You

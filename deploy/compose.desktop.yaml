@@ -1,0 +1,39 @@
+# Use with compose.yaml and the dedicated project name: -p tauceti-desktop.
+services:
+  tauceti:
+    restart: "no"
+    cpus: 2.0
+    mem_limit: 4g
+    # Docker counts RAM plus swap here: permit at most 1 GiB of swap.
+    memswap_limit: 5g
+    command: ["./tauceti", "work", "--worker-id", "desktop", "--agent", "codex", "--ignore-quota", "--skip", "progress", "--roadmap-only", "ReductiveGroups", "--roadmap-before-review"]
+    environment:
+      TAUCETI_WORKER_ID: desktop
+      TAUCETI_WORKER_ARGS: ""
+      TAUCETI_PACE: "0:0,100:95"
+      TAUCETI_SHARED_MATHLIB_BUILDS: "off"
+      TAUCETI_SHARED_ARTIFACTS: "0"
+      TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "false"
+      TAUCETI_MIN_FREE_GIB: "8"
+      TAUCETI_LOG_RETENTION_DAYS: "14"
+      TAUCETI_LOG_MAX_MIB: "256"
+    volumes:
+      - type: bind
+        source: /srv/data/tauceti/credentials/codex-worker
+        target: /root/.codex
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/data/tauceti/credentials/gh
+        target: /root/.config/gh
+        read_only: true
+        bind:
+          create_host_path: false
+
+  # The desktop login owns the real refresh token. These services must not start
+  # as part of this deployment; the system unit starts only tauceti with --no-deps.
+  codex-refresh:
+    profiles: [manual-refresh]
+  claude-refresh:
+    profiles: [manual-refresh]

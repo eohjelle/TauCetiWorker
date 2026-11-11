@@ -180,11 +180,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             elif unpaced:
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
-                # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
-                # still read the usage endpoint and wait out a HARD block: a window at 100% (exhausted),
-                # usage we cannot read (fail-closed), or the endpoint itself refusing to answer (its own
-                # 429 / a network failure). Only a soft over-pace block — real quota left, merely ahead of
-                # the burn line — runs through here. Without this a pinned `--agent claude` worker re-fires
+                # --ignore-quota overrides pacing and permits confirmed existing Codex credits. We
+                # still read usage and wait out unknown telemetry, provider errors, or exhaustion with
+                # no confirmed credit allowance. Without this a pinned `--agent claude` worker re-fires
                 # every green PR into a rate-limited subscription, burning a clone + engine launch each
                 # round to post an all-error scoreboard.
                 if agent == "auto":
@@ -211,6 +209,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     continue
                 if verdict == "over-pace":
                     log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+                elif verdict == "credits":
+                    log("quota: codex subscription exhausted; --ignore-quota set — using available credits")
                 model = agent
             else:
                 model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
@@ -460,17 +460,23 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
     """What --ignore-quota does with the pacer snapshot for its pinned agent — applied both by the loop
     between rounds and by the round deciding what it will launch.
 
-    --ignore-quota overrides PACING, not AVAILABILITY:
+    --ignore-quota overrides pacing and permits confirmed existing Codex credits:
       "run"       — the provider is available (under pace), launch as usual.
       "over-pace" — a SOFT block: real quota remains, we are only ahead of the burn line. This is the
                     block --ignore-quota exists to override, so launch anyway.
+      "credits"   — Codex subscription exhausted, but existing credits and spend controls explicitly
+                    permit use. Ordinary paced selection never uses this exception.
       "wait"      — a HARD block: a window at 100% (exhausted), usage we cannot read (fail-closed), or
                     the usage endpoint refusing to answer (its own 429 / a network error leaves `prov`
                     with no windows). Firing here only hits a dead provider, so back off even under
                     --ignore-quota.
     """
+    if prov is None or prov.error or prov.rate_limited:
+        return "wait"
     if chosen is not None:
         return "run"
+    if prov.name == "codex" and prov.credits_available:
+        return "credits"
     soft = prov is not None and _unavail_reason(prov)[0]
     return "over-pace" if soft else "wait"
 
@@ -560,11 +566,12 @@ def resolve_work_model(
     about the moment it was taken (see Quota._claude_pass), so where nothing has just refreshed it — a
     one-shot `tauceti work` — this is the difference between deciding on current telemetry and refusing
     on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
-    re-fetching would only ask the same question twice.
+    re-fetching would only ask the same question twice. Explicit Codex overrides always refresh,
+    because credit spending requires a successful current read even when subscription pacing is cached.
 
-    --ignore-quota still reads usage. It overrides the soft burn-pace throttle, not availability, so the
-    read is what tells a pinned agent apart from a dead one; only --quota-cmd replaces the pacer
-    outright."""
+    --ignore-quota still reads usage. It overrides soft pacing and permits confirmed existing Codex
+    credits, while unknown telemetry and provider errors remain blocks; only --quota-cmd replaces
+    the pacer outright."""
     if dry:
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
@@ -574,11 +581,12 @@ def resolve_work_model(
             "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
         )
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
-    chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
+    chosen, snap = choose_model(
+        cfg, agent, quota_cmd, refresh=fresh or (ignore_quota and agent == "codex" and not quota_cmd), renew=True
+    )
     if ignore_quota and not quota_cmd:
-        # --ignore-quota overrides PACING, not AVAILABILITY — the same rule the loop applies between
-        # rounds (see cmd_loop). Reading usage costs no quota, and firing a round at an exhausted or
-        # unreadable provider only buys a clone, an engine launch, and a scoreboard full of errors.
+        # Apply the same explicit pacing/credit override as the loop. Reading usage costs no quota;
+        # unreadable providers and exhaustion without confirmed credits still cannot launch.
         verdict = _ignore_quota_verdict(chosen, snap.get(agent))
         if verdict == "wait" and agent == "claude" and claude_pending_init(snap):
             return "claude", True  # the one hard block a bounded, pace-respecting request may clear
@@ -597,6 +605,8 @@ def resolve_work_model(
             )
         if verdict == "over-pace":
             log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+        elif verdict == "credits":
+            log("quota: codex subscription exhausted; --ignore-quota set — using available credits")
         return agent, False
     if chosen is None and claude_pending_init(snap):
         return "claude", True

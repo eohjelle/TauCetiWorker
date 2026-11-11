@@ -117,3 +117,20 @@ costs something: sitting exactly on the budget
 
 If usage cannot be read at all, the provider is treated as unavailable rather
 than assumed free.
+
+## Existing Codex credits with `--ignore-quota`
+
+An explicit `work --agent codex --ignore-quota` may continue after the subscription
+window is exhausted when usage telemetry confirms existing credits, no reached
+credit overage limit, and no reached spend control. Every applicable subscription
+window must still carry valid usage and reset data. Missing or malformed credit
+or spend-control flags refuse this exception, as do authentication errors,
+HTTP 429, and a failed quota refresh served from cache. Credit admission requires
+a fresh successful usage response; even a loop's child round refreshes before
+using this exception. Cached subscription readings never authorize credits.
+
+This uses credits already available to the authenticated account. It does not
+purchase credits or change billing controls. Ordinary paced workers and `auto`
+selection continue to wait for subscription quota; they do not opt into credit
+spending. Claude's exhaustion behavior is unchanged. The provider still decides
+whether an actual model request is accepted.

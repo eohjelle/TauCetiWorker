@@ -100,6 +100,7 @@ RUN_STDLIB=(
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  desktop_credentials.py
   observability_failures.py
   open_pr_pages.py
   overlaps.py
@@ -124,6 +125,7 @@ RUN_STDLIB=(
   quota_claude_windows.py
   quota_launch_stage.py
   quota_codex_windows.py
+  quota_codex_credits.py
   quota_reason.py
   review_codex_model.py
   review_mathlib_source.py

@@ -1,20 +1,23 @@
 [Unit]
 Description=Run one daily Tau Ceti round
+Requires=docker.service
+After=docker.service
+RequiresMountsFor=/srv/data
 ConditionPathIsMountPoint=/srv/data
 
 [Service]
 Type=oneshot
+User=botolomy
+SupplementaryGroups=docker
 WorkingDirectory=/srv/data/tauceti/TauCetiWorker
-Environment=HOME=%h
-Environment=CODEX_HOME=%h/.codex
-Environment=GH_CONFIG_DIR=%h/.config/gh
-Environment=PATH=%h/.local/bin:%h/.elan/bin:/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=%h/.config/tauceti/native-desktop.env
+Environment=HOME=/home/botolomy
+Environment=CODEX_HOME=/home/botolomy/.codex
+Environment=GH_CONFIG_DIR=/home/botolomy/.config/gh
 ExecStartPre=/usr/bin/mountpoint --quiet /srv/data
-ExecStart=%h/.local/bin/uv run --script ./tauceti work --worker-id desktop --agent codex --ignore-quota --skip progress --roadmap-only ReductiveGroups --roadmap-before-review
+ExecStartPre=/usr/bin/python3 scripts/prepare_desktop_credentials.py --destination /srv/data/tauceti/credentials
+ExecStart=/usr/bin/docker-compose -p tauceti-desktop -f compose.yaml -f deploy/compose.desktop.yaml up --no-deps --abort-on-container-exit --exit-code-from tauceti tauceti
+ExecStopPost=/usr/bin/docker-compose -p tauceti-desktop -f compose.yaml -f deploy/compose.desktop.yaml stop -t 120 tauceti
 TimeoutStartSec=infinity
-TimeoutStopSec=2min
+TimeoutStopSec=150s
 KillMode=control-group
 Restart=no
-CPUQuota=200%
-MemoryMax=4G
