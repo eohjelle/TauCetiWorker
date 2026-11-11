@@ -1,0 +1,20 @@
+[Unit]
+Description=Run one daily Tau Ceti round
+ConditionPathIsMountPoint=/srv/data
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/data/tauceti/TauCetiWorker
+Environment=HOME=%h
+Environment=CODEX_HOME=%h/.codex
+Environment=GH_CONFIG_DIR=%h/.config/gh
+Environment=PATH=%h/.local/bin:%h/.elan/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/tauceti/native-desktop.env
+ExecStartPre=/usr/bin/mountpoint --quiet /srv/data
+ExecStart=%h/.local/bin/uv run --script ./tauceti work --worker-id desktop --agent codex --ignore-quota --skip progress --roadmap-only ReductiveGroups --roadmap-before-review
+TimeoutStartSec=infinity
+TimeoutStopSec=2min
+KillMode=control-group
+Restart=no
+CPUQuota=200%
+MemoryMax=4G
