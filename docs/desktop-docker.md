@@ -12,6 +12,12 @@ as `botolomy` with supplementary group `docker`, so installation does not requir
 restarting the desktop user manager. Docker access is privileged; the container
 does not receive the Docker socket or the desktop home directory.
 
+Codex uses its own inner namespace sandbox. This desktop's Docker AppArmor
+profile denies userns_create, so the override selects apparmor=unconfined for
+this container, alongside the base Compose seccomp exception. Host policy is
+unchanged; Docker filesystem/network namespaces, limited mounts, default dropped
+capabilities and resource limits remain. The container is not privileged.
+
 ## Prepare and install
 
 Install Docker Engine, Compose v2 as `/usr/bin/docker-compose`, and Python 3.11
