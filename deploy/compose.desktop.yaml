@@ -2,6 +2,10 @@
 services:
   tauceti:
     restart: "no"
+    # Codex creates an inner user namespace; Debian Docker's default AppArmor
+    # profile denies userns_create. The exception applies only to this container.
+    security_opt:
+      - apparmor=unconfined
     cpus: 2.0
     mem_limit: 4g
     # Docker counts RAM plus swap here: permit at most 1 GiB of swap.
