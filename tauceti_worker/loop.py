@@ -153,9 +153,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if unpaced:
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
-                # An explicit pacing override may run through a transient telemetry outage.
-                # Known exhaustion, auth failures and malformed readings still block. Actual
-                # model refusals stop the round and use the existing no-progress backoff.
+                # --ignore-quota overrides pacing and permits confirmed existing Codex credits. We
+                # still read usage and wait out unknown telemetry, provider errors, or exhaustion with
+                # no confirmed credit allowance. Without this a pinned `--agent claude` worker re-fires
+                # every green PR into a rate-limited subscription, burning a clone + engine launch each
+                # round to post an all-error scoreboard.
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
                 _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True, _wait=quota_wait)
@@ -180,6 +182,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
                 elif verdict == "telemetry-unavailable":
                     log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
+                elif verdict == "credits":
+                    log("quota: codex subscription exhausted; --ignore-quota set — using available credits")
                 model = agent
             else:
                 model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True, _wait=quota_wait)
@@ -434,16 +438,24 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
     """What --ignore-quota does with the pacer snapshot for its pinned agent — applied both by the loop
     between rounds and by the round deciding what it will launch.
 
-    --ignore-quota overrides pacing and transient telemetry outages:
+    --ignore-quota overrides pacing and permits confirmed existing Codex credits:
       "run"       — the provider is available (under pace), launch as usual.
       "over-pace" — a SOFT block: real quota remains, we are only ahead of the burn line. This is the
                     block --ignore-quota exists to override, so launch anyway.
-      "telemetry-unavailable" — explicitly classified transient failure; try useful work.
-      "wait"      — exhaustion, auth/configuration failures, or an unreadable quota response.
+      "credits"   — Codex subscription exhausted, but existing credits and spend controls explicitly
+                    permit use. Ordinary paced selection never uses this exception.
+      "wait"      — a HARD block: a window at 100% (exhausted), usage we cannot read (fail-closed), or
+                    the usage endpoint refusing to answer (its own 429 / a network error leaves `prov`
+                    with no windows). Firing here only hits a dead provider, so back off even under
+                    --ignore-quota.
     """
+    if prov is None or prov.model_refusal or (prov.name == "codex" and (prov.error or prov.rate_limited)):
+        return "wait"
     if chosen is not None:
         return "run"
-    if prov is not None and prov.telemetry_unavailable and not any(w.status == "exhausted" for w in prov.windows):
+    if prov.name == "codex" and prov.credits_available:
+        return "credits"
+    if prov is not None and prov.name != "codex" and prov.telemetry_unavailable and not any(w.status == "exhausted" for w in prov.windows):
         return "telemetry-unavailable"
     soft = prov is not None and _unavail_reason(prov)[0]
     return "over-pace" if soft else "wait"
@@ -547,11 +559,12 @@ def resolve_work_model(
     about the moment it was taken (see Quota._claude_pass), so where nothing has just refreshed it — a
     one-shot `tauceti work` — this is the difference between deciding on current telemetry and refusing
     on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
-    re-fetching would only ask the same question twice.
+    re-fetching would only ask the same question twice. Explicit Codex overrides always refresh,
+    because credit spending requires a successful current read even when subscription pacing is cached.
 
-    --ignore-quota still reads usage and respects known hard blocks. A transient
-    telemetry outage alone does not prevent an explicitly unpaced attempt.
-    `already_paced` carries only the parent's soft pacing decision, never outage permission."""
+    --ignore-quota still reads usage. It overrides soft pacing and permits confirmed existing Codex
+    credits, while unknown telemetry and provider errors remain blocks; only --quota-cmd replaces
+    the pacer outright."""
     if dry:
         return agent
     if agent in OPENROUTER_MODELS or agent == "kiro":
@@ -561,11 +574,14 @@ def resolve_work_model(
             "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
         )
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
-    chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
+    chosen, snap = choose_model(
+        cfg, agent, quota_cmd, refresh=fresh or (ignore_quota and agent == "codex" and not quota_cmd), renew=True
+    )
     if (ignore_quota or already_paced) and not quota_cmd:
-        # Match the loop's decision, including telemetry-only failures.
+        # Apply the same explicit pacing/credit override as the loop. Reading usage costs no quota;
+        # unreadable providers and exhaustion without confirmed credits still cannot launch.
         verdict = _ignore_quota_verdict(chosen, snap.get(agent))
-        if verdict == "telemetry-unavailable" and not ignore_quota:
+        if verdict in {"telemetry-unavailable", "credits"} and not ignore_quota:
             verdict = "wait"
         if verdict == "wait":
             prov = snap.get(agent)
@@ -586,6 +602,8 @@ def resolve_work_model(
             log(f"quota: {agent} over-pace; {why} — running anyway")
         elif verdict == "telemetry-unavailable":
             log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
+        elif verdict == "credits":
+            log("quota: codex subscription exhausted; --ignore-quota set — using available credits")
         return agent
     if chosen is None:
         raise NoProgress(f"no model under pace right now (agent={agent}) — nothing to run this round")
