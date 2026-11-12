@@ -12,6 +12,9 @@ services:
     memswap_limit: 5g
     command: ["./tauceti", "work", "--worker-id", "desktop", "--agent", "codex", "--ignore-quota", "--skip", "progress", "--roadmap-only", "ReductiveGroups", "--roadmap-before-review"]
     environment:
+      # Bookworm curl's HTTP/2 multiplexed artifact transfers can end in partial
+      # streams. Keep verified cache downloads on HTTP/1.1 for this deployment.
+      CURL_HOME: /opt/tauceti/curl-config
       TAUCETI_WORKER_ID: desktop
       TAUCETI_WORKER_ARGS: ""
       TAUCETI_PACE: "0:0,100:95"
@@ -22,6 +25,12 @@ services:
       TAUCETI_LOG_RETENTION_DAYS: "14"
       TAUCETI_LOG_MAX_MIB: "256"
     volumes:
+      - type: bind
+        source: ./deploy/curl
+        target: /opt/tauceti/curl-config
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: /srv/data/tauceti/credentials/codex-worker
         target: /root/.codex
