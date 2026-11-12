@@ -86,6 +86,15 @@ to an unmounted data directory.
 
 ## Schedule and outcome
 
+The desktop override mounts `deploy/curl` read-only and sets `CURL_HOME` to it.
+Its `.curlrc` selects HTTP/1.1 because the bundled Bookworm curl repeatedly ended
+parallel artifact-cache downloads with incomplete HTTP/2 streams (exit 18).
+TLS certificate checks and Lake's downloaded-artifact hash checks remain enabled.
+This configuration is read directly from the fork checkout; changing it requires
+no image rebuild. To roll it back, remove the `CURL_HOME` setting and its matching
+bind mount from `deploy/compose.desktop.yaml` after the current round finishes,
+then use the system service for the next round. Preserve all named volumes.
+
 The timer starts at 02:00 Europe/Oslo, before the existing 03:00 check-in, and
 catches up once after downtime. On the spring clock-change day it uses 01:00,
 one elapsed hour before 03:00. It starts only the canonical `tauceti` service in
