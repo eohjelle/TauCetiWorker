@@ -178,7 +178,7 @@ def lock_round(fd: int, wait: float, what: str) -> bool:
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
-def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subprocess.Popen:
+def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT, temporary=None) -> subprocess.Popen:
     """Spawn one round as a child in its OWN session (so the loop can kill the whole group). Invokes
     the current interpreter directly on this file (NOT via the uv shebang) to avoid a uv wrapper
     process between the loop and the round — sys.executable is already the uv-resolved interpreter."""
@@ -186,6 +186,8 @@ def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subpro
     env = self_env()
     env["TAUCETI_ROUND_DEADLINE"] = str(time.time() + timeout)
     env["TAUCETI_ROUND_LOCK_WAIT"] = str(ROUND_LOCK_WAIT)
+    if temporary is not None:
+        env["TMPDIR"] = str(temporary)
     return subprocess.Popen(cmd, start_new_session=True, env=env)
 
 
@@ -417,7 +419,12 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         except Exception as error:
             log(f"usage supervisor startup pending: {error}")
     temporary = snapshot_round_temp()
-    p = spawn_round(argv_tail, timeout=timeout)
+    try:
+        p = spawn_round(argv_tail, timeout=timeout, **({"temporary": temporary[0]} if temporary is not None else {}))
+    except OSError:
+        if temporary is not None:
+            clean_round_temp(temporary)
+        raise
     owner = process_identity(p.pid) if accounting else None
     ending = "exit"
     pgid = p.pid  # spawn_round's start_new_session ⇒ the round leads its own group; pgid == leader pid

@@ -105,7 +105,7 @@ RUN uv pip install --system --break-system-packages . \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
     && chmod 0644 /etc/profile.d/tauceti-path.sh \
     && chmod 0755 tauceti scripts/oauth_refresh_loop.py scripts/claim.sh scripts/gh-safe-pr-create scripts/git-safe-push \
-        scripts/tauceti-axioms scripts/tauceti-lint-env \
+        scripts/tauceti-local-axioms scripts/tauceti-local-lint scripts/tauceti-verify \
     && ./tauceti --help >/dev/null \
     && mkdir -p /tmp/tauceti-worker-home \
     && env HOME=/tmp/tauceti-worker-home /bin/bash -lc \
