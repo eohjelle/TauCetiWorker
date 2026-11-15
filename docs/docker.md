@@ -173,6 +173,12 @@ next start.
 
 ## Storage policy
 
+The worker service relaxes Docker's seccomp filter so Codex can create its read-only
+review sandbox. AppArmor, Docker's default capabilities, and host-wide security
+settings remain unchanged. Check sandbox startup in the service with
+`docker compose exec tauceti codex sandbox -- ls /`. The entrypoint runs this check
+before starting the worker and refuses to start when it fails.
+
 Compose uses Docker's rotating, compressed `local` logging driver for every service,
 with three 10 MiB files per container. Completed TauCeti transcripts and explicitly
 disposable Claude/Codex session histories and diagnostics share a 256 MiB budget. They
@@ -182,17 +188,18 @@ configuration, Claude memory, or quota/ledger state, and the active TauCeti sess
 is always preserved. Override these defaults in `.env` with
 `TAUCETI_LOG_RETENTION_DAYS` and `TAUCETI_LOG_MAX_MIB`.
 
-Compose enables `TAUCETI_CLEAN_ROUND_TMP=1` for its single worker. The loop records
-the entries already in the container's private `/tmp` before each round and removes
-new entries after the round and its background processes have exited, including failed
-and timed-out rounds. Pre-existing entries and symlink targets are preserved. Temporary
+Compose enables `TAUCETI_CLEAN_ROUND_TMP=1` for its single worker. Each loop round gets
+a private `TMPDIR` under `/tmp`, removed after the round and its background processes
+have exited, including failed and timed-out rounds. Other temporary directories,
+recovery jobs, and symlink targets are preserved. Temporary
 review checkouts and lint drivers must not be used to store work needed by later rounds;
 use the persistent checkout or state directory instead. Do not run a second worker or
 unrelated temporary-file-producing work inside the same container.
 
 When checkout filesystem space falls below `TAUCETI_MIN_FREE_GIB` (8 GiB by default),
 the worker runs `lake clean` between rounds to remove the root and every dependency
-build directory, then separately deletes `.lake/cache`, which Lake does not own. There
+build directory, then separately deletes `.lake/cache` and the worker's private
+`~/.cache/lake` artifact store, which Lake does not own. There
 is no independent artifact-cache size threshold. Dependency source checkouts and
 Mathlib's compressed download cache remain available, so the next authoring preflight
 can restore Mathlib and TauCeti outputs without compiling everything from source.
@@ -228,7 +235,8 @@ Elan's executable and proxies remain image-owned, while only downloaded Lean too
 are persisted. This avoids baking a TauCeti version into the image, lets each checkout's
 `lean-toolchain` file remain authoritative, and prevents container replacement from
 re-downloading a multi-gigabyte toolchain. On this dedicated deployment, obsolete official
-toolchains are removed once no worker checkout requests them.
+toolchains are removed once no worker checkout requests them and no retained recovery
+work could still require them.
 
 The refreshers check once a minute, renew within 90 minutes of expiry, avoid rotating
 more than once per 10 minutes, and back off to 15 minutes after errors. Advanced

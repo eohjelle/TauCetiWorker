@@ -20,6 +20,14 @@ if [[ "${TAUCETI_SKIP_GIT_IDENTITY:-0}" != 1 ]]; then
   echo "tauceti-entrypoint: git author $git_name <$git_email>"
 fi
 
+# Never start a worker whose Codex reviewer cannot inspect local source.
+if [[ "${1:-}" == "./tauceti" && "${2:-}" == "work" ]]; then
+  if ! codex sandbox -- ls / >/dev/null; then
+    echo >&2 "tauceti-entrypoint: Codex sandbox failed; refusing to start the worker"
+    exit 1
+  fi
+fi
+
 # Compose supplies the stable `./tauceti work --loop` command as separate arguments.
 # Append operator options from .env using Python's shell-like parser; never evaluate them
 # as shell code. Restrict this to the worker command so setup and diagnostic overrides are

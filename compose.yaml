@@ -14,6 +14,10 @@ services:
       context: .
     image: tauceti-worker:local
     init: true
+    # Codex's read-only reviewer creates its own user/mount namespaces via bubblewrap.
+    # Docker's default seccomp filter blocks this; AppArmor and normal capabilities stay enabled.
+    security_opt:
+      - seccomp=unconfined
     restart: unless-stopped
     logging: *tauceti-logging
     stop_grace_period: 2m
@@ -33,7 +37,7 @@ services:
       TAUCETI_MIN_FREE_GIB: "${TAUCETI_MIN_FREE_GIB:-8}"
       TAUCETI_LOG_RETENTION_DAYS: "${TAUCETI_LOG_RETENTION_DAYS:-14}"
       TAUCETI_LOG_MAX_MIB: "${TAUCETI_LOG_MAX_MIB:-256}"
-      # One worker owns this container's private /tmp. Remove each round's new entries on exit.
+      # Each round gets a private TMPDIR, removed after its processes exit.
       TAUCETI_CLEAN_ROUND_TMP: "1"
     volumes:
       # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because

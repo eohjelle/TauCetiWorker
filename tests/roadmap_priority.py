@@ -127,7 +127,11 @@ with patch.dict(os.environ):
             cwd=REPO,
             text=True,
         ).strip()
-        check("child inherits priority and cap", child, "rebase,bump,progress,fix-ci,fix,roadmap,review 6")
+        check(
+            "child inherits priority and cap",
+            child,
+            "rebase,bump,lint-repair,progress,fix-ci,fix,roadmap,review,overlap-fix,overlap-scan 6",
+        )
         raise KeyboardInterrupt
 
     with patch.object(tc.cli, "resolve_source", inspect_handoff):
