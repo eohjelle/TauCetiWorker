@@ -467,8 +467,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="ignore the quota PACER (run the requested --agent even when ahead of the burn pace); "
         "explicit --agent codex may also use confirmed existing credits after subscription exhaustion; "
-        "unreadable usage, exhausted credits, reached spend controls, or a refusing usage endpoint "
-        "still backs off (needs an explicit paced --agent codex|claude — 'auto' can't choose without the pacer)",
+        "Codex unreadable usage, exhausted credits, reached spend controls, or a refusing usage endpoint "
+        "still backs off; Claude may attempt through transient telemetry outages "
+        "(needs an explicit paced --agent codex|claude — 'auto' can't choose without the pacer)",
     )
     p.add_argument("--loop-paced", action="store_true", help=argparse.SUPPRESS)
     # Accepted for older loop parents; new rounds ignore this retired internal flag.
@@ -1779,13 +1780,18 @@ def cmd_host_doctor(args) -> int:
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     from . import shared_mathlib
+    from .agents import private_mathlib_enabled
 
-    shared_ok, shared_note = shared_mathlib.capability()
+    if private_mathlib_enabled(os.environ):
+        shared_ok, shared_note = True, "explicit private Mathlib cache mode; shared views are not required"
+    else:
+        shared_ok, shared_note = shared_mathlib.capability()
+        shared_note += "; required for rounds that need Mathlib unless private desktop mode is explicitly enabled"
     rows.append(
         (
             "shared Mathlib",
             shared_ok,
-            shared_note + "; required for rounds that need Mathlib (TAUCETI_SHARED_MATHLIB_BUILDS=off blocks them)",
+            shared_note,
         )
     )
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))

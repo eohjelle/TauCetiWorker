@@ -164,8 +164,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
                 # --ignore-quota overrides pacing and permits confirmed existing Codex credits. We
-                # still read usage and wait out unknown telemetry, provider errors, or exhaustion with
-                # no confirmed credit allowance. Without this a pinned `--agent claude` worker re-fires
+                # still read usage and wait out Codex telemetry errors or exhaustion with no confirmed
+                # credit allowance. Claude retains upstream's transient-telemetry exception. Without
+                # the exhaustion check a pinned `--agent claude` worker re-fires
                 # every green PR into a rate-limited subscription, burning a clone + engine launch each
                 # round to post an all-error scoreboard.
                 if agent == "auto":
@@ -455,10 +456,11 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
                     block --ignore-quota exists to override, so launch anyway.
       "credits"   — Codex subscription exhausted, but existing credits and spend controls explicitly
                     permit use. Ordinary paced selection never uses this exception.
-      "wait"      — a HARD block: a window at 100% (exhausted), usage we cannot read (fail-closed), or
-                    the usage endpoint refusing to answer (its own 429 / a network error leaves `prov`
-                    with no windows). Firing here only hits a dead provider, so back off even under
-                    --ignore-quota.
+      "telemetry-unavailable" — Claude alone may attempt through a transient telemetry outage,
+                    provided no retained exhausted window blocks it.
+      "wait"      — a HARD block: exhaustion without an authorized credit allowance, model refusal,
+                    or unavailable telemetry outside Claude's transient-outage exception. Codex
+                    credits require a successful fresh usage response even under --ignore-quota.
     """
     if prov is None or prov.model_refusal or (prov.name == "codex" and (prov.error or prov.rate_limited)):
         return "wait"
@@ -466,7 +468,12 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
         return "run"
     if prov.name == "codex" and prov.credits_available:
         return "credits"
-    if prov is not None and prov.name != "codex" and prov.telemetry_unavailable and not any(w.status == "exhausted" for w in prov.windows):
+    if (
+        prov is not None
+        and prov.name != "codex"
+        and prov.telemetry_unavailable
+        and not any(w.status == "exhausted" for w in prov.windows)
+    ):
         return "telemetry-unavailable"
     soft = prov is not None and _unavail_reason(prov)[0]
     return "over-pace" if soft else "wait"
@@ -580,8 +587,8 @@ def resolve_work_model(
     because credit spending requires a successful current read even when subscription pacing is cached.
 
     --ignore-quota still reads usage. It overrides soft pacing and permits confirmed existing Codex
-    credits, while unknown telemetry and provider errors remain blocks; only --quota-cmd replaces
-    the pacer outright."""
+    credits. Codex telemetry errors remain blocks; Claude retains its transient-outage exception.
+    Only --quota-cmd replaces the pacer outright."""
     if dry:
         return agent
     if agent in OPENROUTER_MODELS or agent == "kiro":

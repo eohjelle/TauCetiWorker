@@ -17,8 +17,7 @@ from pathlib import Path
 
 from tauceti_tools.forge import RepositoryRef
 
-from .config import Config, log, roadmap_only, roadmap_skip
-from .config import max_open_prs as configured_max_open_prs
+from .config import Config, auto_stages, log, roadmap_before_review, roadmap_only, roadmap_pr_cap, roadmap_skip
 from .constants import (
     AUTO_STAGES,
     BUMP_HEAD_PREFIX,
@@ -402,7 +401,7 @@ class Survey:
     # not the number of every PR we have open across the project.
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
-    max_open_prs: int = field(default_factory=configured_max_open_prs)
+    max_open_prs: int = field(default_factory=roadmap_pr_cap)
     next_auto_stage: str | None = None
     github_failed: bool = False
     # Structured shared-state outage (github_state.last_failure()): unknown coverage, not an empty inventory.
@@ -1400,7 +1399,7 @@ def bump_prs(sv: Survey) -> set[int]:
     return {p.number for p in sv.open_prs if p.automatic_bump}
 
 
-def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate]]:
+def cascade(sv: Survey, stages, listed=frozenset(), *, roadmap: bool = False) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
@@ -1413,7 +1412,13 @@ def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate
     moves across stages, so target priority cannot overtake lint repair or progress reports.
     """
     bumps = bump_prs(sv)
-    pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
+    if roadmap and not sv.roadmap_backpressure and roadmap_before_review():
+        stages = [stage for stage in auto_stages() if stage == "roadmap" or stage in stages]
+    pairs = [
+        (stage, c)
+        for stage in stages
+        for c in ([Candidate(0, "", sv.roadmap_only)] if stage == "roadmap" else sv.kind(stage).actionable)
+    ]
     pairs = [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
     if not listed:
         return pairs
@@ -1429,7 +1434,7 @@ def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate
 def _next_auto_stage(sv: Survey) -> str | None:
     if hasattr(sv, "source_repository"):
         return None  # Source inventory supplies no scheduling or publication authority.
-    for stage, _ in cascade(sv, AUTO_STAGES):
+    for stage, _ in cascade(sv, AUTO_STAGES, roadmap=True):
         return stage
     if not sv.roadmap_backpressure:
         return "roadmap"

@@ -53,7 +53,7 @@ minutes from the original refusal, allowing fresh discovery without a token-chan
 request storm. The original credential still honors its complete server deadline.
 
 Without a usable reading, normally paced workers wait for telemetry. An explicit
-`--agent claude --ignore-quota` or `--agent codex --ignore-quota` may attempt useful
+`--agent claude --ignore-quota` may attempt useful
 work through a transient telemetry outage: HTTP 408, 429, 500, 502, 503, 504, 529,
 or a connection failure. This does not invent a quota value or make an expired
 positive sample usable. Known exhausted windows remain blocking until they reset,
@@ -66,6 +66,9 @@ distinguishing an edge challenge. A still-valid cached reading can supply headro
 otherwise it blocks launches. Its `Retry-After` is honored for that credential,
 without preventing a newly selected credential from recovering.
 Missing credentials, malformed responses, and other HTTP errors still block.
+This desktop fork keeps Codex stricter: `--ignore-quota` cannot launch from unknown
+usage or HTTP 429. A still-valid cached subscription reading retains its ordinary
+meaning, but credit spending requires a successful fresh usage response.
 Actual model refusals stop the round and use the loop's existing escalating
 backoff. A subscription-limit refusal from an authoring agent also records a
 bounded fifteen-minute retry against its frozen launch credential. It expires
