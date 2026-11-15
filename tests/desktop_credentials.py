@@ -14,7 +14,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("desktop_credentials", ROOT / "scripts" / "prepare_desktop_credentials.py")
+spec = importlib.util.spec_from_file_location(
+    "desktop_credentials", ROOT / "scripts" / "prepare_desktop_credentials.py"
+)
 assert spec is not None and spec.loader is not None
 handoff = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(handoff)
@@ -38,14 +40,28 @@ class DesktopCredentialsTests(unittest.TestCase):
     def write_auth(self, expiry=None):
         expiry = time.time() + 60 if expiry is None else expiry
         payload = base64.urlsafe_b64encode(json.dumps({"exp": expiry}).encode()).decode().rstrip("=")
-        self.codex.write_text(json.dumps({"tokens": {"access_token": f"header.{payload}.signature", "refresh_token": "fixture-renewable-token", "id_token": "fixture-id-token", "account_id": "fixture-account"}}))
+        self.codex.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": f"header.{payload}.signature",
+                        "refresh_token": "fixture-renewable-token",
+                        "id_token": "fixture-id-token",
+                        "account_id": "fixture-account",
+                    }
+                }
+            )
+        )
 
     def prepare(self):
         handoff.prepare(self.codex, self.gh, self.destination)
 
     def test_access_only_private_files_without_refresh_or_source_changes(self):
         before = self.codex.read_bytes()
-        with patch.object(handoff.oauth, "refresh_if_due", side_effect=AssertionError("must not refresh")), patch.object(handoff.oauth, "_post_json", side_effect=AssertionError("must not contact provider")):
+        with (
+            patch.object(handoff.oauth, "refresh_if_due", side_effect=AssertionError("must not refresh")),
+            patch.object(handoff.oauth, "_post_json", side_effect=AssertionError("must not contact provider")),
+        ):
             self.prepare()
         mirror = self.destination / "codex-worker" / "auth.json"
         data = json.loads(mirror.read_text())
@@ -68,7 +84,10 @@ class DesktopCredentialsTests(unittest.TestCase):
         self.prepare()
         self.assertEqual(directory.stat().st_ino, directory_inode)
         self.assertNotEqual(mirror.stat().st_ino, old_inode)
-        self.assertEqual(json.loads(mirror.read_text())["tokens"]["access_token"], json.loads(self.codex.read_text())["tokens"]["access_token"])
+        self.assertEqual(
+            json.loads(mirror.read_text())["tokens"]["access_token"],
+            json.loads(self.codex.read_text())["tokens"]["access_token"],
+        )
 
     def test_expired_or_unreadable_expiry_does_not_publish(self):
         for token in ("header.eyJleHAiOjF9.signature", "not-a-jwt"):
@@ -103,7 +122,15 @@ class DesktopCredentialsTests(unittest.TestCase):
     def test_cli_failure_never_prints_credential_content(self):
         self.codex.write_text("fixture-secret-that-is-not-json")
         errors = io.StringIO()
-        argv = ["prepare", "--codex-source", str(self.codex), "--gh-source", str(self.gh), "--destination", str(self.destination)]
+        argv = [
+            "prepare",
+            "--codex-source",
+            str(self.codex),
+            "--gh-source",
+            str(self.gh),
+            "--destination",
+            str(self.destination),
+        ]
         with patch.object(sys, "argv", argv), redirect_stderr(errors):
             self.assertEqual(handoff.main(), 1)
         self.assertNotIn("fixture-secret", errors.getvalue())
