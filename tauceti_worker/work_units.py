@@ -638,8 +638,21 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     declined: list[tuple[str, int]] = []
     claim_collision = False
     from .state_repair import retry_key
+    from .worker_sources import current
 
-    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
+    selected_source = "forgejo" if current() else "github"
+    destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
+    may_author = want(opts.only, "roadmap") and not getattr(opts, "prs", ()) and destination == selected_source
+    roadmap_attempted = False
+    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)], roadmap=may_author):
+        if stage == "roadmap":
+            roadmap_attempted = True
+            if global_pick and scope in (None, "auto") and not opts.dry_run:
+                sv.roadmap_only = random_roadmap_area(w, focus=[])
+            rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
+            if rc is not None:
+                return rc
+            continue
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
@@ -673,11 +686,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
-    from .worker_sources import current
-
-    selected_source = "forgejo" if current() else "github"
-    destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
-    if want(opts.only, "roadmap") and not getattr(opts, "prs", ()) and destination == selected_source:
+    if may_author and not roadmap_attempted:
         if sv.roadmap_backpressure:
             if focused_round:
                 log("Fleet roadmap focus: account authoring limit reached; selecting global maintenance")

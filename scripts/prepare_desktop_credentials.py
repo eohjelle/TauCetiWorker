@@ -50,11 +50,7 @@ def prepare(codex_source: Path, gh_source: Path, destination: Path) -> None:
 
     credentials = json.loads(codex_source.read_text())
     tokens = credentials.get("tokens") if isinstance(credentials, dict) else None
-    if (
-        not isinstance(tokens, dict)
-        or not isinstance(tokens.get("access_token"), str)
-        or not tokens["access_token"]
-    ):
+    if not isinstance(tokens, dict) or not isinstance(tokens.get("access_token"), str) or not tokens["access_token"]:
         raise PreparationError("Desktop Codex access token is missing; check the desktop login.")
     provider = oauth.provider("codex", credentials=codex_source, mirror=directories[1] / "auth.json")
     expiry = oauth._expires_at(provider, credentials)
