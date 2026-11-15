@@ -123,6 +123,14 @@ under Docker's data root. Optional shared Mathlib builds, eager expanded
 artifacts and obsolete-toolchain pruning are disabled. The normal 8 GiB reserve
 and 14-day/256 MiB disposable agent-log retention remain enabled.
 
+New upstream workers require shared Mathlib views by default. This deployment
+explicitly pairs `TAUCETI_SHARED_MATHLIB_BUILDS=off` with
+`TAUCETI_PRIVATE_MATHLIB_BUILDS=1` to retain ordinary checkout-local Mathlib cache
+downloads. This is a selected storage mode, not a fallback after shared preparation
+fails. An attached shared tree, retained shared-view marker (including malformed
+markers), or inherited view/lease metadata blocks private extraction and remains
+intact for recovery. No shared-cache migration or extra service is needed.
+
 At the existing 03:00 check-in, inspect the service result and actual work:
 
 ```sh
@@ -132,7 +140,45 @@ journalctl -u tauceti-desktop-daily.service --since today
 docker-compose -p tauceti-desktop -f compose.yaml -f deploy/compose.desktop.yaml logs --tail 100 tauceti
 ```
 
-## Stop and rollback
+## Daily upstream updates
+
+The existing 03:00 maintenance agent checks upstream and owns rebasing, validation
+and deployment. Keep `origin` pointed at `eohjelle/TauCetiWorker` and `upstream` at
+`TauCetiProject/TauCetiWorker`. Fetch current refs into an isolated clone; record
+the observed upstream commit, deployed commit/image and exact remote branch head.
+Retain a Git bundle or backup ref and the previous image before rebasing. Rebase
+`desktop-daily-worker` on the observed `upstream/main`, resolving conflicts against
+the current upstream contracts while preserving this desktop's settings. Validate
+the resulting code, focused credit/private-cache/roadmap/credential tests, relevant
+upstream tests, shell scripts and merged Compose configuration. Build a candidate
+image from the exact validated tree under a separate tag.
+
+Before changing the deployment, recheck the system service and canonical container
+are stopped, the round lock is unheld, both worker and mathematical checkouts are
+clean, and prior publication is settled. Do not interrupt a healthy round; record
+its identity and finish independent preparation first. Publish with
+`--force-with-lease=refs/heads/desktop-daily-worker:<observed-remote-head>` so another
+writer cannot be overwritten. Keep the original remote history in the backup.
+Move the live checkout to that exact tested commit, tag the tested image for the
+existing Compose project, and recreate its stopped container with Compose `create
+--no-deps --force-recreate tauceti`. Do not use `up` for update validation: that
+would start another model round. Never use `down -v` or prune recovery images.
+
+Verify the image's packaged source and harmless CLI/import checks, merged Compose
+command/mounts/limits, stopped canonical container image, system unit/drop-ins and
+next 02:00 worker / 03:00 review occurrences. Preserve any host-installed
+`credit-reserve.conf` service drop-in; it is owned by Botolomy and is not replaced
+by this fork. No credential refresh, model call, provider spending-setting change
+or new recurring job is part of this verification. Record exact refs, image ID,
+test results, deployment evidence and any remaining limitations.
+
+For an update rollback, reconcile execution again, restore the retained source
+commit and matching image tag, and recreate the stopped canonical container using
+the same Compose project and unchanged volumes. Keep the upstream/rebase evidence;
+do not rewind the remote branch blindly. Update deployment metadata to identify
+the restored commit/image and the failed candidate.
+
+## Stop and uninstall
 
 ```sh
 sudo systemctl disable --now tauceti-desktop-daily.timer

@@ -1040,8 +1040,14 @@ def run_agent_host(
         and TAUCETI_CACHE_SERVICE
         and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
     ):
-        prompt += (
-            "\n\nBuild cache preparation: Mathlib and its dependencies (Batteries, Aesop, Qq, ProofWidgets "
+        mathlib_note = (
+            "Mathlib and its dependencies use this desktop's private checkout and downloaded cache. "
+            "The worker warmed Mathlib and TauCeti artifacts before launch. After changing a "
+            "dependency pin, run `lake exe cache get` before building; do not compile all dependencies "
+            "from source to work around a download failure. After merging/rebasing, fetch TauCeti's "
+            "cache before building:\n"
+            if private_mathlib_enabled(os.environ)
+            else "Mathlib and its dependencies (Batteries, Aesop, Qq, ProofWidgets "
             "and the rest) come from this host's shared, read-only build, attached under "
             "`.lake/packages`; the worker also warmed TauCeti artifacts for this checkout and current "
             "main. Never run `lake exe cache get` or `lake update`: there is nothing to fetch, and the "
@@ -1050,7 +1056,11 @@ def run_agent_host(
             "again; stop and report instead of working around it. The public `tauceti-public` Lake "
             "service remains configured during this run. After merging/rebasing, fetch TauCeti's cache "
             "before building:\n"
-            f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
+        )
+        prompt += (
+            "\n\nBuild cache preparation: "
+            + mathlib_note
+            + f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
             f"--max-revs={lake_cache_max_revs(os.environ)}\n"
             "Lake downloads into its artifact store and restores outputs lazily during a build; "
             "an absent .lake/build directory alone is not a cache failure. A revision lookup can "
@@ -1593,6 +1603,27 @@ def lake_cache_max_revs(env: dict) -> str:
     return value
 
 
+def private_mathlib_enabled(env: dict) -> bool:
+    """Explicit opt-in for the desktop's ordinary private checkout, never an error fallback."""
+    return env.get("TAUCETI_PRIVATE_MATHLIB_BUILDS") == "1" and env.get("TAUCETI_SHARED_MATHLIB_BUILDS") == "off"
+
+
+def _check_private_mathlib(cwd: Path, env: dict) -> None:
+    from . import shared_mathlib
+
+    marker = cwd / ".lake" / "tauceti-mathlib" / "view.json"
+    if (
+        shared_mathlib.attached(cwd)
+        or marker.exists()
+        or marker.is_symlink()
+        or any(
+            env.get(key)
+            for key in ("TAUCETI_SHARED_MATHLIB_VIEW", "TAUCETI_SHARED_MATHLIB_KEY", "TAUCETI_SHARED_MATHLIB_LEASE_FD")
+        )
+    ):
+        raise BuildCacheUnavailable("private Mathlib mode refuses an attached shared tree; preserve it for recovery")
+
+
 @contextlib.contextmanager
 def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False):
     """Keep the public service available through repairs, merges and dependency changes."""
@@ -1605,8 +1636,11 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathli
     logdir.mkdir(parents=True, exist_ok=True)  # callers append their own logs here afterwards
     from . import shared_mathlib
 
+    if private_mathlib_enabled(env):
+        _check_private_mathlib(cwd, env)
+
     def mathlib_view():
-        if queue_mathlib:
+        if queue_mathlib or private_mathlib_enabled(env):
             # The queue repair service's checkout keeps the Mathlib it prepares (see run_agent_host).
             return contextlib.nullcontext([])
         return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
@@ -1622,6 +1656,13 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathli
 
 @contextlib.contextmanager
 def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
+    from . import shared_mathlib
+
+    def rebase_target():
+        if private_mathlib_enabled(env):
+            return contextlib.nullcontext(lambda: None)
+        return shared_mathlib.rebase_target(cwd, env)
+
     if not TAUCETI_CACHE_SERVICE:
         # No TauCeti artifact service to warm, but Mathlib must still come from the shared
         # build: without the view the agent's first `lake build` compiles it privately.
@@ -1629,7 +1670,7 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
 
         try:
             with (
-                shared_mathlib.rebase_target(cwd, env) as restore,
+                rebase_target() as restore,
                 mathlib_view() as prefix,
             ):
                 if prefix:
@@ -1661,7 +1702,7 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
         mathlib_started = expanded_cache.clock()
         try:
             with (
-                shared_mathlib.rebase_target(cwd, env) as restore,
+                rebase_target() as restore,
                 mathlib_view() as prefix,
             ):
                 expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
@@ -1803,6 +1844,9 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     """
     from . import shared_mathlib
 
+    if private_mathlib_enabled(env):
+        _check_private_mathlib(cwd, env)
+
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
     max_revs = lake_cache_max_revs(env)
     has_mathlib = shared_mathlib._names_mathlib(cwd)
@@ -1889,7 +1933,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         # `lake exe cache get` inside the view re-extracts every archive, and each new file lands in
         # this checkout's private overlay upper: a full private copy under a "shared" round.
         log("host build caches: Mathlib and its dependencies come from the shared build; not fetching them")
-    elif env.get("TAUCETI_QUEUE_MATHLIB") != "1":
+    elif env.get("TAUCETI_QUEUE_MATHLIB") != "1" and not private_mathlib_enabled(env):
         # Sharing is the only way a round gets Mathlib; a private `cache get` is a private copy.
         unavailable("this workspace needs Mathlib but has no shared Mathlib view")
     elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":

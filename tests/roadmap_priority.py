@@ -45,7 +45,11 @@ def run(sv, *, only=(), prs=(), decline=()):
 
     worker = SimpleNamespace(cfg=None, gh=None, rs=None, counters=None)
     opts = SimpleNamespace(only=list(only), prs=prs, dry_run=True)
-    with patch.object(tc.work_units, "survey", return_value=sv), patch.object(tc.work_units, "dispatch", dispatch):
+    with (
+        patch.object(tc.work_units, "survey", return_value=sv),
+        patch.object(tc.work_units, "round_scope", return_value=("ReductiveGroups", False, False)),
+        patch.object(tc.work_units, "dispatch", dispatch),
+    ):
         try:
             tc.work_units.run_round(worker, opts)
             reason = None
@@ -57,7 +61,7 @@ def run(sv, *, only=(), prs=(), decline=()):
 with patch.dict(os.environ):
     for name in ("TAUCETI_ROADMAP_BEFORE_REVIEW", "TAUCETI_ROADMAP_PR_CAP"):
         os.environ.pop(name, None)
-    check("default cap remains eight", tc.config.roadmap_pr_cap(), 8)
+    check("default cap follows upstream", tc.config.roadmap_pr_cap(), tc.config.max_open_prs())
     check("default predictor prefers review", tc._next_auto_stage(make_survey()), "review")
     check("default runtime prefers review", run(make_survey())[0], ["review"])
     check(

@@ -92,6 +92,7 @@ COPY tauceti pyproject.toml ./
 COPY prompts ./prompts
 COPY scripts ./scripts
 COPY tauceti_worker ./tauceti_worker
+COPY tauceti_queue ./tauceti_queue
 COPY tauceti-path.sh /etc/profile.d/tauceti-path.sh
 
 # The refresher is a symlink, not a copy: it imports the rotation core from tauceti_worker, and
