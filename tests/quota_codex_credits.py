@@ -47,7 +47,9 @@ for section, field, values in (
     for value in values:
         data = copy.deepcopy(payload)
         data[section][field] = value
-        check(f"{section}.{field}={value!r} does not admit credits", q._codex_from_payload(data).credits_available, False)
+        check(
+            f"{section}.{field}={value!r} does not admit credits", q._codex_from_payload(data).credits_available, False
+        )
     data = copy.deepcopy(payload)
     del data[section][field]
     check(f"missing {section}.{field} does not admit credits", q._codex_from_payload(data).credits_available, False)
@@ -56,7 +58,11 @@ for section in ("credits", "spend_control", "rate_limit"):
     for value in (None, [], "corrupt"):
         data = copy.deepcopy(payload)
         data[section] = value
-        check(f"malformed {section}={value!r} does not admit credits", q._codex_from_payload(data).credits_available, False)
+        check(
+            f"malformed {section}={value!r} does not admit credits",
+            q._codex_from_payload(data).credits_available,
+            False,
+        )
 
 for field, values in (
     ("used_percent", (None, "100", True, float("nan"), float("inf"), -1, 101)),
@@ -65,7 +71,11 @@ for field, values in (
     for value in values:
         data = copy.deepcopy(payload)
         data["rate_limit"]["primary_window"][field] = value
-        check(f"invalid {field}={value!r} despite limit_reached stays blocked", q._codex_from_payload(data).credits_available, False)
+        check(
+            f"invalid {field}={value!r} despite limit_reached stays blocked",
+            q._codex_from_payload(data).credits_available,
+            False,
+        )
 
 for secondary in ({}, "corrupt", {"used_percent": 10}):
     data = copy.deepcopy(payload)
@@ -81,7 +91,20 @@ check("unexplained denial is not proven subscription exhaustion", q._codex_from_
 for p in (replace(eligible, error="codex usage HTTP 401"), replace(eligible, rate_limited=True)):
     for chosen in (None, "codex"):
         check("error/429 beats cached credit or chosen model", tc._ignore_quota_verdict(chosen, p), "wait")
-check("Claude cannot use Codex credit exception", tc._ignore_quota_verdict(None, replace(eligible, name="claude")), "wait")
+check(
+    "Claude cannot use Codex credit exception", tc._ignore_quota_verdict(None, replace(eligible, name="claude")), "wait"
+)
+
+refusal = tc.Provider("codex", False, None, model_refusal=True)
+q._model_refusal = lambda _provider: refusal
+check("recorded model refusal overrides fresh credit eligibility", q._with_model_refusal("codex", eligible), refusal)
+check("model refusal defeats even a chosen provider", tc._ignore_quota_verdict("codex", refusal), "wait")
+q._model_refusal = lambda _provider: None
+check(
+    "Codex telemetry outage cannot authorize an override",
+    tc._ignore_quota_verdict(None, tc.Provider("codex", False, None, telemetry_unavailable=True)),
+    "wait",
+)
 
 # Exercise actual ordinary selection and the one-round entry point: credits alone never make
 # forced/automatic paced workers eligible, while the explicit override can launch Codex.
@@ -91,14 +114,14 @@ check("ordinary pinned Codex remains blocked", q.choose("codex")[0], None)
 check("automatic model selection remains blocked", q.choose(None)[0], None)
 saved_choose = tc.loop.choose_model
 choose_calls = []
-tc.loop.choose_model = lambda _cfg, agent, _cmd, **kw: choose_calls.append(kw) or q.choose(
-    None if agent == "auto" else agent, **kw
+tc.loop.choose_model = lambda _cfg, agent, _cmd, **kw: (
+    choose_calls.append(kw) or q.choose(None if agent == "auto" else agent, **kw)
 )
 try:
     check(
         "explicit pinned override resolves a real round",
         tc.loop.resolve_work_model(object(), "codex", dry=False, ignore_quota=True, fresh=True),
-        ("codex", False),
+        "codex",
     )
     tc.loop.resolve_work_model(object(), "codex", dry=False, ignore_quota=True, fresh=False)
     check("loop child also refreshes credit authorization", choose_calls[-1]["refresh"], True)
@@ -109,6 +132,13 @@ try:
     else:
         refused = False
     check("a round without --ignore-quota refuses credit spending", refused, True)
+    try:
+        tc.loop.resolve_work_model(object(), "codex", dry=False, ignore_quota=False, already_paced=True)
+    except tc.NoProgress:
+        refused = True
+    else:
+        refused = False
+    check("parent pacing handoff cannot authorize credits", refused, True)
     try:
         tc.loop.resolve_work_model(object(), "auto", dry=False, ignore_quota=True, fresh=True)
     except SystemExit:
@@ -129,6 +159,9 @@ q._codex_account_id = lambda _auth: "fake-test-account"
 q._cached_codex = lambda _fp: (payload, time.time())
 q._cooldown = lambda *_a: (0, None)
 q._start_cooldown = lambda *_a: None
+q._clear_cooldown = lambda *_a: None
+q._fetch_usage = lambda *_a: tc.quota._http_get_json(*_a)
+q._model_refusal = lambda *_a: None
 q._store_raw = lambda *_a: None
 saved_http, saved_mirror = tc.quota._http_get_json, tc.quota.mirror_creds
 tc.quota.mirror_creds = lambda _cfg: None
@@ -137,7 +170,9 @@ try:
         tc.quota._http_get_json = lambda *_a, code=code: (code, {}, 60)
         p = q.codex(refresh=True)
         check(f"HTTP {code} never authorizes cached credits", tc._ignore_quota_verdict(None, p), "wait")
-        check(f"cached read after HTTP {code} cannot resurrect credit authorization", q.codex().credits_available, False)
+        check(
+            f"cached read after HTTP {code} cannot resurrect credit authorization", q.codex().credits_available, False
+        )
 
     def offline(*_args):
         raise tc.GitHubError("network unavailable")
