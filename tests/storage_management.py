@@ -52,7 +52,8 @@ def check_round_temp_cleanup(outcome):
         created = root / "review" / "source.lean"
         events = []
 
-        def spawn(_tail):
+        def spawn(_tail, **kwargs):
+            check("round receives its private temporary directory", kwargs["temporary"] == root)
             events.append("spawn")
             write_allocated(root / "spawn-output")
             return SimpleNamespace(pid=123456, returncode=-15, wait=wait)
@@ -60,6 +61,7 @@ def check_round_temp_cleanup(outcome):
         def wait(_timeout):
             events.append("wait")
             write_allocated(created)
+            write_allocated(outside.parent / "concurrent-recovery")
             write_allocated(root / "existing" / "new-but-shared")
             (root / "outside-link").symlink_to(outside.parent, target_is_directory=True)
             (created.parent / "nested-link").symlink_to(outside.parent, target_is_directory=True)
@@ -102,6 +104,7 @@ def check_round_temp_cleanup(outcome):
             (root / "existing" / "new-but-shared").exists(),
         )
         check(f"{outcome}: symlink targets are preserved", outside.exists())
+        check(f"{outcome}: concurrent recovery output is preserved", (outside.parent / "concurrent-recovery").exists())
         expected_events = (
             ["spawn", "wait", "kill", "reap"] if outcome in ("timeout", "interrupt") else ["spawn", "wait", "reap"]
         )
@@ -158,7 +161,7 @@ try:
         os.environ["TAUCETI_LOG_FILE"] = str(active)
         os.environ["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
         os.environ["CODEX_HOME"] = str(home / ".codex")
-        cfg = SimpleNamespace(logdir=logdir, home=home)
+        cfg = SimpleNamespace(logdir=logdir, data_home=home)
         removed = tc.maintain_worker_logs(cfg, phase="test", now=now, max_bytes=1024**3)
         check(
             "14-day retention removes completed TauCeti and provider logs",
@@ -190,7 +193,7 @@ try:
         os.environ["TAUCETI_LOG_FILE"] = str(active)
         os.environ["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
         os.environ["CODEX_HOME"] = str(home / ".codex")
-        cfg = SimpleNamespace(logdir=logdir, home=home)
+        cfg = SimpleNamespace(logdir=logdir, data_home=home)
         tc.maintain_worker_logs(
             cfg,
             phase="test",
@@ -214,12 +217,12 @@ with tempfile.TemporaryDirectory() as td:
     cfg = SimpleNamespace(
         checkout=root / "checkout",
         state=root / "state",
-        home=root / "home",
+        data_home=root / "home",
     )
     toolchain = cfg.checkout / "lean-toolchain"
     toolchain.parent.mkdir(parents=True)
     toolchain.write_text("leanprover/lean4:v4.old\n")
-    download = cfg.home / ".cache" / "mathlib" / "old-download.tar"
+    download = cfg.data_home / ".cache" / "mathlib" / "old-download.tar"
     build = cfg.checkout / ".lake" / "build" / "TauCeti.olean"
     write_allocated(download, "compressed artifact")
     write_allocated(build, "warm output")
@@ -233,6 +236,62 @@ with tempfile.TemporaryDirectory() as td:
     check("toolchain cleanup preserves expanded Lake builds", build.exists())
     marker = cfg.state / "cache" / "mathlib-cache-toolchain"
     check("toolchain marker advances only after cleanup", marker.read_text().strip() == "leanprover/lean4:v4.new")
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    cfg = SimpleNamespace(checkout=root / "checkout", state=root / "state", data_home=root / "home")
+    cached = cfg.checkout / ".lake" / "cache" / "artifact"
+    private_cache = cfg.data_home / ".cache" / "lake" / "artifact"
+    mathlib = cfg.data_home / ".cache" / "mathlib" / "download"
+    for path in (cached, private_cache, mathlib):
+        write_allocated(path)
+    gib = 1024**3
+    with (
+        patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "5"}),
+        patch.object(tc.storage.shutil, "disk_usage", return_value=SimpleNamespace(free=6 * gib)),
+        patch.object(tc.storage.subprocess, "run") as run,
+    ):
+        check("ample free space preserves warm builds", not tc.storage.maintain_host_lake_storage(cfg, phase="test"))
+        run.assert_not_called()
+    with (
+        patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "5"}),
+        patch.object(
+            tc.storage.shutil, "disk_usage", side_effect=[SimpleNamespace(free=4 * gib), SimpleNamespace(free=9 * gib)]
+        ),
+        patch.object(tc.storage.subprocess, "run") as run,
+    ):
+        check("low free space cleans Lake outputs", tc.storage.maintain_host_lake_storage(cfg, phase="test"))
+        run.assert_called_once_with(["lake", "clean"], cwd=cfg.checkout, check=True)
+    check("low-space cleanup deletes both private artifact stores", not cached.exists() and not private_cache.exists())
+    check("Mathlib downloads remain available for restoration", mathlib.exists())
+    with patch.object(tc.storage.shutil, "disk_usage", return_value=SimpleNamespace(free=4 * gib)):
+        try:
+            tc.storage.verify_host_storage_headroom(cfg.checkout, {"TAUCETI_MIN_FREE_GIB": "5"}, phase="test")
+        except tc.agents.BuildCacheUnavailable:
+            check("inference is withheld when restoration leaves too little space", True)
+        else:
+            check("inference is withheld when restoration leaves too little space", False)
+    (cfg.checkout / "lean-toolchain").write_text("leanprover/lean4:v4.new\n")
+    with (
+        patch("tauceti_worker.constants.PRUNE_OBSOLETE_LEAN_TOOLCHAINS", True),
+        patch.dict(os.environ, {"ELAN_HOME": str(root / "elan")}),
+        patch.object(
+            tc.storage.subprocess,
+            "run",
+            return_value=SimpleNamespace(stdout="leanprover/lean4:v4.old\nleanprover/lean4:v4.new\ncustom\n"),
+        ) as run,
+    ):
+        tc.storage.prune_obsolete_host_lean_toolchains(cfg)
+        check(
+            "only the obsolete official toolchain is pruned",
+            run.call_count == 2
+            and run.call_args.args[0] == ["elan", "toolchain", "uninstall", "leanprover/lean4:v4.old"],
+        )
+        write_allocated(cfg.state / "recovery" / "unfinished")
+        run.reset_mock()
+        tc.storage.prune_obsolete_host_lean_toolchains(cfg)
+        check("retained recovery work protects older toolchains", not run.called)
 
 
 journal_policy = (REPO / "deploy" / "tauceti-journald.conf").read_text()
