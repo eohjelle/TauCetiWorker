@@ -225,7 +225,7 @@ class GlobalMaintenance(unittest.TestCase):
         live = dict(state="OPEN", headRefOid=HEAD, isDraft=False, labels=[], author={"login": "science"})
         live.update(changes)
         self.w.gh.pr_view = lambda *_: dict(live)
-        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = work.MAX_FIX_ATTEMPTS
         self.w.rs = SimpleNamespace(
             gh_meta=lambda *a, **k: SimpleNamespace(
                 data={"head_sha": HEAD, "states": {"reuse": "blocking_request"}}, provenance="fresh"
@@ -265,7 +265,7 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertEqual(work._close_spent_pr(self.w, sv, c), 0)
         mutation.assert_called_once()
         self.w.claims.release.assert_called_once()
-        self.assertEqual(self.counter_values[f"fix-10-{HEAD[:12]}"], 3)
+        self.assertEqual(self.counter_values[f"fix-10-{HEAD[:12]}"], work.MAX_FIX_ATTEMPTS)
 
     def test_exhausted_closure_preserves_live_author_head_and_holds(self):
         for changes in (
@@ -302,7 +302,7 @@ class GlobalMaintenance(unittest.TestCase):
             row(10, "Topology"),
             row(15, "Geometry", contest={"id": 1, "rubric": "reuse"}),
         ]
-        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = work.MAX_FIX_ATTEMPTS
         with patch.object(work, "spread_candidates", side_effect=lambda cs: sorted(cs, key=lambda c: -c.pr)):
             _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (30, 20) else 0)
         self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 30), ("fix", 20), ("fix", 10)])
@@ -677,7 +677,7 @@ class GlobalMaintenance(unittest.TestCase):
             patch.object(self.w.rs, "newest_contest_reply", return_value=None),
         ):
             self.assertTrue(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD)))
-            self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+            self.counter_values[f"fix-10-{HEAD[:12]}"] = work.MAX_FIX_ATTEMPTS
             self.assertFalse(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD)))
 
     def test_cold_service_outage_uses_only_shared_inventory_not_per_pr_histories(self):
