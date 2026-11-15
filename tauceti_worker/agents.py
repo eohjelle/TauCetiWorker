@@ -41,7 +41,7 @@ from .constants import (
     ROADMAP,
     TAUCETI,
 )
-from .github import me
+from .github import git_author_identity, me
 from .paths import HERE, legacy_data_root
 from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
 from .processes import owned_process
@@ -58,7 +58,12 @@ from .quota import (
 )
 from .review_diagnostics import failure_summary
 from .runtime_status import report_failure
-from .storage import maintain_mathlib_download_cache
+from .storage import (
+    maintain_host_lake_storage,
+    maintain_mathlib_download_cache,
+    prune_obsolete_host_lean_toolchains,
+    verify_host_storage_headroom,
+)
 from .transcript import AgentTranscriptRenderer
 from .usage import UsageError, kiro_data_dir, kiro_process_env, snapshot_kiro_auth_db
 
@@ -832,6 +837,11 @@ def _finish_checkout(cfg: Config, co: Path) -> bool:
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
+    maintain_mathlib_download_cache(cfg)
+    prune_obsolete_host_lean_toolchains(cfg)
+    maintain_host_lake_storage(cfg, phase="before cache restoration")
+    if not configure_checkout_git_identity(co):
+        return False
     return True
 
 
@@ -867,6 +877,30 @@ def fetch_ref(repo: str, dir: Path) -> bool:
 def fetch_git_source(url: str, dir: Path) -> bool:
     """Clone or refresh a worker-owned shallow snapshot of a source Git repository."""
     return _fetch_shallow(url, dir)
+
+
+def configure_checkout_git_identity(checkout: Path) -> bool:
+    """Link this checkout's Git author identity to the account authenticated with ``gh``."""
+    name, email = git_author_identity()
+    for key, value in (("user.name", name), ("user.email", email)):
+        if subprocess.run(["git", "-C", str(checkout), "config", "--local", key, value]).returncode:
+            return False
+    return True
+
+
+def host_agent_env() -> dict[str, str]:
+    """The common environment host work agents and their login-shell preflight receive.
+
+    Elan defaults to ``$HOME/.elan``.  For an isolated worker, ``isolate_home`` has already pinned
+    ``ELAN_HOME`` to the operator's real installation; for the default non-isolated worker, derive the
+    same default directly. Add its launchers after the caller's PATH, preserving explicit tool shims.
+    """
+    home = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    elan_home = Path(os.environ.get("ELAN_HOME", str(home / ".elan")))
+    return {
+        **os.environ,
+        "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}:{elan_home / 'bin'}",
+    }
 
 
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
@@ -922,7 +956,7 @@ def host_agent_argv(
     the caller writes it to the process's stdin; see ``host_agent_launch``."""
     from .build_resources import defaults
 
-    env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
+    env = defaults(host_agent_env())
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -1674,6 +1708,7 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
                         shared_mathlib.preparation_status(env)
                     restore()  # a rebase round's agent starts on its own branch's files
                     relink_build_outputs(cwd, env, phase="prepare", prefix=prefix)  # H1
+                    verify_host_storage_headroom(cwd, env, phase="after cache restoration")
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)

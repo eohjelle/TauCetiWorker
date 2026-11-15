@@ -116,7 +116,8 @@ with tempfile.TemporaryDirectory() as td:
         default_env = tc.agents.host_agent_env()
         check(
             "non-isolated host defaults Lake launchers to HOME/.elan/bin",
-            default_env["PATH"].split(os.pathsep)[:2] == [str(REPO / "scripts"), str(default_home / ".elan" / "bin")],
+            default_env["PATH"].split(os.pathsep)
+            == [str(REPO / "scripts"), "/usr/bin", str(default_home / ".elan" / "bin")],
         )
     finally:
         for key, value in (("HOME", saved_home), ("ELAN_HOME", saved_elan), ("PATH", saved_path)):
@@ -130,7 +131,7 @@ with tempfile.TemporaryDirectory() as td:
     check("unset ELAN_HOME resolves from the real pre-isolation HOME", agent_env.get("ELAN_HOME") == expected)
     check(
         "isolated host puts the shared Elan launchers on PATH",
-        agent_env["PATH"].split(os.pathsep)[:2] == [str(REPO / "scripts"), str(real / ".elan" / "bin")],
+        agent_env["PATH"].split(os.pathsep)[-1] == str(real / ".elan" / "bin"),
     )
 
     explicit = root / "operator-selected-elan"
@@ -138,7 +139,7 @@ with tempfile.TemporaryDirectory() as td:
     check("an explicit ELAN_HOME is preserved exactly", agent_env.get("ELAN_HOME") == str(explicit))
     check(
         "explicit Elan launchers are put on the host agent PATH",
-        agent_env["PATH"].split(os.pathsep)[:2] == [str(REPO / "scripts"), str(explicit / "bin")],
+        agent_env["PATH"].split(os.pathsep)[-1] == str(explicit / "bin"),
     )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
