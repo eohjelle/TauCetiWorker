@@ -154,6 +154,7 @@ RUN_STDLIB=(
   mirror_creds_macos.py
   oauth_refresh_loop.py
   desktop_credentials.py
+  desktop_local_mathlib.py
   oauth_user_agent.py
   observability_failures.py
   open_pr_pages.py
