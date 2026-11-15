@@ -36,6 +36,8 @@ sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 from tauceti_worker import work_recovery as wr
 
+tc.agents.git_author_identity = lambda: ("t", "t@example.com")
+
 fails = 0
 
 
