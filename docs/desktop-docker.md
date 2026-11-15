@@ -107,6 +107,16 @@ roadmap, and prefers roadmap work before review. It requests `--ignore-quota`;
 check the worker's quota diagnostics for admission failures. The schedule and a
 successful process exit alone do not establish that useful work completed.
 
+Lake stores downloaded artifacts separately and restores them during a build.
+An absent `.lake/build` directory or a 404 for the newest revision does not by
+itself establish a cache outage: an older compatible revision may have supplied
+the artifacts. `lake build --no-build <existing-module>` checks and restores a
+selected existing target without compiling missing source. Let that check finish
+and inspect its result before deciding that cache recovery is needed. The worker's
+host-agent guidance includes this distinction; rebuild the image after changing
+that guidance. To roll back the guidance, revert its source change and rebuild
+while the daily service is inactive, retaining all named volumes.
+
 Compose limits the container to two CPUs' worth of time, 4 GiB RAM and at most
 1 GiB swap. Normal named volumes retain checkouts, state, toolchains and logs
 under Docker's data root. Optional shared Mathlib builds, eager expanded
