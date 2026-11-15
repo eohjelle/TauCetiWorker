@@ -161,7 +161,8 @@ its identity and finish independent preparation first. Publish with
 writer cannot be overwritten. Keep the original remote history in the backup.
 Move the live checkout to that exact tested commit, tag the tested image for the
 existing Compose project, and recreate its stopped container with Compose `create
---no-deps --force-recreate tauceti`. Do not use `up` for update validation: that
+--no-build --pull never --force-recreate tauceti`. The desktop worker has no Compose
+service dependencies; check that before creating only this service. Do not use `up` for update validation: that
 would start another model round. Never use `down -v` or prune recovery images.
 
 Verify the image's packaged source and harmless CLI/import checks, merged Compose
