@@ -19,7 +19,7 @@ RESOURCE_ERROR = re.compile(
 DEFAULTS = {"LEAN_NUM_THREADS": "4", "RAYON_NUM_THREADS": "1"}
 WAIT_ENV = "TAUCETI_BUILD_RESOURCE_WAIT"
 
-# The pinned Tools11e608b asset overflows execve for full-library HeaderStyle checks.
+# The pinned Tools cccfd6b asset overflows execve for full-library HeaderStyle checks.
 # Tools e4ed3eab contains precisely this batching fix; the Lean checker is identical.
 STYLE_UNBATCHED_SHA256 = "7d69471ef34c5de1285013f8b3b57dc2f22a96a1168cf5ea5c8b79aaaff36f53"
 STYLE_BATCHED_SHA256 = "ae730ad9546b96109d8af3df5c7e061da8006813b32d72a58fafc0c5f5e553cc"
