@@ -313,7 +313,7 @@ with tempfile.TemporaryDirectory() as td:
         tc.storage.prune_obsolete_host_lean_toolchains(cfg)
         check("completed recovery no longer pins its toolchain", run.call_count == 2)
         run.reset_mock()
-        with patch("tauceti_worker.work_recovery.live_users", return_value=["active Lean process"]):
+        with patch("tauceti_worker.live_use.live_users", return_value=["active Lean process"]):
             tc.storage.prune_obsolete_host_lean_toolchains(cfg)
         check("live toolchain users prevent uninstall", run.call_count == 1)
 

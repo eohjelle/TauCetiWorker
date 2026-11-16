@@ -76,6 +76,7 @@ def main():
         subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(origin)], check=True)
         agents = tc.agents
         agents.sync_mathlib_pool = lambda cfg: None
+        agents.git_author_identity = lambda: ("t", "t@example.com")
         agents.CHECKOUT_URL = str(origin)
         main_oid = git(origin, "rev-parse", "main").strip()
 

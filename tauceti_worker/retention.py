@@ -298,7 +298,7 @@ def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False):
     if live_users(tree):
         note(report, "protected", str(tree))
         return
-    if discard:
+    if discard and not preserve_legacy_recovery():
         # Rounds are all-or-nothing: an idle checkout holds nothing that was not pushed. A clone
         # that other linked worktrees still use keeps its Git store; its caches are still evicted.
         from .live_use import dependent_worktrees
@@ -407,7 +407,11 @@ def recycle(cfg, *, now=None, dry=False):
     from .live_use import CACHE_DIRS, CACHE_TOP
 
     anchor = cfg.checkout.parent.parent if legacy_project() else cfg.state
-    pending = [(cfg.checkout.with_name(cfg.checkout.name + ".retention-deleting"), anchor)]
+    pending = (
+        []
+        if preserve_legacy_recovery()
+        else [(cfg.checkout.with_name(cfg.checkout.name + ".retention-deleting"), anchor)]
+    )
     pending += [(path.with_name(path.name + ".retention-deleting"), root) for path, root in cache_roots(cfg)]
     pending += [
         (cfg.checkout / name, anchor) for name in CACHE_DIRS | CACHE_TOP if name.endswith(".retention-deleting")
@@ -547,6 +551,11 @@ LEGACY_RECOVERY = (
 LEGACY = LEGACY_VERIFICATION + LEGACY_RECOVERY
 
 
+def preserve_legacy_recovery():
+    """The desktop opts out of deleting source retained by pre all-or-nothing releases."""
+    return os.environ.get("TAUCETI_PRESERVE_LEGACY_RECOVERY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _purge(parent, root, names, report, *, dry=False):
     for name in names:
         path = parent / name
@@ -570,6 +579,8 @@ def purge_legacy(state, report, *, dry=False, checkout=None):
     shared Mathlib and immutable installations by symlink, which deletion never follows; hard links
     into a workspace lose only the candidate's own name.
     """
+    if preserve_legacy_recovery():
+        return report
     members = [state, state / "verification-state"]
     # A native forge source keeps the same layout under state/sources/<id>/.
     sources = state / "sources"
@@ -595,6 +606,8 @@ def purge_legacy(state, report, *, dry=False, checkout=None):
 
 def purge_legacy_host(report, *, dry=False):
     """Delete the host-local ledger older releases kept for verification checkpoints."""
+    if preserve_legacy_recovery():
+        return report
     import pwd
 
     # TAUCETI_VERIFY_STORAGE_DIR moved the ledger (tests point it at scratch); only that is deleted.
@@ -820,6 +833,7 @@ COLLECTOR_ENV = frozenset(
         "PATH",
         "TAUCETI_BUILD_CACHE_ROOT",
         "TAUCETI_CACHE_MAX_GIB",
+        "TAUCETI_PRESERVE_LEGACY_RECOVERY",
     }
 )
 # Beyond the timer's set: what a user session supplies to a systemd unit implicitly.
@@ -1504,6 +1518,8 @@ def retire_roots(report, *, dry=False, deadline=None):
     to it; its contents are then deleted in deadline-bounded passes that resume on later runs.
     An older runtime's worker starting a new worker id at the instant of staging is not fenced:
     such code predates this protocol."""
+    if preserve_legacy_recovery():
+        return
     roots = retired_roots()
     if not roots:
         return

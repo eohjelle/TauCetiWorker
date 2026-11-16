@@ -86,32 +86,30 @@ def host_storage_free(checkout: Path, env=None) -> int:
 
 
 def start_host_storage_maintenance(cfg: Config):
-    """Standalone Docker loops run recovery housekeeping even while quota blocks rounds."""
+    """Standalone Docker loops request upstream cleanup even while quota blocks rounds."""
     if "TAUCETI_MIN_FREE_GIB" not in os.environ:
         return None
-    from .work_recovery import housekeep
+    from .retention import request_cleanup
 
     stopping = threading.Event()
 
     def run():
         while not stopping.is_set():
             try:
-                result = housekeep(cfg.state.parent, seconds=2, entries=16384, bytes=1024**3)
-                if result.get("removed_bytes", 0):
-                    log(f"recovery storage cleanup: reclaimed {result['removed_bytes'] / 1024**2:.1f} MiB")
+                request_cleanup(fallback=True)
             except Exception as error:
-                log(f"warning: recovery storage cleanup failed: {error}")
+                log(f"warning: storage cleanup request failed: {error}")
             stopping.wait(30)
 
-    thread = threading.Thread(target=run, name="recovery-storage", daemon=True)
+    thread = threading.Thread(target=run, name="storage-maintenance", daemon=True)
     thread.start()
     return stopping, thread
 
 
 def clean_lake_outputs(checkout: Path) -> None:
     """Remove generated outputs without invoking Elan or downloading a missing toolchain."""
+    from .live_use import live_users
     from .retention import fresh_report, remove
-    from .work_recovery import live_users
 
     if live_users(checkout):
         raise NoProgress("Lake cleanup incomplete: checkout still has live users")
@@ -136,8 +134,8 @@ def maintain_host_lake_storage(cfg: Config, *, phase: str) -> bool:
         return False
     clean_lake_outputs(cfg.checkout)
     from .build_caches import lake_cache
+    from .live_use import live_users
     from .retention import fresh_report, locked, remove
-    from .work_recovery import live_users
 
     # Recovery uses independent checkouts; their old builds must not strand the main loop.
     for checkout in cfg.state.glob("recovery/*/checkout"):
@@ -176,7 +174,7 @@ def guard_host_storage(proc, checkout: Path | None, env: dict, *, interval: floa
             if free >= reserve or proc.poll() is not None:
                 continue
             reason.append(f"disk pressure: {free / 1024**3:.1f} GiB free; {reserve / 1024**3:.0f} GiB required")
-            log(reason[0] + " — stopping process group; source edits are preserved")
+            log(reason[0] + " — stopping process group without deleting live outputs")
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
             if not finished.wait(2):
@@ -221,7 +219,7 @@ def prune_obsolete_host_lean_toolchains(cfg: Config) -> None:
                 return
         except OSError:
             continue
-    from .work_recovery import live_users
+    from .live_use import live_users
 
     for line in listed.stdout.splitlines():
         name = line.split()[0] if line.split() else ""

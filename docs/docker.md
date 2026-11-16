@@ -216,18 +216,30 @@ same mount so artifact hard links remain possible. Keep `state` on the backing d
 The mount must be a prerequisite of Docker startup: Docker must not silently create
 a fresh checkout on the underlying directory if the mount is unavailable.
 
-The standalone loop runs recovery housekeeping every 30 seconds, in batches bounded by
-two seconds, 16,384 entries and 1 GiB, including during quota waits.
-Retained checkouts are collected after their users exit: generated caches
-are discarded and unfinished sources are saved in recovery records before checkout removal.
-Live readers, verification references and recovery locks prevent premature cleanup.
+The standalone loop requests upstream storage cleanup every 30 seconds, including
+while waiting for quota. Upstream rate-limits fallback collectors to hourly and
+runs them with low CPU/I/O priority. Round entry also requests cleanup.
+
+Current upstream rounds are all-or-nothing: pushed work is retained remotely;
+unpublished work from a failed round is not automatically saved for resumption.
+Its collector removes legacy continuation/recovery state and retired worker data.
+Before an upgrade, reconcile and back up any unfinished source in those locations.
+The desktop override sets `TAUCETI_PRESERVE_LEGACY_RECOVERY=1`: legacy recovery,
+verification continuations, retained checkouts and host ledgers stay in place;
+retired roots and idle checkout sources are not discarded. The setting propagates
+to detached cleanup collectors. Generated build caches and disposable logs still
+follow their normal retention policies. This switch preserves existing data; it
+does not restore the removed recovery engine or resume old rounds. The desktop
+also refuses destructive checkout preparation or worktree deletion while source
+edits, non-cache untracked/ignored files or unpublished local commits remain, so
+maintenance can reconcile them in place.
 
 After restoring both caches, the worker measures space again and refuses to launch an
 agent if less than the configured reserve remains. Cleanup logs the free space before
 and after cleaning, and preflight logs it again after restoration. Cache downloads and
 host authoring processes are also checked every second while running. If free space
-falls below the reserve, their process group is stopped, without deleting source edits
-or live build files. Normal cleanup runs at the next quiescent round boundary.
+falls below the reserve, their process group is stopped without deleting live build files.
+The ordinary upstream round cleanup still governs unpublished work. Normal cleanup runs at the next quiescent round boundary.
 
 Overlap surveys retain the current source snapshot and any older versions leased by
 live reader processes. Unused versions are removed on the next snapshot request.
