@@ -20,6 +20,8 @@ services:
       TAUCETI_PACE: "0:0,100:95"
       TAUCETI_SHARED_MATHLIB_BUILDS: "off"
       TAUCETI_PRIVATE_MATHLIB_BUILDS: "1"
+      # Keep pre-upgrade recovery source in place; upstream otherwise deletes it.
+      TAUCETI_PRESERVE_LEGACY_RECOVERY: "1"
       TAUCETI_SHARED_ARTIFACTS: "0"
       TAUCETI_PRUNE_OBSOLETE_LEAN_TOOLCHAINS: "false"
       TAUCETI_MIN_FREE_GIB: "8"
