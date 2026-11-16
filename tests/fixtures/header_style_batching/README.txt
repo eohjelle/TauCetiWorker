@@ -1,5 +1,5 @@
 Exact trusted assets from TauCetiProject/TauCetiTools commit
-11e608b37033d5a3e775786b14a8ae97603d949a:
+cccfd6b73106bb49e5e59383e5c718279daefece:
   tauceti_tools/assets/scripts/lint-style.sh
   tauceti_tools/assets/scripts/HeaderStyle.lean
 
