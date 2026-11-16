@@ -57,7 +57,10 @@ def run_shared_checks(args):
     """Run the pinned shared checks, adapting only the known HeaderStyle argv overflow."""
     from tauceti_tools import templates
 
-    if not args or args[0] not in {"style", "lint", "verify"}:
+    # Shared argparse accepts options before the phase. Conservatively scan the unchanged
+    # arguments rather than duplicating its parser; an option value matching a phase merely
+    # enables the same checked adaptation, never changes which checks the shared parser runs.
+    if not {"style", "lint", "verify"}.intersection(args):
         return templates.run_script("local_checks.py", args)
     original = templates.ASSETS
     updated = batched_style(original / "scripts")
