@@ -144,7 +144,7 @@ reconcile. Each Git inspection has a 30-second timeout and preserves the checkou
 if inspection fails. Published clean work and generated-cache-only leftovers can proceed.
 This is preservation rather than automatic recovery or another retry process.
 
-The worker's shared-check adapter also supports the known Tools11e608b header
+The worker's shared-check adapter also supports the known Tools cccfd6b header
 style runner, whose whole-library file arguments exceed the OS execution limit.
 For style-containing checks it copies installed trusted assets to a temporary
 bundle and applies the exact upstream83befc4 `xargs -0 -n 2000` fix. Both the
