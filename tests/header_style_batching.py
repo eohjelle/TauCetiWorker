@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_tools import templates
+from tauceti_tools.project import Project
 
 from tauceti_worker import verification_resources as v
 
@@ -171,6 +172,61 @@ class HeaderBatching(unittest.TestCase):
             self.assertEqual(v.run_shared_checks(["style"]), 7)
             self.assertEqual(templates.ASSETS, self.assets)
         self.assertEqual({p.name: p.read_bytes() for p in self.scripts.iterdir()}, before)
+
+    def test_options_before_phase_use_the_adapter_and_keep_argument_order(self):
+        arguments = (
+            ["--base", "fixture", "style"],
+            ["--policy", "ordinary", "verify"],
+            ["--base=fixture", "--policy=ordinary", "lint"],
+        )
+        for args in arguments:
+            with self.subTest(args=args):
+                (self.scripts / "local_checks.py").write_text(
+                    "import argparse,hashlib,pathlib,sys\n"
+                    "parser=argparse.ArgumentParser()\n"
+                    "parser.add_argument('phase', choices=['style','lint','verify'])\n"
+                    "parser.add_argument('--base')\nparser.add_argument('--policy')\n"
+                    "parser.parse_args()\n"
+                    f"assert sys.argv[1:] == {args!r}\n"
+                    "style=pathlib.Path(__file__).with_name('lint-style.sh').read_bytes()\n"
+                    f"assert hashlib.sha256(style).hexdigest() == '{v.STYLE_BATCHED_SHA256}'\n"
+                )
+                with (
+                    patch.object(templates, "ASSETS", self.assets),
+                    patch.object(templates, "bootstrap_qualified", return_value=None),
+                ):
+                    self.assertEqual(v.run_shared_checks(args), 0)
+
+    def test_project_materialization_renders_scripts_and_preserves_local_policy(self):
+        project = Project(
+            {
+                "repositories": {"content": "example/Library", "roadmap": "example/Roadmap"},
+                "lean": {"roots": ["Library"]},
+            },
+            "fixture",
+        )
+        policy = self.project / "scripts/policy.json"
+        policy.parent.mkdir()
+        policy.write_bytes(b'{"TauCeti": "unrendered local policy"}\n')
+        rendered = templates.render(v.batched_style(self.scripts).decode(), project, qualified=True)
+        digest = hashlib.sha256(rendered.encode()).hexdigest()
+        (self.scripts / "local_checks.py").write_text(
+            "import hashlib,os,pathlib\n"
+            "root=pathlib.Path(__file__).parent\n"
+            "assert str(root) == os.environ['TAUCETI_TRUSTED_SCRIPTS']\n"
+            f"assert os.environ['TAUCETI_PROJECT_ROOT'] == {str(self.project)!r}\n"
+            f"assert hashlib.sha256((root/'lint-style.sh').read_bytes()).hexdigest() == '{digest}'\n"
+            f"assert hashlib.sha256((root/'policy.json').read_bytes()).hexdigest() == '{hashlib.sha256(policy.read_bytes()).hexdigest()}'\n"
+            "assert 'Library' in (root/'HeaderStyle.lean').read_text()\n"
+        )
+        with (
+            patch.object(templates, "ASSETS", self.assets),
+            patch.object(templates, "bootstrap_qualified", return_value=project),
+            patch.object(templates, "checkout_root", return_value=self.project),
+        ):
+            self.assertEqual(v.run_shared_checks(["style"]), 0)
+            self.assertEqual(templates.ASSETS, self.assets)
+        self.assertEqual(policy.read_bytes(), b'{"TauCeti": "unrendered local policy"}\n')
 
     def test_unrecognized_adapter_returns_unavailable_without_running_checks(self):
         package = self.root / "tauceti_tools"
