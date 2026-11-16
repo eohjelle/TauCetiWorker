@@ -220,7 +220,9 @@ class Scanner:
                             meta[found.st_ino] = [size, found.st_nlink]
                     if (
                         self.since_ns is not None
-                        and found.st_mtime_ns >= self.since_ns
+                        # Filesystem mtimes can lag the round's wall-clock timestamp.
+                        # Include the same coarse-timestamp window used for directories.
+                        and found.st_mtime_ns >= self.since_ns - RACY_NS
                         and (entry.path in self.tracked or len(self.tracked) < TRACK_LIMIT)
                     ):
                         self.tracked[entry.path] = (path, size, found.st_nlink)
