@@ -68,7 +68,7 @@ class DesktopLocalMathlibTests(unittest.TestCase):
 
     def cache_success(self, command, cwd, env, output, timeout):
         self.assertEqual(cwd, self.cwd)
-        self.assertGreater(timeout, 0)
+        self.assertIsNone(timeout)  # Upstream bounds preparation by the round, not a separate deadline.
         self.assertNotIn("TAUCETI_QUEUE_MATHLIB", env)
         self.assert_dependency_files_unchanged()
         return 0

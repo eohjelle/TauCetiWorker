@@ -737,6 +737,72 @@ def repair_origin(co: Path) -> bool:
     return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", checkout_url()]).returncode == 0
 
 
+def checkout_preservation_problem(path: Path) -> str | None:
+    """Refuse destructive desktop preparation when source or publication evidence is incomplete.
+
+    This leaves source in place for maintenance; it does not recreate the removed recovery engine.
+    Generated paths use upstream's cache classification. Local branches, tags and HEAD must all be
+    reachable from remote-tracking refs or git-safe-push's confirmed-publication refs.
+    """
+    from .live_use import CACHE_DIRS, CACHE_TOP, checkout_kind, live_users
+    from .retention import preserve_legacy_recovery
+
+    if not preserve_legacy_recovery() or not (path.exists() or path.is_symlink()):
+        return None
+    if users := live_users(path):
+        return f"live users: {', '.join(users[:3])}"
+    if checkout_kind(path) is None:
+        return "checkout metadata unavailable; existing files preserved"
+
+    def git(*args):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(path), *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return subprocess.CompletedProcess(args, 124, "", "source inspection unavailable")
+
+    for args in (("diff", "--name-only", "-z"), ("diff", "--cached", "--name-only", "-z")):
+        result = git(*args)
+        if result.returncode:
+            return "tracked-source inspection failed; checkout preserved"
+        if names := result.stdout.strip("\0").split("\0") if result.stdout else []:
+            return f"tracked edits: {', '.join(repr(name) for name in names[:3])}"
+    for ignored in (False, True):
+        args = ["ls-files", "--others", "--directory", "--no-empty-directory", "--exclude-standard", "-z"]
+        if ignored:
+            args.append("--ignored")
+        result = git(*args)
+        if result.returncode:
+            return "untracked-source inspection failed; checkout preserved"
+        for name in result.stdout.split("\0"):
+            if not name:
+                continue
+            parts = Path(name).parts
+            if any(part in CACHE_DIRS for part in parts) or parts[0] in CACHE_TOP:
+                continue
+            return f"{'ignored' if ignored else 'untracked'} source: {name!r}"
+    result = git(
+        "rev-list",
+        "--max-count=1",
+        "HEAD",
+        "--branches",
+        "--tags",
+        "--not",
+        "--remotes",
+        "--glob=refs/tauceti/published/*",
+    )
+    if result.returncode:
+        return "publication inspection failed; checkout preserved"
+    if result.stdout.strip():
+        return f"local commit lacks confirmed publication: {result.stdout.strip()[:12]}"
+    return None
+
+
 def discard_checkout(path: Path, why: str) -> bool:
     """Delete a checkout that cannot be reset in place; anything unpushed in it is abandoned.
 
@@ -744,6 +810,9 @@ def discard_checkout(path: Path, why: str) -> bool:
     never a tree a live process still uses (that is reported and retried next round)."""
     from . import retention
 
+    if problem := checkout_preservation_problem(path):
+        log(f"checkout: kept {path} ({why}): {problem}; maintenance must reconcile it")
+        return False
     report = retention.fresh_report()
     try:
         # Anchored one level up, so a symlinked parent directory is refused like any other link.
@@ -773,6 +842,9 @@ def prepare_checkout(
     from . import round_worktrees
     from .live_use import checkout_kind
 
+    if problem := checkout_preservation_problem(co):
+        log(f"checkout preparation refused for {co}: {problem}; maintenance must reconcile it")
+        return False
     if round_worktrees.enabled():
         if not round_worktrees.prepare(cfg, checkout_url()):
             return False
