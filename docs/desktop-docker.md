@@ -144,6 +144,18 @@ reconcile. Each Git inspection has a 30-second timeout and preserves the checkou
 if inspection fails. Published clean work and generated-cache-only leftovers can proceed.
 This is preservation rather than automatic recovery or another retry process.
 
+The worker's shared-check adapter also supports the known Tools11e608b header
+style runner, whose whole-library file arguments exceed the OS execution limit.
+For style-containing checks it copies installed trusted assets to a temporary
+bundle and applies the exact upstream83befc4 `xargs -0 -n 2000` fix. Both the
+script and unchanged Lean checker hashes must match recognized versions; unknown
+versions fail closed. The recognized already-fixed asset is used unchanged.
+Every validated file still receives the same header check, failed batches still
+fail the audit, and the full text-style pass remains unchanged. Installed Tools,
+the mathematical checkout and its selected Tools pin are never edited. This
+adapter is part of the image; rolling it back restores the earlier header-argument
+limit, so retain a tested image with the fix for whole-library verification.
+
 At the existing 03:00 check-in, inspect the service result and actual work:
 
 ```sh
