@@ -229,6 +229,10 @@ def _remove(tree: Path, common: Path | None = None):
 
     Never while a live process uses the tree or a mount lies inside it (``InUse``)."""
     _check_unused(tree)
+    from .agents import checkout_preservation_problem
+
+    if problem := checkout_preservation_problem(tree):
+        raise InUse(f"{tree}: {problem}; maintenance must reconcile it")
     git = ["git", f"--git-dir={common or host_clone()}"]
     subprocess.run([*git, "worktree", "remove", "--force", str(tree)], check=True, capture_output=True, text=True)
 
