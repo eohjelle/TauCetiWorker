@@ -96,6 +96,10 @@ def scanner_tests():
     # A file created this round that grows in place, without its directory changing, is caught.
     log = checkout / "build.log"
     write(log, MIB)
+    # Filesystem timestamps may lag time.time_ns() at the round boundary.
+    # Exercise that boundary explicitly instead of relying on the host's tick.
+    coarse_stamp = scanner.since_ns - 1_000_000
+    os.utime(log, ns=(coarse_stamp, coarse_stamp))
     scanner.scan()
     time.sleep(2.2)  # past the racy window: only per-file tracking can see the growth
     scanner.scan()
