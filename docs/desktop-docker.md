@@ -131,6 +131,19 @@ fails. An attached shared tree, retained shared-view marker (including malformed
 markers), or inherited view/lease metadata blocks private extraction and remains
 intact for recovery. No shared-cache migration or extra service is needed.
 
+`TAUCETI_PRESERVE_LEGACY_RECOVERY=1` keeps pre-upgrade recovery and verification
+continuations, retained checkouts, host ledgers and retired worker roots intact.
+Idle checkout sources are preserved while generated caches remain reclaimable.
+Upstream's detached cleanup inherits this switch. Current upstream rounds are
+all-or-nothing and no longer resume old recovery records; preserve/reconcile those
+records separately before deliberately removing this switch. Before a destructive reset or worktree deletion, the desktop additionally checks
+for live users, tracked edits, non-cache untracked/ignored files and local commits
+without remote or confirmed-push evidence. It leaves such source in place and
+refuses preparation, reporting the path and reason for daily maintenance to
+reconcile. Each Git inspection has a 30-second timeout and preserves the checkout
+if inspection fails. Published clean work and generated-cache-only leftovers can proceed.
+This is preservation rather than automatic recovery or another retry process.
+
 At the existing 03:00 check-in, inspect the service result and actual work:
 
 ```sh
