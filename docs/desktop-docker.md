@@ -156,6 +156,13 @@ keeps these two entry points aligned. Rolling back to the old image restores
 the vulnerable source-entry-point pin, so retain the tested image when whole-library
 verification is required.
 
+The private-byte scanner includes its existing two-second timestamp tolerance
+when selecting files for growth tracking. Filesystem modification timestamps can
+lag the round's wall-clock start; without this tolerance a newly created file
+could grow without being measured on the next pass. The storage regression forces
+that timestamp boundary and checks the allocated-byte result. This changes only
+measurement, not storage policy, limits, cleanup or the desktop's default mode.
+
 At the existing 03:00 check-in, inspect the service result and actual work:
 
 ```sh
