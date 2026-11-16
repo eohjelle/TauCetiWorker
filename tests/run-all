@@ -57,6 +57,7 @@ RUN_STDLIB=(
   build_resources.py
   excerpt.py
   build_cache_wait.py
+  header_style_batching.py
   activity.py
   activity_git.py
   activity_costs.py
