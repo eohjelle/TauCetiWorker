@@ -117,10 +117,13 @@ host-agent guidance includes this distinction; rebuild the image after changing
 that guidance. To roll back the guidance, revert its source change and rebuild
 while the daily service is inactive, retaining all named volumes.
 
-Compose limits the container to two CPUs' worth of time, 4 GiB RAM and at most
-1 GiB swap. `LEAN_NUM_THREADS=1` and `RAYON_NUM_THREADS=1` limit build concurrency:
-the November 17 full-library verification recorded an OOM kill with four Lean
-threads under these limits. Verification honors these explicit environment values.
+Compose limits the container to two CPUs' worth of time, 5 GiB RAM and at most
+1.5 GiB of existing host swap. `LEAN_NUM_THREADS=1` and `RAYON_NUM_THREADS=1`
+limit build concurrency. November 17 verification exceeded the former 4 GiB RAM
+and 1 GiB swap limits first with four Lean threads, then in `E7.MinusculeWeight`
+with one thread. The latter module passed under the current allowance while the
+host retained measured RAM and swap headroom. No additional host swap is provisioned.
+Verification honors the explicit thread settings.
 Normal named volumes retain checkouts, state, toolchains and logs
 under Docker's data root. Optional shared Mathlib builds, eager expanded
 artifacts and obsolete-toolchain pruning are disabled. The normal 8 GiB reserve
