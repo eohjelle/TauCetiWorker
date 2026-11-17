@@ -118,16 +118,44 @@ that guidance. To roll back the guidance, revert its source change and rebuild
 while the daily service is inactive, retaining all named volumes.
 
 Compose limits the container to two CPUs' worth of time, 5 GiB RAM and at most
-1.5 GiB of existing host swap. `LEAN_NUM_THREADS=1` and `RAYON_NUM_THREADS=1`
+24 GiB of host-backed swap. `LEAN_NUM_THREADS=1` and `RAYON_NUM_THREADS=1`
 limit build concurrency. November 17 verification exceeded the former 4 GiB RAM
 and 1 GiB swap limits first with four Lean threads, then in `E7.MinusculeWeight`
-with one thread. The latter module passed under the current allowance while the
-host retained measured RAM and swap headroom. No additional host swap is provisioned.
-Verification honors the explicit thread settings.
+with one thread. That module passed with 5 GiB RAM and 1.5 GiB swap. The larger
+swap allowance now favors completing large Lean checks while keeping RAM capped
+for desktop services. Verification honors the explicit thread settings.
 Normal named volumes retain checkouts, state, toolchains and logs
 under Docker's data root. Optional shared Mathlib builds, eager expanded
 artifacts and obsolete-toolchain pruning are disabled. The normal 8 GiB reserve
 and 14-day/256 MiB disposable agent-log retention remain enabled.
+
+The host supplies about 36 GiB of swap: the existing 4 GiB `/swapfile` and a
+fully allocated 32 GiB `/srv/data/swapfile` on the ordinary ext4 data drive. The
+latter is owned by root with mode 0600 and is outside the selected source backups;
+never archive swap contents. Its host-owned `/etc/fstab` entry is:
+
+```fstab
+/srv/data/swapfile none swap sw,nofail,pri=10 0 0
+```
+
+This generates `srv-data-swapfile.swap`, wanted by `swap.target` and ordered after
+and dependent on `srv-data.mount`. Validate the active capacity with `swapon --show
+--bytes` and the generated unit with `systemctl show srv-data-swapfile.swap`.
+Docker's [`memory-swap` value](https://docs.docker.com/engine/containers/resource_constraints/#--memory-swap-details)
+is the combined RAM-plus-swap limit: `29g` permits 5 GiB RAM plus 24 GiB swap; it
+does not provision host swap. Read the container's cgroup limits rather than its
+`free` output. A live increase must retain the same container/round identity; on
+this Docker/runc version, supply both `--memory 5g` and `--memory-swap 29g` to
+`docker update`. No restart or new model round is needed to raise these limits.
+
+The swap file and fstab entry are host configuration, preserved across worker
+updates alongside the credit-reserve service drop-in. The November 17 fstab preimage
+is `/etc/fstab.tauceti-swap-20261117.bak`, root-only. To roll back swap, first
+reconcile/finish active work and ensure remaining RAM and swap can hold the used
+pages. Deactivate only `/srv/data/swapfile`, confirm it is absent from `swapon
+--show`, remove only its fstab entry, reload systemd, and then remove the inactive
+file. Preserve the original `/swapfile` and unrelated fstab changes. Do not shrink
+a live container's allowance below its use or remove an active swap file.
 
 New upstream workers require shared Mathlib views by default. This deployment
 explicitly pairs `TAUCETI_SHARED_MATHLIB_BUILDS=off` with
@@ -233,8 +261,8 @@ only `/etc/systemd/system/tauceti-desktop-daily.service` and
 `/etc/systemd/system/tauceti-desktop-daily.timer`, then reload systemd. Keep the
 checkout, credentials and named volumes; do not use `down -v`. Disable/remove old
 native user-unit links if still present, and keep that timer disabled. Stop the
-worker before unmounting `/srv/data`. No filesystem reversal or state migration
-is needed.
+worker before unmounting `/srv/data`, and reconcile/deactivate the host swap file
+there before unmounting it. No filesystem reversal or state migration is needed.
 
 The workspace project path links to this checkout on the data drive. Source and
 deployment changes are committed and pushed to the GitHub fork; do not rely on a
