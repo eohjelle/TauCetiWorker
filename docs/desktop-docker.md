@@ -118,7 +118,10 @@ that guidance. To roll back the guidance, revert its source change and rebuild
 while the daily service is inactive, retaining all named volumes.
 
 Compose limits the container to two CPUs' worth of time, 4 GiB RAM and at most
-1 GiB swap. Normal named volumes retain checkouts, state, toolchains and logs
+1 GiB swap. `LEAN_NUM_THREADS=1` and `RAYON_NUM_THREADS=1` limit build concurrency:
+the November 17 full-library verification recorded an OOM kill with four Lean
+threads under these limits. Verification honors these explicit environment values.
+Normal named volumes retain checkouts, state, toolchains and logs
 under Docker's data root. Optional shared Mathlib builds, eager expanded
 artifacts and obsolete-toolchain pruning are disabled. The normal 8 GiB reserve
 and 14-day/256 MiB disposable agent-log retention remain enabled.
