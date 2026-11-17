@@ -18,6 +18,9 @@ services:
       TAUCETI_WORKER_ID: desktop
       TAUCETI_WORKER_ARGS: ""
       TAUCETI_PACE: "0:0,100:95"
+      # Full-library verification exceeded 4 GiB at Lean's four-thread default.
+      LEAN_NUM_THREADS: "1"
+      RAYON_NUM_THREADS: "1"
       TAUCETI_SHARED_MATHLIB_BUILDS: "off"
       TAUCETI_PRIVATE_MATHLIB_BUILDS: "1"
       # Retain this desktop's ordinary checkout; do not migrate into fleet worktrees.
