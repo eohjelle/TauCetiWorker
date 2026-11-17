@@ -11,7 +11,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from decimal import Decimal
@@ -903,12 +902,20 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         os.environ["FAKE_DELAY"] = "0.6"
         os.environ["FAKE_COST"] = "150"
         with ClaudeAPIContext("worker1", "fix"):
-            thread = threading.Thread(target=lambda: (time.sleep(0.3), self.budget.configure(set_grant=0, rate=0)))
-            thread.start()
-            result = self.run_claude()
-            thread.join()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"result": "done"', result.stdout)
+            with subprocess.Popen(
+                ["claude", "-p", "hello", "--model", "opus", "--output-format", "stream-json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ) as process:
+                # Change the balance only after the fake provider actually starts. A fixed
+                # sleep can instead revoke funding before admission on a busy host.
+                initial = process.stdout.readline()
+                self.assertEqual(json.loads(initial)["subtype"], "init")
+                self.budget.configure(set_grant=0, rate=0)
+                stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn('"result": "done"', stdout)
         self.assertEqual(Decimal(self.budget.snapshot()["balance"]), -150)
         with self.assertRaises(AdmissionUnavailable), ClaudeAPIContext("worker2", "review"):
             self.fail("an unfunded work stage started")
