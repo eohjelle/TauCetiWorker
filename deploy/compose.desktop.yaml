@@ -8,8 +8,8 @@ services:
       - apparmor=unconfined
     cpus: 2.0
     mem_limit: 5g
-    # Docker counts RAM plus swap here: permit at most 1.5 GiB of existing swap.
-    memswap_limit: 6656m
+    # Docker counts RAM plus swap here: 5 GiB RAM plus 24 GiB host-backed swap.
+    memswap_limit: 29g
     command: ["./tauceti", "work", "--worker-id", "desktop", "--agent", "codex", "--ignore-quota", "--skip", "progress", "--roadmap-only", "ReductiveGroups", "--roadmap-before-review"]
     environment:
       # Bookworm curl's HTTP/2 multiplexed artifact transfers can end in partial
