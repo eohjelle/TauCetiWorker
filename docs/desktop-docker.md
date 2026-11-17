@@ -150,16 +150,17 @@ if inspection fails. Published clean work and generated-cache-only leftovers can
 This is preservation rather than automatic recovery or another retry process.
 
 The source `./tauceti` entry point and installed worker both pin Tools
-`e4ed3eab96457b7425b494b0ea1952319f1d12d6`. The old source entry point still
+`3efe7c2dac753c6acaec93b9398cd2260493735d`. The old source entry point still
 selected `cccfd6b` even after upstream updated the installed package, leaving
 its whole-library header audit vulnerable to the OS argument limit. Aligning
 the pins uses the existing upstream83befc4 `xargs -0 -n 2000` fix in both paths.
 Every selected file receives the same header checker; failed batches still fail
 the audit, and the full text-style pass remains unchanged. No worker adapter or
 mathematical checkout tooling change is required. A pin-consistency regression
-keeps these two entry points aligned. Rolling back to the old image restores
-the vulnerable source-entry-point pin, so retain the tested image when whole-library
-verification is required.
+keeps these two entry points aligned. The current shared Tools revision also supplies
+upstream's PR-level diff guards. For rollback, retain a matching tested source/image
+pair with aligned entry-point pins; the pre-November16 image with the mismatched
+source pin remains unsuitable for whole-library verification.
 
 The private-byte scanner includes its existing two-second timestamp tolerance
 when selecting files for growth tracking. Filesystem modification timestamps can
