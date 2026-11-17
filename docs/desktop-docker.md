@@ -117,6 +117,45 @@ host-agent guidance includes this distinction; rebuild the image after changing
 that guidance. To roll back the guidance, revert its source change and rebuild
 while the daily service is inactive, retaining all named volumes.
 
+For deterministic verification or publication recovery, retain the original round
+lock and exact checkout/image identity. A direct `docker exec` or Compose command
+does not inherit the normal worker's prepared agent environment. Before invoking
+Lake or `tauceti-local-checks`, explicitly carry the desktop cache context:
+
+```sh
+export ELAN_HOME=/opt/elan
+export MATHLIB_CACHE_DIR=/opt/tauceti/state/desktop/home/.cache/mathlib
+export LAKE_CACHE_DIR=/opt/tauceti/checkouts/lake-cache/desktop
+export LAKE_ARTIFACT_CACHE=1 LAKE_RESTORE_ARTIFACTS=1
+export LEAN_NUM_THREADS=1 RAYON_NUM_THREADS=1
+```
+
+Also provide `LAKE_CONFIG` pointing to a temporary TOML file with the public cache
+service, using the deployed worker's `TAUCETI_CACHE_SERVICE`,
+`TAUCETI_CACHE_ARTIFACT_URL` and `TAUCETI_CACHE_REVISION_URL` values from
+`tauceti_worker.agents` (the ordinary defaults are `tauceti-public`,
+`https://cache.taucetiproject.org/artifacts` and
+`https://cache.taucetiproject.org/revisions`). The TOML has a `[[cache.service]]`
+entry with `name`, `kind = "s3"`, `artifactEndpoint` and `revisionEndpoint`.
+Keep the file for the command's lifetime and remove it afterward. It needs no
+upload credential. Check the effective `LAKE_CACHE_DIR` with `lake env` and a
+selected unchanged target using `lake build --no-build`; wait for the result.
+Do not interpret cache-preparation success as verification of the changed proof.
+
+On November 17 an ad hoc recovery omitted this environment. Lake selected an
+empty toolchain-local cache, although the ordinary preflight had populated the
+per-worker store. Both `E7.MinusculeWeight` and `G2.RootString` had exact cached
+input mappings and byte-identical outputs; recompiling them was avoidable.
+Whole-library verification requests every module, but does not itself require
+recompiling unchanged cached modules. Checkout-local outputs were preserved.
+The running verifier was repaired without restarting by temporarily aliasing its
+previously absent fallback cache path to the existing per-worker store; subsequent
+modules were unpacked from cache. That alias is a one-invocation recovery measure,
+not deployment configuration: remove only the exact recorded symlink after the
+verifier exits, preserving its target and all build outputs. Future recoveries
+must supply the explicit environment above and retain a terminal verification
+receipt bound to the exact published source.
+
 Compose limits the container to two CPUs' worth of time, 5 GiB RAM and at most
 24 GiB of host-backed swap. `LEAN_NUM_THREADS=1` and `RAYON_NUM_THREADS=1`
 limit build concurrency. November 17 verification exceeded the former 4 GiB RAM
