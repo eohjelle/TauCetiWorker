@@ -244,7 +244,10 @@ test results, deployment evidence and any remaining limitations.
 
 For an update rollback, reconcile execution again, restore the retained source
 commit and matching image tag, and recreate the stopped canonical container using
-the same Compose project and unchanged volumes. Keep the upstream/rebase evidence;
+the same Compose project and unchanged volumes. Retain the host swap and carry
+forward the 5 GiB RAM, 24 GiB swap and single-thread build settings when restoring
+an older Compose file; the former limits caused verified OOM failures. Validate
+the merged rollback configuration before recreating the container. Keep the upstream/rebase evidence;
 do not rewind the remote branch blindly. Update deployment metadata to identify
 the restored commit/image and the failed candidate.
 
