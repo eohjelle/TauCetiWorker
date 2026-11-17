@@ -20,6 +20,8 @@ services:
       TAUCETI_PACE: "0:0,100:95"
       TAUCETI_SHARED_MATHLIB_BUILDS: "off"
       TAUCETI_PRIVATE_MATHLIB_BUILDS: "1"
+      # Retain this desktop's ordinary checkout; do not migrate into fleet worktrees.
+      TAUCETI_ROUND_WORKTREES: "0"
       # Keep pre-upgrade recovery source in place; upstream otherwise deletes it.
       TAUCETI_PRESERVE_LEGACY_RECOVERY: "1"
       TAUCETI_SHARED_ARTIFACTS: "0"
