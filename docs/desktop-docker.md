@@ -127,7 +127,9 @@ New upstream workers require shared Mathlib views by default. This deployment
 explicitly pairs `TAUCETI_SHARED_MATHLIB_BUILDS=off` with
 `TAUCETI_PRIVATE_MATHLIB_BUILDS=1` to retain ordinary checkout-local Mathlib cache
 downloads. This is a selected storage mode, not a fallback after shared preparation
-fails. An attached shared tree, retained shared-view marker (including malformed
+fails. `TAUCETI_ROUND_WORKTREES=0` keeps the existing standalone mathematical
+checkout when upstream defaults to per-round fleet worktrees. No checkout migration
+is part of daily updates. An attached shared tree, retained shared-view marker (including malformed
 markers), or inherited view/lease metadata blocks private extraction and remains
 intact for recovery. No shared-cache migration or extra service is needed.
 
