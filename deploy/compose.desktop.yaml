@@ -7,9 +7,9 @@ services:
     security_opt:
       - apparmor=unconfined
     cpus: 2.0
-    mem_limit: 4g
-    # Docker counts RAM plus swap here: permit at most 1 GiB of swap.
-    memswap_limit: 5g
+    mem_limit: 5g
+    # Docker counts RAM plus swap here: permit at most 1.5 GiB of existing swap.
+    memswap_limit: 6656m
     command: ["./tauceti", "work", "--worker-id", "desktop", "--agent", "codex", "--ignore-quota", "--skip", "progress", "--roadmap-only", "ReductiveGroups", "--roadmap-before-review"]
     environment:
       # Bookworm curl's HTTP/2 multiplexed artifact transfers can end in partial
@@ -18,7 +18,7 @@ services:
       TAUCETI_WORKER_ID: desktop
       TAUCETI_WORKER_ARGS: ""
       TAUCETI_PACE: "0:0,100:95"
-      # Full-library verification exceeded 4 GiB at Lean's four-thread default.
+      # Limit concurrency alongside the measured desktop memory allowance.
       LEAN_NUM_THREADS: "1"
       RAYON_NUM_THREADS: "1"
       TAUCETI_SHARED_MATHLIB_BUILDS: "off"
