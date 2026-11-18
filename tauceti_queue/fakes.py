@@ -131,7 +131,9 @@ class FakeRepo:
         push_to: str | None = None,
     ) -> str:
         """Commit `files` on top of `start` (default: the canonical branch) in the scratch clone; optionally push to a ref."""
-        run_git(self.scratch, "fetch", "-q", "origin", "+refs/*:refs/remotes/origin/*")
+        # This fixture keeps every origin ref under its original namespace. Do not
+        # also apply the clone's default heads-only tracking map to the same fetch.
+        run_git(self.scratch, "fetch", "-q", "--refmap=", "origin", "+refs/*:refs/remotes/origin/*")
         base = start or run_git(self.scratch, "rev-parse", f"refs/remotes/origin/heads/{self.branch}")
         run_git(self.scratch, "checkout", "-q", "--detach", base)
         self.write_files(files)
