@@ -331,10 +331,10 @@ done
 # change could break it without CI running it.
 docs_contract=(" ${DOCS_CONTRACT[*]} ")
 undeclared=()
-for f in $(grep -lE 'REPO / "(README\.md|docs|workers\.toml\.example)"' tests/*.py); do
+while IFS= read -r f; do
   base=$(basename "$f")
   [[ "${docs_contract[*]}" == *" $base "* ]] || undeclared+=("$base")
-done
+done < <(grep -lE 'REPO / "(README\.md|docs|workers\.toml\.example)"' tests/*.py)
 if ((${#undeclared[@]})); then
   echo "ERROR: test file(s) read README.md/docs/workers.toml.example but are not in DOCS_CONTRACT in tests/run-all:" >&2
   printf '  - %s\n' "${undeclared[@]}" >&2
@@ -400,6 +400,7 @@ export RUN_ROOT FAIL_FAST
 
 # --- run ------------------------------------------------------------------------------------------
 echo "run-all: ${#selected[@]} modules, group $GROUP, $JOBS at a time, python $PY"
+# shellcheck disable=SC2016 # The child Bash expands its positional parameter.
 printf '%s\n' "${selected[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
 
 for t in "${selected[@]}"; do
