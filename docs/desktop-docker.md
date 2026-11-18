@@ -219,15 +219,20 @@ reconcile. Each Git inspection has a 30-second timeout and preserves the checkou
 if inspection fails. Published clean work and generated-cache-only leftovers can proceed.
 This is preservation rather than automatic recovery or another retry process.
 
-The source `./tauceti` entry point and installed worker both pin Tools
-`3efe7c2dac753c6acaec93b9398cd2260493735d`. The old source entry point still
+The source `./tauceti` entry point and installed worker both select Tools `main`,
+following upstream's November 18 dependency policy. Record and compare the actual
+resolved Tools commit in both image environments before deployment; matching
+branch names alone do not establish matching installed code. The consistency
+regression accepts `main` or an exact commit and requires both entry points to agree.
+Previously both were aligned at `3efe7c2dac753c6acaec93b9398cd2260493735d`.
+Before that correction, the old source entry point still
 selected `cccfd6b` even after upstream updated the installed package, leaving
 its whole-library header audit vulnerable to the OS argument limit. Aligning
 the pins uses the existing upstream83befc4 `xargs -0 -n 2000` fix in both paths.
 Every selected file receives the same header checker; failed batches still fail
 the audit, and the full text-style pass remains unchanged. No worker adapter or
 mathematical checkout tooling change is required. A pin-consistency regression
-keeps these two entry points aligned. The current shared Tools revision also supplies
+keeps these two entry points aligned. Shared Tools also supplies
 upstream's PR-level diff guards. For rollback, retain a matching tested source/image
 pair with aligned entry-point pins; the pre-November16 image with the mismatched
 source pin remains unsuitable for whole-library verification.
