@@ -219,12 +219,15 @@ reconcile. Each Git inspection has a 30-second timeout and preserves the checkou
 if inspection fails. Published clean work and generated-cache-only leftovers can proceed.
 This is preservation rather than automatic recovery or another retry process.
 
-The source `./tauceti` entry point and installed worker both select Tools `main`,
-following upstream's November 18 dependency policy. Record and compare the actual
-resolved Tools commit in both image environments before deployment; matching
-branch names alone do not establish matching installed code. The consistency
-regression accepts `main` or an exact commit and requires both entry points to agree.
-Previously both were aligned at `3efe7c2dac753c6acaec93b9398cd2260493735d`.
+Upstream selects Tools `main`. For this tested desktop deployment, the source
+`./tauceti` entry point and installed worker both pin its November 18 observed head,
+`1aea401ffaaa89b4b0af8fd4fb20a971176db889`. The mutable reference failed the
+candidate image's offline CLI check and would let the persistent script environment
+resolve different code from the image's installed package. When integrating an
+upstream dependency change, resolve its current reference, pin both entry points
+to that commit, and verify the actual installed commits in both image environments.
+The consistency regression requires matching immutable references. Previously both
+were aligned at `3efe7c2dac753c6acaec93b9398cd2260493735d`.
 Before that correction, the old source entry point still
 selected `cccfd6b` even after upstream updated the installed package, leaving
 its whole-library header audit vulnerable to the OS argument limit. Aligning
