@@ -990,6 +990,18 @@ class ActivityTests(unittest.TestCase):
         s = a.cached()["summary"]
         self.assertEqual(sum(r["finished"] for r in s["rounds"]["total"].values()), 1)
 
+    def test_fractional_history_cutoff_keeps_its_first_native_round(self):
+        # SQLite's implicit REAL-to-TEXT conversion rounds this instant upward.
+        # The first native receipt must not fall below its own history cutoff.
+        self.now = 1794973403.1952357 + 60
+        self.finish(60, kind="fix", rid="first-native")
+        a.prepare(now=self.now)
+        summary = a.cached()["summary"]
+        self.assertEqual(summary["rounds"]["total"], {"fix": dict(finished=1, failed=0, unknown=0)})
+        with contextlib.closing(a._connect()) as db:
+            cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()[0]
+        self.assertEqual(cutoff, self.now - 60)
+
     def test_history_cutoff_keeps_native_rounds_and_preserves_older_pr_identities(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute(
