@@ -414,11 +414,13 @@ def _clean_history(db):
     # Pin the start once, using the first native lifecycle receipt. Preserve event
     # deduplication tombstones so replaying a journal cannot restore discarded facts.
     if not db.execute("SELECT 1 FROM meta WHERE key='history_cutoff'").fetchone():
-        db.execute("""
-          INSERT OR IGNORE INTO meta(key,value)
-          SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
-          WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
-        """)
+        first = db.execute(
+            "SELECT MIN(COALESCE(started,finished)) FROM rounds WHERE id NOT LIKE 'resource:%'"
+        ).fetchone()[0]
+        if first is not None:
+            # meta.value is TEXT: SQLite's implicit conversion can round upward
+            # and delete the very first round. Python's representation round-trips.
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES ('history_cutoff',?)", (str(first),))
     db.execute("DELETE FROM rounds WHERE id>='resource:' AND id<'resource;'")
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     if cutoff:
