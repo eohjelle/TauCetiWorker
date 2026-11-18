@@ -1,4 +1,4 @@
-"""Both worker entry points must select the same upstream Tools reference."""
+"""Both worker entry points must select the same immutable shared Tools revision."""
 
 import re
 import tomllib
@@ -16,9 +16,9 @@ def tools_pin(project):
     dependencies = [value for value in project["dependencies"] if value.startswith("tauceti-tools ")]
     assert len(dependencies) == 1, "each entry point must declare exactly one shared Tools dependency"
     match = re.fullmatch(
-        r"tauceti-tools @ git\+https://github.com/TauCetiProject/TauCetiTools@(main|[0-9a-f]{40})", dependencies[0]
+        r"tauceti-tools @ git\+https://github.com/TauCetiProject/TauCetiTools@([0-9a-f]{40})", dependencies[0]
     )
-    assert match, "shared Tools must select upstream main or an exact Git revision"
+    assert match, "shared Tools must have an immutable Git revision"
     return match[1]
 
 
