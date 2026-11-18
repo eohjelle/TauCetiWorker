@@ -226,6 +226,10 @@ candidate image's offline CLI check and would let the persistent script environm
 resolve different code from the image's installed package. When integrating an
 upstream dependency change, resolve its current reference, pin both entry points
 to that commit, and verify the actual installed commits in both image environments.
+The image build also applies that direct Tools snapshot as an installation override
+to Review's transitive `main` requirement. Otherwise a later movement of `main`
+makes the pinned direct and mutable transitive URLs conflict during a rebuild.
+The override is derived from `pyproject.toml`, not a separately maintained pin.
 The consistency regression requires matching immutable references. Previously both
 were aligned at `3efe7c2dac753c6acaec93b9398cd2260493735d`.
 Before that correction, the old source entry point still

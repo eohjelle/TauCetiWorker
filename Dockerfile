@@ -100,7 +100,12 @@ COPY tauceti-path.sh /etc/profile.d/tauceti-path.sh
 # worker from a checkout rather than an installed wheel.
 # Bare-Python helper entrypoints (including the OAuth refresher) also import the
 # worker package, so install its shared Tools dependency outside the uv-script env.
-RUN uv pip install --system --break-system-packages . \
+# Review follows Tools main. Apply this deployment's tested direct Tools snapshot to
+# that transitive requirement too, even after main moves during a rebuild.
+RUN python3 -c 'import tomllib; print(next(d for d in tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"] if d.startswith("tauceti-tools @ ")))' \
+        > /tmp/tauceti-tools-override.txt \
+    && uv pip install --system --break-system-packages --overrides /tmp/tauceti-tools-override.txt . \
+    && rm /tmp/tauceti-tools-override.txt \
     && install -m 0755 scripts/curl-no-progress /usr/local/bin/curl \
     && ln -s /opt/tauceti/scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
