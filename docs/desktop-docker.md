@@ -117,6 +117,14 @@ host-agent guidance includes this distinction; rebuild the image after changing
 that guidance. To roll back the guidance, revert its source change and rebuild
 while the daily service is inactive, retaining all named volumes.
 
+Host coding rounds now compare the prepared dependency files with the revision
+whose cache was restored. An older revision with matching dependencies still
+proceeds. `waiting-build-cache` (exit 79) means preparation deferred before model
+work; it does not satisfy the daily useful-round requirement. This one-shot
+deployment does not adopt the fleet loop. Daily maintenance retains the exact
+wait, dependency and execution evidence and owns recovery through the existing
+service after reconciling the available cache and any unresolved execution.
+
 For deterministic verification or publication recovery, retain the original round
 lock and exact checkout/image identity. A direct `docker exec` or Compose command
 does not inherit the normal worker's prepared agent environment. Before invoking
