@@ -228,8 +228,11 @@ if inspection fails. Published clean work and generated-cache-only leftovers can
 This is preservation rather than automatic recovery or another retry process.
 
 Upstream selects Tools `main`. For this tested desktop deployment, the source
-`./tauceti` entry point and installed worker both pin its November 18 observed head,
-`1aea401ffaaa89b4b0af8fd4fb20a971176db889`. The mutable reference failed the
+`./tauceti` entry point and installed worker both pin its November 20 observed head,
+`6322b2e53f9d1c2533f3439175f15dc84cc863a5`. This snapshot supports the upstream
+PR-size guard's `large_refactor` argument, admin-label evidence reader and
+separate limits for added and removed lines.
+The mutable reference failed the
 candidate image's offline CLI check and would let the persistent script environment
 resolve different code from the image's installed package. When integrating an
 upstream dependency change, resolve its current reference, pin both entry points

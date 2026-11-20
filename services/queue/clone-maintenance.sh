@@ -75,5 +75,12 @@ if [ -e "$lock" ]; then
   rm -f "$lock"
 fi
 
-exec git -C "$CLONE" maintenance run \
-  --task=pack-refs --task=loose-objects --task=incremental-repack --task=commit-graph
+tasks=(--task=pack-refs --task=loose-objects --task=commit-graph)
+# Git can schedule incremental repack before loose objects are packed. On a fresh
+# clone with no pack index, older Git fails to create a multi-pack index.
+shopt -s nullglob
+pack_indexes=("$git_dir"/objects/pack/*.idx)
+if [ "${#pack_indexes[@]}" -gt 0 ]; then
+  tasks+=(--task=incremental-repack)
+fi
+exec git -C "$CLONE" maintenance run "${tasks[@]}"
