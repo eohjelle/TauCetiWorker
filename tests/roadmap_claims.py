@@ -10,6 +10,9 @@ filtering), claimed_block (prompt rendering), and avoid_list against a fake `gh`
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import re
 import sys
 from pathlib import Path
@@ -17,6 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from tauceti_worker import intentions as it  # noqa: E402
+from tauceti_worker.config import Die  # noqa: E402
 from tauceti_worker.github import GitHubError  # noqa: E402
 
 fails = 0
@@ -177,10 +181,11 @@ check("names match case-sensitively", not it.in_area(issue("Left and right Fuete
 # --- avoid_list: one read per round, no area label in the query --------------
 class FakeGH:
     def __init__(self, issues, error=None):
-        self.issues, self.error, self.calls = issues, error, []
+        self.issues, self.error, self.calls, self.ttls = issues, error, [], []
 
-    def issue_list(self, repo, *, labels=None, fields, state="open", limit=200):
+    def issue_list(self, repo, *, labels=None, fields, state="open", limit=200, ttl=120):
         self.calls.append((list(labels or []), limit))
+        self.ttls.append(ttl)
         if self.error:
             raise self.error
         return [i for i in self.issues if all(lb in it._label_names(i) for lb in labels or [])]
@@ -224,14 +229,17 @@ check("a hold applies through either area label", round_("IntegralLattices")[1] 
 check("a hold does not reach other areas", round_("AlgebraicCurves")[1] == [12])
 check("an unpinned round reads only the holds and gets all of them", round_(None) == ([HOLDS], [14]))
 check("an ignore-claims round reads only the holds", round_("RepresentationTheory", respect=False) == ([HOLDS], []))
+ttl_gh = FakeGH(board)
+it.avoid_list(ttl_gh, "PDE", True)
+check("the board is shared on the host for ten minutes", ttl_gh.ttls == [600])
 check("nothing to avoid renders as none", it.avoid_list(FakeGH([]), "PDE", True) == "none")
 
 try:
     it.avoid_list(FakeGH(board, error=GitHubError("HTTP 504")), "PDE", True)
-    raised = False
-except GitHubError:
-    raised = True
-check("a failed read stops authoring, since holds fail closed", raised)
+    raised = None
+except Die as e:
+    raised = str(e)
+check("a failed read stops authoring, since holds fail closed", raised is not None and "HTTP 504" in raised)
 
 
 def no_identity():

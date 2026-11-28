@@ -7,10 +7,29 @@ name = "tauceti"
 version = "0.1.0"
 description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
-dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@b22318446dcf66776248ed8c19370cd8da396748", "rich>=13", "textual>=8,<9"]
+dependencies = [
+    "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@9f6561e2c2b86813b779de548cc49b6434fd8e58",
+    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@main",
+    "rich>=13",
+    "textual>=8,<9",
+    "psutil>=7; sys_platform == 'darwin'",
+    "cryptography>=42",
+    "anthropic>=2.12,<3",
+]
+
+# The TauCetiTools commit Worker CI tests against. CI runs `.github/scripts/tools-pin.sh apply`,
+# which points the dependency above at it, so a TauCetiTools merge cannot change Worker CI's
+# verdict; `.github/scripts/tools-pin.sh bump` opens the pull request that moves it to Tools main.
+# Production installs (services/queue/install*.sh, TauCetiFleet's worker runtimes and the Docker
+# image) deliberately keep following TauCetiTools main: the shared CI harness and TauCeti's
+# workflows run Tools main, and the queue's admission and result checks must agree with them.
+[tool.tauceti-ci]
+tools-rev = "e4648aa6e6325cfd08a1dbc191d0a610f4124a69"
 
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
+tauceti-workflow-backstop = "tauceti_worker.workflow_backstop:main"
+tauceti-queue = "tauceti_queue.__main__:main"
 
 # The worker is the tauceti_worker/ package. Its prompts/ and scripts/ wrappers live at the repo
 # root for the `./tauceti` shim (HERE resolves to the repo root in a checkout); the wheel bundles
@@ -20,7 +39,7 @@ tauceti = "tauceti_worker.cli:cli_main"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["tauceti_worker"]
+packages = ["tauceti_worker", "tauceti_queue"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "prompts" = "tauceti_worker/prompts"
@@ -30,7 +49,7 @@ packages = ["tauceti_worker"]
 target-version = "py311"
 line-length = 120
 # `tauceti` is the program but has no .py extension, so ruff won't pick it up by default.
-extend-include = ["tauceti", "scripts/tauceti-local-axioms", "scripts/tauceti-local-lint"]
+extend-include = ["tauceti", "scripts/tauceti-local-axioms", "scripts/tauceti-local-lint", "scripts/tauceti-local-checks", "scripts/tauceti-lean"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

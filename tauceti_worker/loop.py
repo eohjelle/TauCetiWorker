@@ -12,18 +12,18 @@ import sys
 import time
 
 from .agents import resolve_authoring_profile
-from .budget import Budget, BudgetError, admission_pause
+from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, admission_pause
 from .claude_api import api_mode
-from .config import Config, NoProgress, log
+from .config import Config, NoProgress, log, one_line
 from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
+    DRAIN_SIGNAL,
     EX_ADMISSION_WAIT,
     EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
-    EX_RECOVERY_IDLE,
     GH_MIN_BUDGET,
     INTERROUND,
     OPENROUTER_MODELS,
@@ -31,7 +31,9 @@ from .constants import (
 )
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
-from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
+from .github_state import enabled as github_state_enabled
+from .quota import Provider, Quota, _hours, _unavail_reason, claude_usage_credentials, quota_line
+from .quota_wait import QuotaWait
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 from .storage import start_host_storage_maintenance
@@ -41,56 +43,31 @@ class _LoopTerminated(KeyboardInterrupt):
     """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
 
 
+class _LoopDrained(KeyboardInterrupt):
+    """SIGUSR1 outside a round: a graceful restart found the loop between rounds."""
+
+
 def _recheck_in(prov: Provider | None, now: float) -> int:
     """How long until it is worth reading this provider's usage again, while waiting for quota.
 
-    A rate-limited endpoint (HTTP 429): its Retry-After, capped at RATE_LIMIT_RECHECK_MAX_S, and that
-    cap beats even a longer POLL. Any other Retry-After is honored as given. Otherwise the moment a
-    blocking window frees (hourly at most, so sibling workers and operator activity are still
-    observed), else the next poll. Never sooner than POLL: the next read would only re-trip a limit."""
+    Wake at a known telemetry deadline, rounded UP so an early wake cannot turn a
+    remaining fraction of a second into another full poll interval. Long waits are
+    revisited hourly without bypassing the fetcher's persisted cooldown."""
     if prov is None:
         return POLL
-    if prov.rate_limited and prov.error:  # no usable reading; a cached one waits on its own clock below
-        cap = RATE_LIMIT_RECHECK_MAX_S
-        return int(max(min(POLL, cap), min(prov.retry_after or POLL, cap)))
-    if prov.retry_after:
-        return int(max(POLL, prov.retry_after))
+    if prov.telemetry_unavailable and prov.next_eligible:
+        # An observed exhaustion may reset before the telemetry endpoint permits a
+        # retry. Re-evaluate it then; --ignore-quota can resume without another fetch.
+        deadline = math.ceil(prov.next_eligible - now)
+        if prov.retry_after and math.isfinite(prov.retry_after) and prov.retry_after > 0:
+            deadline = min(deadline, math.ceil(prov.retry_after))
+        return max(1, min(deadline, 3600))
+    if prov.retry_after and math.isfinite(prov.retry_after) and prov.retry_after > 0:
+        floor = 1 if prov.telemetry_unavailable or prov.rate_limited or prov.model_refusal else POLL
+        return max(floor, min(math.ceil(prov.retry_after), 3600))
     if prov.next_eligible:
         return max(POLL, min(int(prov.next_eligible - now) + 5, 3600))
     return POLL
-
-
-def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
-    """Render the immediate pacing bottleneck when it defers an otherwise-initializable idle window.
-
-    The provider remains HARD-blocked for launch-control purposes until the window is initialized; this
-    is display-only. But when the only hard state is a plain post-reset idle window and a sibling window
-    is pacing-blocked, the sibling is what must clear first. Show that condition first instead of hiding
-    it behind the latent idle state.
-
-    `markup=False` for a plain destination; see quota_line.
-    """
-    line = quota_line(snap, markup=markup)
-    prov = snap.get("claude")
-    if prov is None or prov.error or prov.available:
-        return line
-
-    windows = prov.windows or []
-    idle = [w for w in windows if w.status == "idle"]
-    paced = [w for w in windows if w.status in ("at-budget", "over-pace")]
-    other_hard = [w for w in windows if w.status not in ("under-pace", "at-budget", "over-pace", "idle")]
-    if not idle or not paced or other_hard or any(w.detail != "window reset; awaiting initialization" for w in idle):
-        return line
-
-    why = "; ".join(
-        [
-            *(_pace_reason(w) for w in paced),
-            *(f"{w.name} window reset — initialization deferred until pacing permits" for w in idle),
-        ]
-    )
-    old = quota_line({"claude": prov}, markup=markup)
-    new = f"claude {_glyph('~', 'yellow', markup)} ({why})"
-    return line.replace(old, new, 1)
 
 
 def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, ...] = ()) -> int:
@@ -107,51 +84,63 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'}{targeted} "
         f"agent={agent}{' [bubble]' if bubble else ''}"
     )
-    report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
+    report_runtime(
+        "idle",
+        detail="loop started",
+        phase=None,
+        target=None,
+        roadmap_focus=None,
+        roadmap_target=None,
+        next_action_at=None,
+        authoring=None,  # a new loop's sources or limits may differ; its first round reports afresh
+    )
     streak = 0
     admission_streak = 0
-    recovery_probe_at = 0.0
     collision_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_drain = signal.getsignal(DRAIN_SIGNAL)
+    quota_wait = QuotaWait(cfg, agent)
+    # Rounds are all-or-nothing, so a restart must never interrupt one. While a round runs the drain
+    # request is only recorded; between rounds (sleeping, waiting for quota, budget or GitHub, or
+    # selecting work) it ends the loop at once, so an idle worker restarts promptly.
+    drain = {"requested": False, "in_round": False, "raised": False}
 
     def terminate(_signum, _frame) -> None:
         # run_round_subprocess catches KeyboardInterrupt and tears down the round's process
         # group before re-raising, so use that same proven cleanup path for Compose SIGTERM.
         raise _LoopTerminated
 
+    def request_drain(_signum, _frame) -> None:
+        drain["requested"] = True
+        # The wrapper repeats its request; only the first one may unwind the loop.
+        if not drain["in_round"] and not drain["raised"]:
+            drain["raised"] = True
+            raise _LoopDrained
+
     signal.signal(signal.SIGTERM, terminate)
+    signal.signal(DRAIN_SIGNAL, request_drain)
+    from . import background_relink
+
+    relinking = None  # The between-rounds relink child, if one is running.
     maintenance = start_host_storage_maintenance(cfg)
     try:
         while True:
+            if drain["requested"]:
+                raise _LoopDrained
             from .config import rotate_console_log
 
             rotate_console_log()
-            from .verification_jobs import reap_continuations, resume_pending
-
-            reap_continuations(cfg)
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
-            # Verification owns an isolated candidate and a separate job lease. Its execution
-            # must not block model selection, and host CI reservations still precede launch.
-            resume_pending(cfg, background=True)
-            from .repair_recovery import due
-
-            recovery_only = (
-                set(only) != {"security-audit"}
-                and time.time() >= recovery_probe_at
-                and due(cfg, only=only, prs=prs, sandbox_host=not bubble, agent=agent)
-            )
-            if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
-                try:
-                    snapshot = Budget().snapshot(worker=cfg.wid)
-                    reason = admission_pause(snapshot, worker=cfg.wid)
-                    blocked = reason is not None
-                    if blocked:
+            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                snapshot = Budget().runtime_snapshot(worker=cfg.wid)
+                reason = admission_pause(snapshot, worker=cfg.wid) if snapshot else None
+                blocked = reason is not None
+                if blocked:
+                    with contextlib.suppress(*ACCOUNTING_ERRORS):
                         Budget().refresh_waiter(cfg.wid)
-                except (BudgetError, OSError) as error:
-                    blocked, reason, snapshot = True, str(error), {}
                 if blocked:
                     wake = snapshot.get("funding_at")
                     if reason == "API throughput cooldown":
@@ -167,38 +156,29 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 detail="checking provider availability",
                 phase=None,
                 target=None,
+                roadmap_focus=None,
+                roadmap_target=None,
                 failure_reason=None,
                 failure_code=None,
                 failure_log=None,
             )
-            # 1) Decide the model and whether to run this cycle. `pending_init` means Claude was picked
-            # while a window of it is reset-but-unopened: the round is authorized to spend ONE small
-            # request to open it, but only once it has found work (see work_units.dispatch).
-            pending_init = False
-            if recovery_only:
-                model = agent  # The child attempts recovery before any model selection.
-            elif unpaced:
+            # Decide provider availability using the common quota verdict.
+            if unpaced:
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
-                # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
-                # still read the usage endpoint and wait out a HARD block: a window at 100% (exhausted),
-                # usage we cannot read (fail-closed), or the endpoint itself refusing to answer (its own
-                # 429 / a network failure). Only a soft over-pace block — real quota left, merely ahead of
-                # the burn line — runs through here. Without this a pinned `--agent claude` worker re-fires
-                # every green PR into a rate-limited subscription, burning a clone + engine launch each
-                # round to post an all-error scoreboard.
+                # An explicit pacing override may run through a transient telemetry outage.
+                # Known exhaustion, auth failures and malformed readings still block. Actual
+                # model refusals stop the round and use the existing no-progress backoff.
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
-                _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
+                _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True, _wait=quota_wait)
                 prov = snap.get(agent)
                 verdict = _ignore_quota_verdict(_chosen, prov)
-                # An unopened window is the one hard block --ignore-quota may still clear, because the
-                # clearing is a bounded, pace-respecting request rather than an override of a real limit.
-                if verdict == "wait" and agent == "claude" and claude_pending_init(snap):
-                    verdict, pending_init = "run", True
                 if verdict == "wait":
                     why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
                     nap = _recheck_in(prov, time.time())
+                    if quota_wait.deadlines:
+                        nap = max(0, math.ceil(quota_wait.recheck_at() - time.time()))
                     # A loop DOES wait this out, so the wording stays — but a rejected credential is not
                     # something waiting fixes, and an unattended loop can poll on one indefinitely, so
                     # name the command that ends it here too.
@@ -207,15 +187,15 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                         f"block; sleeping {nap}s{_credential_hint(agent, prov)}"
                     )
                     report_runtime("waiting-quota", detail=why, next_action_at=time.time() + nap)
-                    time.sleep(nap)
+                    _wait_for_quota(quota_wait, nap, quota_cmd)
                     continue
                 if verdict == "over-pace":
                     log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+                elif verdict == "telemetry-unavailable":
+                    log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
                 model = agent
             else:
-                model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
-                if model is None and claude_pending_init(snap):
-                    model, pending_init = "claude", True
+                model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True, _wait=quota_wait)
                 if model is None:
                     # Wake for whichever provider can change first. An idle/unknown alternative may
                     # become usable at the next poll, so another provider's distant reset or long
@@ -226,35 +206,43 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     # well before its reset, so a long wait sleeps to the line, not past it.
                     now = time.time()
                     nap = min((_recheck_in(p, now) for p in snap.values()), default=POLL)
+                    if quota_wait.deadlines:
+                        nap = max(0, math.ceil(quota_wait.recheck_at() - now))
                     # Neither destination renders Rich markup: log() writes to stderr and a file, and a
                     # runtime-status detail is read back as data.
-                    waiting = _wait_quota_line(snap, markup=False)
+                    waiting = quota_line(snap, markup=False)
                     log(f"quota: {waiting} — sleeping {nap}s")
                     report_runtime("waiting-quota", detail=waiting, next_action_at=time.time() + nap)
-                    time.sleep(nap)
+                    _wait_for_quota(quota_wait, nap, quota_cmd)
                     continue
 
-            # 1b) GitHub budget preflight. A round does many gh calls AND launches the review engine,
-            # whose own diff fetch 403s when GitHub is rate-limited — throwing away the agent's work.
-            # The loop has no hard timeout, so this is where we wait out an hourly primary reset rather
-            # than launching expensive work that a mid-round 403 would discard. We watch BOTH buckets a
-            # round spends (REST core and the progress-guard graphql); either being low blocks launch
-            # until the later of their resets. The rate_limit probe is itself exempt, so this is free
-            # when we are flush.
-            # A configured mirror owns an independent read installation. Its callers must not
-            # be parked because the direct credential's unrelated read pool is running low.
-            # Publication is durable and actual rejections are handled by the transport/outbox.
-            gb = None if os.environ.get("TAUCETI_GITHUB_STATE_URL") else github_budget()
-            # Focused overlap scans publish through REST and do no PR authoring;
-            # unrelated GraphQL exhaustion must not park that queue.
-            buckets = ("core",) if set(only) == {"overlap-scan"} else ("core", "graphql")
-            low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < GH_MIN_BUDGET}
+            quota_wait.reset()
+            # Mirrored discovery owns a separate read quota. Only a recorded
+            # exhaustion of direct REST should pause a mirrored worker: fresh
+            # dispatch reads and publication still need that credential. Unknown
+            # quota and a low direct GraphQL pool must not block the mirror.
+            mirrored = github_state_enabled()
+            if mirrored:
+                from .github_transport import observed_budget, scope
+
+                # gh's credential store has no transport identity to persist
+                # observations under. Retain its existing preflight probe;
+                # a failed probe remains unknown and never prevents launch.
+                gb = observed_budget() if scope() else github_budget()
+            else:
+                gb = github_budget()
+            buckets = ("core",) if mirrored or set(only) == {"overlap-scan"} else ("core", "graphql")
+            minimum = 1 if mirrored else GH_MIN_BUDGET
+            low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < minimum}
             if low:
+                from .github_transport import reset_jitter
+
                 reset = max(v[1] for v in low.values())
-                nap = max(POLL, min(reset - int(time.time()) + 5, 3600))
+                # Every loop on the account waits for the same reset; spread their relaunches.
+                nap = max(POLL, min(reset - int(time.time()) + 5 + int(reset_jitter()), 3600))
                 detail = ", ".join(f"{k}={gb[k][0]}" for k in low)
                 log(
-                    f"github: REST budget low ({detail} remaining < {GH_MIN_BUDGET}) — "
+                    f"github: REST budget low ({detail} remaining < {minimum}) — "
                     f"waiting {nap}s for the reset before launching a round"
                 )
                 report_runtime("waiting-github", detail=detail, next_action_at=time.time() + nap)
@@ -262,7 +250,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 continue
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
-            tail = ["--worker-id", cfg.wid]
+            from .worker_sources import selection_arguments
+
+            tail = ["--worker-id", cfg.wid, *selection_arguments()]
             if overlap_batch := os.environ.get("TAUCETI_OVERLAP_BATCH_COMMITS"):
                 tail += ["--overlap-batch-commits", overlap_batch]
             if api_mode():
@@ -278,28 +268,13 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # flag omitted here would turn every round of a `--loop --pr` into a free-running one.
             if prs:
                 tail += ["--pr", ",".join(str(n) for n in prs)]
-            tail += ["--recovery-agent", agent]
-            if not (getattr(args, "author_model", None) or getattr(args, "author_effort", None)):
-                tail.append("--recovery-unpinned-profile")
-            if recovery_only:
-                tail += ["--recovery-only", "--agent", agent]
-            elif model:
-                tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
-            if recovery_only:
-                if getattr(args, "author_model", None):
-                    tail += ["--author-model", args.author_model]
-                if getattr(args, "author_effort", None):
-                    tail += ["--author-effort", args.author_effort]
+            if model:
+                tail += ["--agent", model, "--loop-paced"]  # soft pacing already decided by the parent
                 if ignore_quota:
-                    tail.append("--ignore-quota")
-            if pending_init:
-                # Authorization travels with the round, not with the pacer: the child asks for it only
-                # after it has surveyed and picked a work unit, so a round that finds nothing to do never
-                # spends the request. The GitHub preflight above has already passed at this point.
-                tail.append("--claude-bootstrap")
+                    tail.append("--ignore-quota")  # only the operator grants outage permission
             # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
             # authoring overrides. Their maintenance fallback resolves its normal defaults.
-            if model and not recovery_only and "security-audit" not in only:
+            if model and "security-audit" not in only:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),
@@ -336,15 +311,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 wait_detail=None,
                 wait_cached=None,
             )
-            rc = run_round_subprocess(tail)
-            if recovery_only:
-                recovery_probe_at = time.time() + 300  # At most one quota-independent probe per five minutes.
-            if rc == EX_RECOVERY_IDLE:
-                # Busy claims and other unavailable recovery records already have local retry
-                # scheduling. They must not delay unrelated reviews, fixes or roadmap work.
-                streak = 0
-                report_runtime("idle", detail="recovery deferred; selecting other work", next_action_at=None)
-                continue
+            drain["in_round"] = True
+            try:
+                rc = run_round_subprocess(tail)
+            finally:
+                drain["in_round"] = False
+            if drain["requested"]:
+                log(f"round finished (rc={rc}); restart requested, exiting at the round boundary")
+                raise _LoopDrained
+            # Off the next round's critical path: that round stops it before touching a checkout.
+            if getattr(cfg, "state", None) is not None:
+                relinking = background_relink.start(cfg.state, relinking)
             if rc == EX_CLAIM_COLLISION:
                 streak = 0
                 collision_streak += 1
@@ -352,7 +329,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 # a tiny capped pause to avoid hammering shared claims or GitHub.
                 nap = min(30, 5 * (collision_streak - 1))
                 report_runtime(
-                    "idle", detail="peer claims busy; selecting other work", next_action_at=time.time() + nap
+                    "idle", detail="work candidates unavailable; selecting other work", next_action_at=time.time() + nap
                 )
                 if nap:
                     time.sleep(nap)
@@ -371,10 +348,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if rc == EX_ADMISSION_WAIT:
                 paused = runtime_snapshot()
                 reason = fleet_admission_reason(cfg.wid)
-                waiting = paused.get("state") in ("waiting-capacity", "waiting-budget", "waiting-storage")
+                waiting = paused.get("state") in (
+                    "waiting-capacity",
+                    "waiting-budget",
+                    "waiting-storage",
+                    "waiting-resource",
+                )
                 state = "waiting-capacity" if reason else (paused["state"] if waiting else "waiting-budget")
-                admission_streak = admission_streak + 1 if state == "waiting-budget" else 0
+                admission_streak = admission_streak + 1 if state in ("waiting-budget", "waiting-resource") else 0
                 nap = 60 if state == "waiting-storage" else min(60, 5 * (1 << min(max(0, admission_streak - 1), 4)))
+                if state == "waiting-resource":
+                    nap = min(300, 30 * (1 << min(max(0, admission_streak - 1), 4)))
                 with contextlib.suppress(BudgetError, OSError):
                     if api_mode():
                         Budget().refresh_waiter(cfg.wid)
@@ -415,7 +399,13 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if rc == 0:
                 streak = 0
                 report_runtime(
-                    "idle", detail="round completed", phase=None, target=None, next_action_at=time.time() + INTERROUND
+                    "idle",
+                    detail="round completed",
+                    phase=None,
+                    target=None,
+                    roadmap_focus=None,
+                    roadmap_target=None,
+                    next_action_at=time.time() + INTERROUND,
                 )
                 time.sleep(INTERROUND)
             else:
@@ -429,7 +419,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     if published
                     else ("round timed out" if rc in (124, 137) else f"round exited with status {rc}")
                 )
-                log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
+                why = f": {one_line(str(published))}" if published else ""
+                if failed.get("failure_log"):
+                    why += f" (log: {failed['failure_log']})"
+                log(f"round {tag}{why}; no-progress streak={streak} — backing off {nap}s")
                 report_runtime(
                     "backoff",
                     detail=reason,
@@ -438,6 +431,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     next_action_at=time.time() + nap,
                 )
                 time.sleep(nap)
+    except _LoopDrained:
+        log("loop drained for restart; stopping between rounds")
+        return 0
     except _LoopTerminated:
         log("loop terminated — stopping")
         return 143
@@ -445,38 +441,43 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         log("loop interrupted — stopping")
         return 130
     finally:
-        from .verification_jobs import stop_continuations
-
-        stop_continuations(cfg)
+        background_relink.finish(relinking)
         if maintenance is not None:
             stopping, thread = maintenance
             stopping.set()
             thread.join(timeout=35)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(DRAIN_SIGNAL, previous_drain)
 
 
 def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
     """What --ignore-quota does with the pacer snapshot for its pinned agent — applied both by the loop
     between rounds and by the round deciding what it will launch.
 
-    --ignore-quota overrides PACING, not AVAILABILITY:
+    --ignore-quota overrides pacing and transient telemetry outages:
       "run"       — the provider is available (under pace), launch as usual.
       "over-pace" — a SOFT block: real quota remains, we are only ahead of the burn line. This is the
                     block --ignore-quota exists to override, so launch anyway.
-      "wait"      — a HARD block: a window at 100% (exhausted), usage we cannot read (fail-closed), or
-                    the usage endpoint refusing to answer (its own 429 / a network error leaves `prov`
-                    with no windows). Firing here only hits a dead provider, so back off even under
-                    --ignore-quota.
+      "telemetry-unavailable" — explicitly classified transient failure; try useful work.
+      "wait"      — exhaustion, auth/configuration failures, or an unreadable quota response.
     """
     if chosen is not None:
         return "run"
+    if prov is not None and prov.telemetry_unavailable and not any(w.status == "exhausted" for w in prov.windows):
+        return "telemetry-unavailable"
     soft = prov is not None and _unavail_reason(prov)[0]
     return "over-pace" if soft else "wait"
 
 
 def choose_model(
-    cfg: Config, agent: str, quota_cmd: str | None, *, refresh: bool = False, renew: bool = False
+    cfg: Config,
+    agent: str,
+    quota_cmd: str | None,
+    *,
+    refresh: bool = False,
+    renew: bool = False,
+    _wait: QuotaWait | None = None,
 ) -> tuple[str | None, dict]:
     """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
     command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
@@ -495,7 +496,21 @@ def choose_model(
         out = (r.stdout or "").split()
         model = out[0] if (r.returncode == 0 and out) else None
         return (model or None), {"quota-cmd": Provider("quota-cmd", bool(model), model)}
-    return Quota(cfg).choose(None if agent == "auto" else agent, refresh=refresh, renew=renew)
+    quota = Quota(cfg)
+    baseline, options = _wait.prepare(quota) if _wait else ({}, {})
+    result = quota.choose(None if agent == "auto" else agent, refresh=refresh, renew=renew, **options)
+    if _wait:
+        _wait.selected(quota, result[1], baseline, _recheck_in)
+    return result
+
+
+def _wait_for_quota(wait: QuotaWait, nap: float, quota_cmd: str | None):
+    if quota_cmd or not wait.deadlines:
+        time.sleep(nap)
+    else:
+        # Keep the manager's actual retry timestamp; local checks do not move it.
+        report_runtime(next_action_at=wait.recheck_at())
+        wait.wait()
 
 
 def _credential_hint(agent: str, prov: Provider | None) -> str:
@@ -513,6 +528,12 @@ def _credential_hint(agent: str, prov: Provider | None) -> str:
         return ""
     if agent != "claude":
         return ". Run `codex login` to renew the credential"
+    usage = claude_usage_credentials()
+    if usage is not None:
+        return (
+            f". Sign in again to the usage login at {usage}, or --auto-refresh to let an unattended worker"
+            " rotate it (see docs/quota.md)"
+        )
     if sys.platform == "darwin":
         # The Keychain is the store here and the worker never writes it, so --auto-refresh does nothing
         # and offering it would send the operator after a flag that cannot help.
@@ -537,24 +558,17 @@ def _retry_hint(prov: Provider | None) -> str:
     return f"; retry in ~{round(after / 60)}m" if after < 90 * 60 else f"; retry in ~{_hours(after)}"
 
 
-def claude_pending_init(snap: dict) -> bool:
-    """True when Claude is unavailable ONLY because a window has reset and nothing has opened the next
-    cycle yet, and initializing it is within the operator's pace curve (Quota decides both, purely).
-
-    Such a provider is not "out of quota" — it is unopened, and only a Claude request can open it. It
-    may therefore be selected PROVISIONALLY: nothing is spent by selecting it, and the round makes the
-    one bootstrap request at its launch stage, after it has found actual work to do."""
-    prov = snap.get("claude")
-    return bool(prov and prov.bootstrap_eligible)
-
-
 def resolve_work_model(
-    cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None, fresh: bool = False
-) -> tuple[str, bool]:
-    """Turn the --agent dial into (concrete model, needs-launch-stage-bootstrap). 'auto' consults the
-    pacer (or --quota-cmd); codex preferred, opus fallback. Kiro and OpenRouter agents are explicit
-    and unpaced. Dry-run symbolic. The bootstrap flag never launches anything by itself — it says the round
-    must ask for launch authorization once it has a work unit in hand.
+    cfg: Config,
+    agent: str,
+    *,
+    dry: bool,
+    ignore_quota: bool,
+    quota_cmd: str | None = None,
+    fresh: bool = False,
+    already_paced: bool = False,
+) -> str:
+    """Resolve the provider for ordinary work using the common quota verdict.
 
     `fresh` forces the usage read rather than accepting a cached one. A cached reading is only evidence
     about the moment it was taken (see Quota._claude_pass), so where nothing has just refreshed it — a
@@ -562,26 +576,24 @@ def resolve_work_model(
     on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
     re-fetching would only ask the same question twice.
 
-    --ignore-quota still reads usage. It overrides the soft burn-pace throttle, not availability, so the
-    read is what tells a pinned agent apart from a dead one; only --quota-cmd replaces the pacer
-    outright."""
+    --ignore-quota still reads usage and respects known hard blocks. A transient
+    telemetry outage alone does not prevent an explicitly unpaced attempt.
+    `already_paced` carries only the parent's soft pacing decision, never outage permission."""
     if dry:
-        return agent, False
+        return agent
     if agent in OPENROUTER_MODELS or agent == "kiro":
-        return agent, False
+        return agent
     if ignore_quota and not quota_cmd and agent == "auto":
         raise SystemExit(
             "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
         )
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
     chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
-    if ignore_quota and not quota_cmd:
-        # --ignore-quota overrides PACING, not AVAILABILITY — the same rule the loop applies between
-        # rounds (see cmd_loop). Reading usage costs no quota, and firing a round at an exhausted or
-        # unreadable provider only buys a clone, an engine launch, and a scoreboard full of errors.
+    if (ignore_quota or already_paced) and not quota_cmd:
+        # Match the loop's decision, including telemetry-only failures.
         verdict = _ignore_quota_verdict(chosen, snap.get(agent))
-        if verdict == "wait" and agent == "claude" and claude_pending_init(snap):
-            return "claude", True  # the one hard block a bounded, pace-respecting request may clear
+        if verdict == "telemetry-unavailable" and not ignore_quota:
+            verdict = "wait"
         if verdict == "wait":
             prov = snap.get(agent)
             why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
@@ -591,15 +603,17 @@ def resolve_work_model(
             # skipped the read, launched, and the agent CLI renewed on its way up. It no longer does, so
             # the message has to hand the recovery back.
             fix = _credential_hint(agent, prov)
+            override = "--ignore-quota" if ignore_quota else "loop pacing handoff"
             raise NoProgress(
-                f"{agent} hard-blocked ({why}) — --ignore-quota overrides pacing, not availability; "
+                f"{agent} hard-blocked ({why}) — {override} overrides pacing, not availability; "
                 f"not launching this round{fix or _retry_hint(prov)}"
             )
         if verdict == "over-pace":
-            log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
-        return agent, False
-    if chosen is None and claude_pending_init(snap):
-        return "claude", True
+            why = "--ignore-quota set" if ignore_quota else "loop already paced this round"
+            log(f"quota: {agent} over-pace; {why} — running anyway")
+        elif verdict == "telemetry-unavailable":
+            log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
+        return agent
     if chosen is None:
         raise NoProgress(f"no model under pace right now (agent={agent}) — nothing to run this round")
-    return chosen, False
+    return chosen

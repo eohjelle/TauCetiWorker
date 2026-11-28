@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import cache_storage, retention, storage, work_recovery
+from tauceti_worker import cache_storage, live_use, retention, storage
 from tauceti_worker.round import RoundContext
 
 
@@ -60,7 +60,7 @@ class StorageRecovery(unittest.TestCase):
 
     def test_live_build_is_not_removed(self):
         output = self.write(".lake/build/lib/A.olean")
-        with patch.object(work_recovery, "live_users", return_value=["verifier"]):
+        with patch.object(live_use, "live_users", return_value=["verifier"]):
             with self.assertRaisesRegex(storage.NoProgress, "cleanup incomplete"):
                 storage.clean_lake_outputs(self.checkout)
         self.assertTrue(output.exists())
@@ -80,7 +80,9 @@ class StorageRecovery(unittest.TestCase):
             patch.object(storage, "host_storage_free", side_effect=[2 * gib, 10 * gib]),
             patch("tauceti_worker.build_caches.lake_cache", return_value=self.root / "lake-cache/test"),
             patch.object(
-                work_recovery, "live_users", side_effect=lambda p: ["verifier"] if p == checkouts["live"] else []
+                live_use,
+                "live_users",
+                side_effect=lambda path, *, walkers=True: ["verifier"] if path == checkouts["live"] else [],
             ),
             retention.locked(checkouts["locked"].parent / "recovery.lock"),
         ):
@@ -93,15 +95,13 @@ class StorageRecovery(unittest.TestCase):
         called = threading.Event()
         cfg = SimpleNamespace(state=self.root / "state/docker")
 
-        def housekeeping(root, **budgets):
-            self.assertEqual(root, cfg.state.parent)
-            self.assertEqual(budgets, dict(seconds=2, entries=16384, bytes=1024**3))
+        def housekeeping(*, fallback=False):
+            self.assertTrue(fallback)
             called.set()
-            return {"removed_bytes": 0}
 
         with (
             patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "3"}),
-            patch.object(work_recovery, "housekeep", side_effect=housekeeping),
+            patch.object(retention, "request_cleanup", side_effect=housekeeping),
         ):
             stopping, thread = storage.start_host_storage_maintenance(cfg)
             try:
@@ -112,7 +112,7 @@ class StorageRecovery(unittest.TestCase):
             self.assertFalse(thread.is_alive())
 
     def test_housekeeping_is_opt_in(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(work_recovery, "housekeep") as housekeep:
+        with patch.dict(os.environ, {}, clear=True), patch.object(retention, "request_cleanup") as housekeep:
             self.assertIsNone(storage.start_host_storage_maintenance(None))
             housekeep.assert_not_called()
 
@@ -137,11 +137,12 @@ class StorageRecovery(unittest.TestCase):
                 storage.verify_host_storage_headroom(self.checkout, env, phase="compressed volume")
 
     def test_round_reclaims_space_before_admission_can_block_it(self):
-        cfg = SimpleNamespace(state=self.root / "state/docker", checkout=self.checkout)
+        cfg = SimpleNamespace(state=self.root / "state/docker", checkout=self.checkout, wid="docker")
         events = []
         with (
             patch.dict(os.environ, {"TAUCETI_MIN_FREE_GIB": "3"}),
             patch.object(retention, "recycle", return_value={"errors": [], "removed": []}),
+            patch.object(retention, "request_cleanup"),
             patch.object(
                 storage, "prune_obsolete_host_lean_toolchains", side_effect=lambda _: events.append("toolchains")
             ),

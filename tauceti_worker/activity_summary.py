@@ -14,30 +14,6 @@ COST_WINDOWS = ("24h", "7d", "total")
 # Shared PR inventories reconcile hourly. Allow a missed cycle before warning;
 # the preparer's five-minute reads do not make the underlying evidence younger.
 PR_STALE_SECONDS = 2 * 3600
-RECOVERY_COUNTS = (
-    "records",
-    "retained",
-    "blocked",
-    "preserved",
-    "reset",
-    "superseded",
-    "incomplete",
-    "corrupt",
-    "errors",
-    "cleanup_backlog",
-) + tuple(
-    "recovery_" + state
-    for state in (
-        "retained",
-        "eligible",
-        "resuming",
-        "verified",
-        "publication_pending",
-        "published",
-        "obsolete",
-        "blocked",
-    )
-)
 
 
 def amount(value, *, rate=False):
@@ -64,39 +40,53 @@ def hourly_rate(spent, covered_seconds):
     )
 
 
-def measured_pr_weight(row):
-    """Full weight for measured landed PRs, half for measured open PRs."""
-    if row.get("measured_pr_weight") is not None:
-        return Decimal(str(row["measured_pr_weight"]))
-    # Older prepared summaries have only unweighted coverage counts.
-    weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
-    known = row.get("known_loc_prs", 0)
-    count = known + row.get("missing_loc_prs", 0)
-    return weight * known / count if count else weight
-
-
 def loc_estimate(row):
-    """Keep partial PR coverage useful without fetching any additional data."""
-    measured = Decimal(row.get("landed_loc_added", 0)) + Decimal(row.get("open_loc_added", 0)) / 2
-    weighted = measured
+    """Estimate missing measurements using only PRs that landed in the window."""
+    # Creation-cohort summaries cannot be converted into landing windows.
+    if row.get("loc_basis") != "landed_at":
+        return dict(landed_loc=None, loc_estimated=False, usd_per_loc=None)
+    measured = Decimal(row.get("landed_loc_added", 0))
+    landed = measured
     missing = bool(row.get("missing_loc_prs"))
-    if missing:
-        known_weight = measured_pr_weight(row)
-        total_weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
-        if known_weight > 0:
-            weighted = measured * total_weight / known_weight
+    known = row.get("known_loc_prs", 0)
+    if missing and known:
+        landed = measured * row.get("landed_prs", 0) / known
     cost = row.get("estimated_usd")
     rate = None
     if cost is not None:
         cost = Decimal(cost)
-        # No measured output means zero LOC, never an invented positive denominator.
-        rate = cost / weighted if weighted else Decimal("Infinity") if cost else Decimal(0)
+        rate = cost / landed if landed else Decimal("Infinity") if cost else Decimal(0)
     return dict(
-        measured_weighted_loc=str(measured),
-        weighted_loc=str(weighted),
+        landed_loc=str(landed),
         loc_estimated=missing,
         usd_per_loc=str(rate) if rate is not None else None,
     )
+
+
+def attribution_backfilling(row):
+    # Older collectors exposed one flag for historical backfill and live refresh.
+    return bool(row.get("attribution_backfilling", row.get("attribution_preparing", False)))
+
+
+def attributed_rate(row):
+    if attribution_backfilling(row):
+        return None
+    if row.get("attribution_known_prs") == 0 and (
+        row.get("attribution_missing_prs") or row.get("attribution_preparing")
+    ):
+        return None
+    loc, cost = row.get("attributed_loc"), row.get("estimated_usd")
+    if loc is None or cost is None:
+        return None
+    loc, cost = Decimal(loc), Decimal(cost)
+    return str(cost / loc if loc else Decimal("Infinity") if cost else Decimal(0))
+
+
+def attributed_rate_display(row):
+    rate = attributed_rate(row)
+    if rate is None:
+        return "—"
+    return "~" + amount(rate, rate=True)
 
 
 def display(value, default_kinds=()):
@@ -115,7 +105,7 @@ def display(value, default_kinds=()):
             f"Storage cleanup: {cleanup.get('removed_count', len(cleanup.get('removed', [])))} paths removed; "
             f"{cleanup.get('protected_count', len(cleanup.get('protected', [])))} protected; "
             f"{cleanup.get('errors_count', len(cleanup.get('errors', [])))} errors; "
-            f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free"
+            f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free at last cleanup"
         )
         if "managed_bytes" in cleanup:
             age = max(0, int(time.time() - cleanup.get("at", time.time())))
@@ -124,6 +114,14 @@ def display(value, default_kinds=()):
                 f"{cleanup.get('protected_bytes', 0) / 2**30:.1f} GiB held by live workers; "
                 f"{cleanup.get('reclaimed_bytes', 0) / 2**30:.1f} GiB space recovered; checked {age}s ago"
             )
+            if "named_bytes" in cleanup:
+                # du counts each hard link, so named bytes alone prove nothing about disk use.
+                print(
+                    f"  Cache storage: {cleanup['named_bytes'] / 2**30:.1f} GiB named (du, every link); "
+                    f"{cleanup['managed_bytes'] / 2**30:.1f} GiB allocated in "
+                    f"{cleanup.get('unique_inodes', 0):,} unique inodes; "
+                    f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB filesystem free"
+                )
             if cleanup.get("pressure"):
                 print("  Disk cleanup requested; live work and saved source remain protected")
     if expanded := s.get("expanded_cache"):
@@ -147,10 +145,18 @@ def display(value, default_kinds=()):
         ]
         rounds.append(("  " + kind, counts))
     rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
+    closed = [sum(r.get("closed", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(closed):
+        rounds.append(("    closed own PR", closed))
+    unconfirmed = [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(unconfirmed):
+        rounds.append(("    outcome unconfirmed", unconfirmed))
     prs = []
     for key, label in (
         ("authored", "PRs authored"),
+        ("authored_forgejo", "  on Forgejo"),
         ("landed", "Authored PRs landed"),
+        ("landed_forgejo", "  from Forgejo"),
         ("assisted", "PRs assisted"),
         ("reviews", "Reviews completed"),
     ):
@@ -176,12 +182,12 @@ def display(value, default_kinds=()):
                 )
             )
     costs = s.get("costs", {})
-    spending_title = (
-        "Spending (recorded usage)" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
-    )
+    spending_title = "Spending" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
     spending_rows = []
     if costs.get("spending"):
-        spending = costs["spending"]
+        spending = {
+            w: costs.get("spending_including_live", {}).get(w, costs["spending"].get(w, {})) for w in report_windows
+        }
         hours = [spending.get(w, {}).get("worker_seconds") for w in report_windows]
         spending_rows = [
             (
@@ -207,8 +213,8 @@ def display(value, default_kinds=()):
     cost_rows = []
     loc_rows = []
     if costs.get("windows"):
-        # Compatibility for snapshots prepared before partial-coverage estimates.
-        windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
+        # Recompute rates from the window evidence, guarding older cohort summaries.
+        windows = {w: {**r, **loc_estimate(r)} for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
             (
@@ -221,7 +227,10 @@ def display(value, default_kinds=()):
             ),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in cost_windows]))
-        if costs.get("accounting_version", 1) >= 3:
+        if costs.get("accounting_version", 1) >= 3 and any(
+            windows[w].get("unresolved_stopped_usd") is None or Decimal(windows[w]["unresolved_stopped_usd"]) != 0
+            for w in cost_windows
+        ):
             # Settled estimates are already in completed sessions; recovered
             # estimates are a subset of those. Only stopped usage adds a component.
             cost_rows.append(
@@ -231,43 +240,68 @@ def display(value, default_kinds=()):
                 )
             )
         cost_rows.append(("API cost: estimated total", [amount(windows[w].get("estimated_usd")) for w in cost_windows]))
-        for key, label in (
-            ("landed_loc_added", "Authored Lean LOC: landed"),
-            ("open_loc_added", "Authored Lean LOC: open"),
-        ):
-            loc_rows.append((label, [str(windows[w].get(key, 0)) for w in cost_windows]))
         loc_rows.append(
             (
-                "Lean LOC (landed + ½ open)",
+                "Landed Lean LOC",
                 [
-                    "~" + number(f"{Decimal(windows[w]['weighted_loc']):.1f}")
-                    if windows[w].get("loc_estimated")
-                    else number(windows[w].get("weighted_loc", 0))
+                    "—"
+                    if windows[w]["landed_loc"] is None
+                    else ("~" if windows[w].get("loc_estimated") else "")
+                    + number(f"{Decimal(windows[w]['landed_loc']):.1f}")
                     for w in cost_windows
                 ],
             )
         )
         loc_rows.append(
             (
-                "Estimated $ / weighted LOC",
+                "Estimated $ / landed LOC",
                 [
                     ("~" if windows[w].get("loc_estimated") else "") + amount(windows[w].get("usd_per_loc"), rate=True)
                     for w in cost_windows
                 ],
             )
         )
+        if any(windows[w].get("attribution_version") for w in cost_windows):
+            loc_rows.extend(
+                [
+                    (
+                        "Attributed landed Lean LOC",
+                        [
+                            "—"
+                            if attribution_backfilling(windows[w]) or windows[w].get("attributed_loc") is None
+                            else "~" + number(f"{Decimal(windows[w]['attributed_loc']):.1f}")
+                            for w in cost_windows
+                        ],
+                    ),
+                    (
+                        "Estimated $ / attributed LOC",
+                        [attributed_rate_display(windows[w]) for w in cost_windows],
+                    ),
+                    (
+                        "Landed PRs with attribution data",
+                        [
+                            "—"
+                            if windows[w].get("attribution_known_prs") is None
+                            else f"{windows[w]['attribution_known_prs']}/{windows[w]['attribution_known_prs'] + windows[w]['attribution_missing_prs']}"
+                            for w in cost_windows
+                        ],
+                    ),
+                ]
+            )
         if any(windows[w].get("missing_loc_prs") for w in cost_windows):
             loc_rows.append(
                 (
-                    "Authored PRs with measured LOC",
+                    "Landed PRs with measured LOC",
                     [
-                        f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
+                        "—"
+                        if windows[w].get("loc_basis") != "landed_at"
+                        else f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
                         for w in cost_windows
                     ],
                 )
             )
     label_width = max(
-        len("Spending (recorded usage)"),
+        len(spending_title),
         *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *loc_rows, *spending_rows]),
     )
     headers = tuple("All time" if w == "total" else w for w in report_windows)
@@ -294,27 +328,27 @@ def display(value, default_kinds=()):
         print(f"\nReview Git claims (24h): {local.get('git_held', 0)} held / {local['started']} starts")
     if spending_rows:
         table(spending_title, headers, spending_rows, widths)
-    if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
-        q = costs["quality"]
-        print(
-            f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
-        )
+    if live := costs.get("live_estimate"):
+        age = max(0, int(time.time() - min(live["observed_at"], live.get("session_observed_at", live["observed_at"]))))
+        if age > 180 or live.get("stale"):
+            print(f"Live estimates stale: updated {age}s ago.")
     if spending_rows and costs.get("accounting_version", 1) >= 3:
-        q = costs["accounting"]
-        print(
-            f"Accounting: {q.get('live', 0)} live; {q.get('settled_estimates', 0)} settled estimates "
-            f"({q.get('recovered_estimates', 0)} recovered); {q.get('unresolved_stopped', 0)} unresolved stopped."
-        )
+        if unresolved := costs.get("accounting", {}).get("unresolved_stopped", 0):
+            print(
+                f"Accounting: {unresolved} stopped conversation{'s' if unresolved != 1 else ''} with unresolved usage."
+            )
     if cost_rows:
         cost_headers = tuple({"7d": "7 days", "total": "All time"}.get(w, w) for w in cost_windows)
         cost_widths = [
             max(len(h), *(len(str(values[i])) for _, values in [*cost_rows, *loc_rows]))
             for i, h in enumerate(cost_headers)
         ]
-        table("Costs / initiated PR output", cost_headers, cost_rows, cost_widths)
+        table("Costs / landed PR output", cost_headers, cost_rows, cost_widths)
         table(None, cost_headers, loc_rows, cost_widths)
+        if any(windows[w].get("loc_basis") != "landed_at" for w in cost_windows):
+            print("Landed LOC unavailable from older summaries; refresh activity collectors.")
         if any(windows[w].get("loc_estimated") for w in cost_windows):
-            print("~ Missing LOC estimated from measured PRs; zero if none measured. Unknown PR states count as zero.")
+            print("~ Missing LOC estimated from measured landed PRs; zero if none measured.")
     funding = costs.get("funding")
     if funding:
         print()
@@ -333,41 +367,30 @@ def display(value, default_kinds=()):
         print(
             f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing, {sharing.get('blocked', 0)} blocked, {sharing.get('idle', 0)} idle; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
         )
-        for reason in sharing.get("reasons", []):
-            print("  " + reason)
-    recovery = s.get("work_recovery")
-    if recovery and (any(recovery.get(key) for key in RECOVERY_COUNTS) or recovery.get("preparation_metadata_entries")):
-        print()
-        print(
-            f"Local work recovery: {recovery.get('records', 0)} saved, "
-            f"{recovery.get('retained', 0)} checkouts moved aside, "
-            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt, {recovery.get('errors', 0)} errors"
-        )
-        if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
-            print(
-                "Repair recovery: "
-                + ", ".join(
-                    f"{recovery.get('recovery_' + state, 0)} {state.replace('_', '-')}"
-                    for state in (
-                        "eligible",
-                        "resuming",
-                        "verified",
-                        "publication_pending",
-                        "published",
-                        "obsolete",
-                        "blocked",
-                    )
-                )
-            )
-        print(
-            f"  Cleanup: {recovery.get('cleanup_backlog', 0)} queued, "
-            f"oldest {int(recovery.get('cleanup_oldest_age_seconds', 0))}s; "
-            f"preparation {recovery.get('preparation_seconds', 0):.3f}s, "
-            f"read {recovery.get('preparation_read_bytes', 0)}B, "
-            f"hashed {recovery.get('preparation_hash_bytes', 0)}B"
-        )
-        for reason in recovery.get("reasons", []):
-            print("  " + reason)
+        reasons_by_mode = {
+            mode: list(reasons)
+            for mode, reasons in sharing.get("reasons_by_mode", {"unknown": sharing.get("reasons", [])}).items()
+        }
+        missing_checkout = "Mathlib dependency is not available for sharing"
+        # Older preparers emitted this reason in either private or required/blocked
+        # mode. Attribute it only when the counts identify exactly one of those.
+        possible_modes = [mode for mode in ("private", "blocked") if sharing.get(mode)]
+        if len(possible_modes) == 1 and missing_checkout in reasons_by_mode.get("unknown", []):
+            reasons_by_mode["unknown"].remove(missing_checkout)
+            reasons_by_mode.setdefault(possible_modes[0], []).append(missing_checkout)
+        for mode, reasons in sorted(reasons_by_mode.items()):
+            label = "Worker message (state unavailable)" if mode == "unknown" else f"{mode.capitalize()} builds"
+            messages = set()
+            for reason in reasons:
+                if reason == "shared view released; awaiting next natural round":
+                    continue
+                if mode == "private" and reason == missing_checkout:
+                    reason = "sharing was skipped because the Mathlib checkout was absent."
+                elif mode == "blocked" and reason == missing_checkout:
+                    reason = "the Mathlib checkout was absent, but sharing is required."
+                messages.add(reason)
+            for message in sorted(messages):
+                print(f"  {label}: {message}")
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
@@ -381,17 +404,23 @@ def display(value, default_kinds=()):
     if s.get("interrupted_unfinished"):
         detail = s.get("interrupted_unfinished_details")
         if detail:
-            print(
-                f"Rounds missing finish records (by start time): {detail['started_1h']} in 1h; "
-                f"{detail['started_24h']} in 24h; {s['interrupted_unfinished']} all time"
-            )
-            if latest := detail.get("latest"):
-                started = datetime.fromtimestamp(latest["started"], UTC).isoformat(timespec="seconds")
-                print(f"  Latest affected round started {started}: {latest['worker']}, round {latest['round_id']}")
+            if detail["started_24h"]:
+                line = (
+                    f"Round reporting gaps: {detail['started_1h']} in 1h; "
+                    f"{detail['started_24h']} in 24h (by start time)"
+                )
+                if latest := detail.get("latest"):
+                    age = max(0, int(time.time() - latest["started"]))
+                    elapsed = f"{age // 3600}h" if age >= 3600 else f"{age // 60}m" if age >= 60 else "<1m"
+                    line += f"; latest start {elapsed} ago"
+                print(line)
+                if detail["started_1h"] and latest:
+                    print(
+                        f"  {latest['worker']}, round {latest['round_id']}: no outcome recorded; "
+                        "excluded from finished totals. See worker log."
+                    )
         else:
-            print(f"Rounds missing finish records: {s['interrupted_unfinished']} all time; recent timing unavailable")
-        print("  Processes exited without reporting an outcome; excluded from finished counts.")
-        print("  Check worker logs for crashes, forced stops, or OOM kills.")
+            print(f"Round reporting gaps: {s['interrupted_unfinished']} historical; recent counts unavailable")
     # Older summaries only have an all-history minimum, which cannot establish
     # whether unresolved PRs are stale. Never use it as a freshness warning.
     now = time.time()
@@ -403,8 +432,14 @@ def display(value, default_kinds=()):
         if at is not None and now - at > PR_STALE_SECONDS:
             minutes = int((now - at) // 60)
             print(f"PR evidence: {label} {minutes // 60}h {minutes % 60}m ago (stale; expected within 2h)")
-    for error in value.get("errors", []):
-        print("Activity coverage: " + error)
+    for error in dict.fromkeys(value.get("errors", [])):
+        prefix = "Shared PR observations unavailable for "
+        if error.startswith(prefix):
+            repo = error[len(prefix) :].split(" ", 1)[0]
+            cause = "access denied (HTTP 403)" if "HTTP 403" in error else "observations unavailable"
+            print(f"PR reporting: {repo} {cause}; open/landed counts may be stale. Retrying in background.")
+        else:
+            print("Activity coverage: " + error)
 
 
 def combine(values):
@@ -475,8 +510,10 @@ def combine(values):
                 continue
             for kind, counts in types.items():
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
-                for key in row:
+                for key in ("finished", "failed", "unknown"):
                     row[key] += counts.get(key, 0)
+                if counts.get("closed"):
+                    row["closed"] = row.get("closed", 0) + counts["closed"]
     cleanup = [v["storage_cleanup"] for v in known if v.get("storage_cleanup")]
     if cleanup:
         s["storage_cleanup"] = dict(
@@ -485,6 +522,8 @@ def combine(values):
                 key: sum(row.get(key, 0) for row in cleanup)
                 for key in (
                     "managed_bytes",
+                    "named_bytes",
+                    "unique_inodes",
                     "protected_bytes",
                     "reclaimed_bytes",
                     "free_bytes",
@@ -495,6 +534,10 @@ def combine(values):
             },
             pressure=any(row.get("pressure", False) for row in cleanup),
         )
+        if not all("named_bytes" in row for row in cleanup):
+            # A host on an older collector reports no link-aware totals; a partial sum would mislead.
+            s["storage_cleanup"].pop("named_bytes")
+            s["storage_cleanup"].pop("unique_inodes")
     expanded = [v["expanded_cache"] for v in known if v.get("expanded_cache")]
     if expanded:
         s["expanded_cache"] = {
@@ -503,6 +546,10 @@ def combine(values):
     for w in report_windows:
         for key in ("authored", "landed", "reviews", "fixes"):
             s["pr_windows"][w][key] = sum(v["pr_windows"][w].get(key, 0) for v in known)
+        for key in ("authored_forgejo", "landed_forgejo"):
+            # Hosts whose collector predates the forge breakdown leave it unknown, not zero.
+            counts = [v["pr_windows"][w].get(key) for v in known]
+            s["pr_windows"][w][key] = None if None in counts else sum(counts)
         # Unique assisted PR counts are per-host; review events are additive.
         s["pr_windows"][w]["assisted"] = known[0]["pr_windows"][w].get("assisted") if len(known) == 1 else None
     for w in cost_windows:
@@ -511,11 +558,9 @@ def combine(values):
             k: sum(r.get(k, 0) for r in rows)
             for k in (
                 "landed_loc_added",
-                "open_loc_added",
                 "missing_loc_prs",
                 "known_loc_prs",
                 "landed_prs",
-                "open_prs",
             )
         }
         for key in (
@@ -532,7 +577,8 @@ def combine(values):
                 if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
-        row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
+        if all(r.get("loc_basis") == "landed_at" for r in rows):
+            row["loc_basis"] = "landed_at"
         if accounting_versions == {2, 3} and row.get("active_accrued_usd") is not None:
             row["active_accrued_usd"] = str(
                 sum(
@@ -549,6 +595,16 @@ def combine(values):
                 )
             )
         row.update(loc_estimate(row))
+        if any(r.get("attribution_version") for r in rows):
+            compatible = len(known) == len(values) and all(r.get("attribution_version") == 1 for r in rows)
+            row["attribution_version"] = 1
+            row["attribution_preparing"] = any(r.get("attribution_preparing") for r in rows)
+            row["attribution_backfilling"] = any(attribution_backfilling(r) for r in rows)
+            for field in ("attribution_known_prs", "attribution_missing_prs"):
+                row[field] = sum(r[field] for r in rows) if compatible else None
+            row["attributed_loc"] = (
+                str(sum((Decimal(r.get("attributed_loc") or "0") for r in rows), Decimal(0))) if compatible else None
+            )
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
         s["costs"]["spending"] = {}
@@ -577,6 +633,29 @@ def combine(values):
         k: sum(v.get("costs", {}).get("quality", {}).get(k, 0) for v in known)
         for k in ("native", "estimated", "incomplete")
     }
+    if any(v.get("costs", {}).get("spending_including_live") for v in known):
+        s["costs"]["spending_including_live"] = {}
+        for w in report_windows:
+            rows = [v.get("costs", {}).get("spending_including_live", {}).get(w, {}) for v in known]
+            complete = (
+                compatible_costs and len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
+            )
+            recorded = s["costs"].get("spending", {}).get(w, {})
+            total = str(sum((Decimal(r["spent_usd"]) for r in rows), Decimal(0))) if complete else None
+            s["costs"]["spending_including_live"][w] = {
+                **recorded,
+                "spent_usd": total,
+                "recorded_spent_usd": recorded.get("spent_usd"),
+                "usd_per_hour": hourly_rate(total, recorded.get("covered_seconds")),
+                "usd_per_worker_hour": hourly_rate(total, recorded.get("worker_seconds")),
+                **{
+                    key: str(sum((Decimal(r[key]) for r in rows), Decimal(0))) if complete else None
+                    for key in ("live_observed_usd", "live_unobserved_estimate_usd", "live_adjustment_usd")
+                },
+            }
+        stamps = [v.get("costs", {}).get("live_estimate", {}).get("observed_at") for v in known]
+        if all(stamp is not None for stamp in stamps):
+            s["costs"]["live_estimate"] = dict(observed_at=min(stamps), refresh_seconds=60)
     s["costs"]["accounting"] = {
         k: sum(v.get("costs", {}).get("accounting", {}).get(k, 0) for v in known)
         for k in ("live", "settled_estimates", "recovered_estimates", "unresolved_stopped")
@@ -588,20 +667,13 @@ def combine(values):
             for key in ("shared", "private", "preparing", "blocked", "idle", "cache_hits", "preparation_seconds")
         }
         s["shared_mathlib"]["reasons"] = sorted({reason for row in sharing for reason in row.get("reasons", [])})
-    recovery = [v.get("work_recovery", {}) for v in known]
-    if any(recovery):
-        s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
-        for key in (
-            "preparation_seconds",
-            "preparation_read_bytes",
-            "preparation_hash_bytes",
-            "preparation_metadata_entries",
-        ):
-            s["work_recovery"][key] = sum(row.get(key, 0) for row in recovery)
-        s["work_recovery"]["cleanup_oldest_age_seconds"] = max(
-            (row.get("cleanup_oldest_age_seconds", 0) for row in recovery), default=0
-        )
-        s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
+        reasons_by_mode = {}
+        for row in sharing:
+            for mode, reasons in row.get("reasons_by_mode", {"unknown": row.get("reasons", [])}).items():
+                reasons_by_mode.setdefault(mode, set()).update(reasons)
+        s["shared_mathlib"]["reasons_by_mode"] = {
+            mode: sorted(reasons) for mode, reasons in sorted(reasons_by_mode.items())
+        }
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

@@ -5,9 +5,9 @@ TauCetiReview#117 gave the engine a distinct exit status for "I stopped because 
 unusable, and I posted nothing": a revoked credential, or an exhausted subscription window. Before
 that the engine exited 0 having posted a scoreboard of `error` rows, so do_review took the success
 path. With a real non-zero status it would otherwise fall into the ordinary failure branch and
-charge `review-err-<pr>` — a per-PR, lifetime counter that only a posted review resets. Three of
-them drop the PR from review candidacy (survey) and open a public "Review stuck: PR #N" issue, so an
-outage lasting one quota window could strand several unrelated PRs. Review workers run
+charge `review-err-<pr>` — a per-PR, lifetime counter that only a posted review resets. At the cap
+the PR is closed (the fleet's own) or dropped from review candidacy (anyone else's), so an outage
+lasting one quota window could retire several unrelated PRs. Review workers run
 `--ignore-quota` precisely so they do not pace, which is what makes that a live risk rather than a
 theoretical one.
 
@@ -26,15 +26,23 @@ Pinned here:
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 import tauceti_worker as tc
-from tauceti_worker.constants import MAX_REVIEW_ERRORS, REVIEW_PROVIDER_DOWN_EXIT
+from tauceti_worker.constants import MAX_REVIEW_ERRORS, REVIEW_PREPARATION_WAIT_EXIT, REVIEW_PROVIDER_DOWN_EXIT
 from tauceti_worker.review_diagnostics import classify_failure, read_review_failure
 
 fails = 0
@@ -66,7 +74,9 @@ def fake_worker(state):
         cfg=types.SimpleNamespace(state=state, logdir=state, wid="w", store_dir=state / "store"),
         counters=Counters(),
         rs=types.SimpleNamespace(bust=lambda pr: None, review_rounds=lambda pr, c: 0),
-        gh=types.SimpleNamespace(add_reaction=lambda i: True, remove_reaction=lambda i: True),
+        gh=types.SimpleNamespace(
+            repo="TauCetiProject/TauCeti", add_reaction=lambda i: True, remove_reaction=lambda i: True
+        ),
     )
 
 
@@ -101,6 +111,50 @@ def main():
         check("provider-down charges no review error", w.counters.read("review-err-42") == 0)
         check("provider-down retains no per-PR failure", not read_review_failure(state, 42))
 
+        # Preparation outages must have the same uncharged scheduling semantics
+        # through both launchers, even after more attempts than the stuck limit.
+        from unittest.mock import patch
+
+        for bubble in (False, True):
+            for _ in range(MAX_REVIEW_ERRORS + 2):
+                w = fake_worker(state)
+                w.counters.write("review-err-42", 1)
+                c = types.SimpleNamespace(pr=42, head="a" * 40, contest=None, contest_reply_id=None)
+                with (
+                    patch.object(tc.work_units, "run_to_logfile", return_value=REVIEW_PREPARATION_WAIT_EXIT),
+                    patch.object(tc.work_units, "review_in_bubble", return_value=REVIEW_PREPARATION_WAIT_EXIT),
+                    patch.object(tc.work_units, "me", return_value="tester"),
+                    patch.object(tc.work_units, "record_review_failure") as record,
+                    patch.object(tc.work_units, "_sync_review_outbox") as sync,
+                    patch.object(w.rs, "bust") as bust,
+                ):
+                    try:
+                        tc.work_units.do_review(
+                            w, types.SimpleNamespace(), c, types.SimpleNamespace(work_model="claude"), bubble=bubble
+                        )
+                    except tc.config.NoProgress:
+                        pass
+                    else:
+                        raise AssertionError("preparation outage did not back off")
+                    assert w.counters.read("review-err-42") == 1
+                    from tauceti_worker.state_repair import retry_key
+
+                    assert w.counters.read(retry_key(42, c.head)) > time.time()
+                    record.assert_not_called()
+                    sync.assert_not_called()
+                    bust.assert_called_once_with(42)
+        check("preparation outages preserve existing error allowance in both launchers", True)
+
+        for code in (85, 86):
+            with patch.object(tc.work_units, "record_review_failure") as record:
+                retained, deferred, _ = drive(code, state)
+                check(f"publication status {code} defers without new inference", deferred is not None)
+                check(
+                    f"publication status {code} preserves the PR error allowance",
+                    retained.counters.read("review-err-42") == 0,
+                )
+                record.assert_not_called()
+
         # 2) an ordinary engine failure keeps the existing behaviour.
         w2, raised2, out2 = drive(1, state)
         check("an ordinary failure does not raise", raised2 is None)
@@ -119,7 +173,7 @@ def main():
             drive(REVIEW_PROVIDER_DOWN_EXIT, state)[0].counters.read("review-err-42")
             for _ in range(MAX_REVIEW_ERRORS + 2)
         )
-        check("repeated outages never reach the stuck cap", charged < MAX_REVIEW_ERRORS)
+        check("repeated outages never reach the review-error cap", charged < MAX_REVIEW_ERRORS)
 
     # 5) the public category for an exhausted plan.
     cases = {

@@ -5,6 +5,12 @@
 Progress-report rounds always run on the host. This page describes what the
 container boundary enforces; the README covers when to use it.
 
+Code-writing rounds are currently refused in Bubble: their bootstrap would unpack
+a private Mathlib build and build TauCeti inside the container, while a host keeps
+one shared, read-only copy of each. They run again once Bubble containers see those
+shared views. Review rounds are unaffected: they only read a host-wide, read-only
+Mathlib source snapshot.
+
 ## What happens in the container
 
 The outer worker surveys GitHub, selects a task, and coordinates claims from the
@@ -42,11 +48,12 @@ refreshes a selected container through another account's active login.
 
 ## Lake caches
 
-Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
-`lake exe cache get`, fetches TauCeti's own main-built outputs with
-`lake cache get`. Host coding rounds do this after selecting the target branch,
-using the anonymous public service at `cache.taucetiproject.org` and a private
-per-worker artifact store. Lake searches up to 100 revisions for a published
+Before the work agent starts, a host coding round attaches the host's shared Mathlib
+(sources and the builds of Mathlib and its dependencies; see
+[shared-mathlib.md](shared-mathlib.md)) and fetches TauCeti's own main-built outputs with
+`lake cache get`. It does this after selecting the target branch, using the anonymous public
+service at `cache.taucetiproject.org` and a private per-worker artifact store. Bubble rounds
+still fetch Mathlib's prebuilt outputs with `lake exe cache get` inside the container. Lake searches up to 100 revisions for a published
 build; `LAKE_CACHE_MAX_REVS` overrides that limit (`0` searches the complete history).
 The build restores matching artifacts and compiles changed modules and their
 affected dependents. Progress-writing and review jobs do not need this bootstrap.
@@ -58,8 +65,9 @@ replacing the operator’s Lake service configuration for that invocation. The p
 service stays configured throughout the agent invocation; after changing Git history, dependencies or
 repairing a malformed workspace, the agent is instructed to fetch both caches again.
 
-Host downloads retry once, with one twenty-minute deadline for the entire
-bootstrap. A transport, publication or partial-download failure stops the round
+Host downloads retry once. They have no wall-clock deadline of their own: Lake's HTTP timeouts
+cover a hung connection, waits for another round's cache entry last until that round releases it,
+and only the round's hard cap (`TAUCETI_ROUND_TIMEOUT`) bounds the bootstrap. A transport, publication or partial-download failure stops the round
 before the agent starts and never consumes a PR's attempt budget or its bounded
 provider-refund allowance. Missing published main outputs also stop the round
 rather than compiling the whole library. Workspace, dependency revision and invalid-toolchain errors reach the
@@ -86,6 +94,31 @@ capability checks only, `tauceti` can fetch it with `uvx`. `tauceti doctor`
 reports whether the Bubble and Incus executables are present; the round preflight
 checks the Bubble version and capabilities. `TAUCETI_BUBBLE` overrides the
 executable, and `TAUCETI_BUBBLE_HOME` overrides the private Bubble home.
+
+### Restricted Incus projects
+
+A user in the `incus` group is served by `incus-user` and gets a restricted
+project of their own, without the root-equivalent access `incus-admin` grants.
+Such a project accepts a disk device only when its source lies under the
+project's allowed paths (the user's home directory, for a project `incus-user`
+creates) and is reached without crossing an absolute symlink. On Linux the worker hands
+Bubble every explicit mount by its resolved host path, so the roadmap and review-engine
+checkouts, which are links into the shared repository store, arrive as the
+snapshots they point to. Container paths and read/write modes are preserved.
+Darwin host paths keep their original spelling because resolving `/tmp` or
+`/var` to `/private` paths may change what the Colima VM can access.
+
+What the worker mounts must itself sit under an allowed path: its state and
+data directories, the Python environment it is installed in,
+`TAUCETI_GITHUB_SHARED_DIR`, `TAUCETI_SHARED_REPOSITORIES_DIR` and a
+`TAUCETI_REVIEW_ENGINE_DIR` checkout. With
+`TAUCETI_VERIFY_HELPER=1`, set `TAUCETI_VERIFY_CACHE_DIR` as well, because its
+default is under `/tmp`.
+
+The worker changes no ownership or permissions for the container. Connecting
+the container to the project's bridge and mapping the host user onto the
+container's `user`, so that private files mounted from the host stay readable
+inside, are Bubble's part.
 
 ## OpenRouter agents
 

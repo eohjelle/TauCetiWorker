@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Quota pauses retain stage work and reach the driver without failed-round backoff."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess
@@ -19,6 +22,52 @@ from tauceti_worker.constants import EX_GITHUB_WAIT, EX_NOPROGRESS
 
 
 class GitHubPauseTests(unittest.TestCase):
+    def test_publication_pacing_preserves_review_budget_and_counts_as_waiting(self):
+        from tauceti_worker import activity
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {
+                    "TAUCETI_GITHUB_SHARED_DIR": tmp,
+                    "GH_TOKEN": "fixture",
+                    "TAUCETI_WORKER_ID": "fixture",
+                    "TAUCETI_GH_PROXY_WAIT": "0",
+                },
+            ),
+            patch.object(transport, "mutation_slot", return_value=60),
+            patch.object(transport.subprocess, "run") as send,
+            patch.object(activity, "emit") as emit,
+        ):
+            values = {"review-err-7": 2, "review-err-7-at": 1000}
+            worker = SimpleNamespace(
+                counters=SimpleNamespace(
+                    read=lambda key: values[key], write=lambda key, value: values.__setitem__(key, value)
+                )
+            )
+            candidate = SimpleNamespace(pr=7, head="abc")
+
+            def paced(*_args):
+                values["review-err-7"] += 1
+                values["review-err-7-at"] = 2000
+                return transport.execute(
+                    ["gh", "api", "-X", "POST", "repos/org/repo/issues/7/comments", "-f", "body=review"],
+                    wait=True,
+                ).returncode
+
+            round_ = activity.Round("fixture")
+            round_.select("review")
+            with self.assertRaises(GitHubUnavailable) as waiting:
+                work_units._run_github_stage("review", paced, worker, None, candidate, None, False)
+            round_.finish(waiting.exception)
+            self.assertEqual(values["review-err-7"], 2)
+            self.assertEqual(values["review-err-7-at"], 1000, "the back-off timestamp is restored too")
+            self.assertGreater(waiting.exception.retry_at, round_.started_at + 59)
+            self.assertIn("round_waited", [call.args[0] for call in emit.call_args_list])
+            self.assertNotIn("round_finished", [call.args[0] for call in emit.call_args_list])
+            send.assert_not_called()
+
     def test_stage_preserves_accrued_attempts_and_propagates_reset(self):
         with (
             tempfile.TemporaryDirectory() as tmp,
@@ -42,7 +91,8 @@ class GitHubPauseTests(unittest.TestCase):
             with self.assertRaises(GitHubUnavailable) as raised:
                 work_units._run_github_stage("fix", interrupted, worker, None, candidate, None, False)
             self.assertEqual(values["fix-7-abc"], 3)
-            self.assertEqual(raised.exception.retry_at, reset)
+            # Workers paused on one account retry over a jittered window after its reset.
+            self.assertTrue(reset <= raised.exception.retry_at <= reset + 120)
 
     def test_unrelated_search_and_mirrored_read_quotas_do_not_gate_stages(self):
         with (
@@ -56,16 +106,38 @@ class GitHubPauseTests(unittest.TestCase):
             work_units._check_stage_read_quota("fix")
         with (
             patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
-            patch.object(transport, "observed_budget", return_value={"core": (0, 2000), "graphql": (0, 2000)}),
+            patch.object(transport, "observed_budget", return_value={"core": (1, 2000), "graphql": (0, 2000)}),
         ):
             work_units._check_stage_read_quota("review")
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.object(transport, "observed_budget", return_value={"core": (0, 2000), "graphql": (5000, 2000)}),
+            self.assertRaises(GitHubUnavailable) as waiting,
+        ):
+            work_units._check_stage_read_quota("review")
+        self.assertTrue(2000 <= waiting.exception.retry_at <= 2000 + 120)
 
     def test_post_write_progress_bypasses_webhook_lag(self):
+        from tauceti_worker.github import GitHub
+
+        with patch("tauceti_worker.github.gh_run", return_value=SimpleNamespace(returncode=1)) as read:
+            with transport.read_context(fresh=True, direct=True, retry=False):
+                GitHub("org/repo")._gh(["pr", "view", "7"])
+        self.assertEqual(read.call_args.kwargs["max_wait"], 0)
+        with patch("tauceti_worker.github.gh_run", return_value=SimpleNamespace(returncode=1)) as read:
+            with transport.read_context(fresh=True, direct=True):
+                GitHub("org/repo")._gh(["pr", "view", "7"])
+        self.assertNotIn("max_wait", read.call_args.kwargs)
         gh = SimpleNamespace(
             pr_progress_state=lambda _: {"head": "new" if transport.direct_reads() else "old", "ncomments": 0}
         )
-        self.assertTrue(
+        self.assertIsNone(
             work_units._progressed(SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0})
+        )
+        self.assertTrue(
+            work_units._progressed(
+                SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0, "published": "new"}
+            )
         )
         self.assertFalse(transport.direct_reads())
 
@@ -148,6 +220,7 @@ class GitHubPauseTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"TAUCETI_USE_BUDGET": "0", "TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
             patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", side_effect=codes),
             patch.object(loop, "runtime_snapshot", return_value={"next_action_at": retry_at, "detail": "quota reset"}),
             patch.object(loop, "report_runtime", side_effect=lambda state=None, **kw: statuses.append((state, kw))),

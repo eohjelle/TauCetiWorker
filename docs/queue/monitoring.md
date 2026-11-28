@@ -1,0 +1,182 @@
+# Public queue monitoring
+
+The standalone `tauceti_queue.monitoring` sidecar reads SQLite in read-only mode,
+projects explicit public fields and publishes framed observations to the existing
+live-CI service. It cannot claim tasks, write statuses, pause admissions or land a
+batch. Its failure does not affect controller or repair work.
+
+Deploy the live-CI reader, public scope and telemetry-only grant first. Keep the
+publisher token and state file private. Start a separate supervised process:
+
+```sh
+python3 -m tauceti_queue.monitoring \
+  --database ~/TauCetiQueue-data/queue.sqlite3 \
+  --clone ~/TauCetiQueue-data/clone \
+  --worker-root ~/TauCetiQueue-data/repair \
+  --worker-root ~/TauCetiQueue-data/repair-2 \
+  --output ~/TauCetiQueue-data/monitoring/queue.json \
+  --state-file ~/TauCetiQueue-data/monitoring/publisher.json \
+  --publish-url https://ci-data.taucetiproject.org/ingest/operations/queue \
+  --token-file ~/TauCetiQueue-data/monitoring/token \
+  --follow --interval 10
+```
+
+On the queue host these commands run as systemd user units from their own release directory,
+`~/TauCetiQueue-releases/<sha>-<time>/`, with its uv environment (the modules import
+`tauceti_tools`, so the system `python3` is not enough; operations.md, "Install and update"):
+
+```sh
+~/TauCetiQueue/services/queue/install-monitoring.sh
+```
+
+installs `tauceti-queue-monitoring.service` (the live publisher above),
+`tauceti-queue-task-activity.service` (the repair-phase observer below), and
+`tauceti-queue-monitoring-history.service` with its hourly timer (the history report below), and
+`tauceti-queue-forgejo-team-sync.timer` and `tauceti-queue-claims-access.timer` (docs/forgejo-worker.md,
+"Claim access for contributor fleets"),
+then restarts the two long-running units. Host-specific extra arguments, such as retired workers' task
+roots, go in `~/.config/tauceti-queue/monitoring-environment` as `TAUCETI_QUEUE_MONITORING_ARGS`
+(`services/queue/monitoring-environment.example`). Never use systemd drop-ins for these units, and
+never point them at a hand-made directory: the installer creates their release, refuses to run
+while a drop-in exists, and any revision other than origin/main HEAD needs a human operator's
+permission (operations.md, "Install and update").
+The controller/repair services do not need to restart to start the sidecar. Live
+source updates that add the reduction journal event use the normal live deployment
+path without draining. Do not run the controller installer solely to add telemetry.
+
+The state file persists a source UUID and monotonic restart epoch and takes a
+single-process lock. Never run two publishers for the same store. Uploads commit
+only after all bounded frames validate; acknowledgements advance the delta cache.
+A lost receiver base requests a full resend. Source-complete deletions use explicit
+tombstones. Capped missing history does not imply deletion. Keep state files in
+backups. If a state file is lost, stop its old sidecar and use `--recover-state`
+with a **new** private state-file path, the same endpoint and queue grant. This
+explicitly adopts the established receiver source/fence; do not use it to connect
+an unrelated queue/store. Restart epochs also advance from current milliseconds,
+so an ordinary restored old state file does not replay old process epochs.
+
+The live detail window retains active batches plus up to 500 terminal batches in
+ninety days, and up to 5,000 terminal inputs. Only active batches' members and live inputs
+count toward the 20,000-row read limit; terminal batches join newest first while all their
+members fit, and each member carries its own input's title, author and times even when that
+input is older than the published terminal inputs. Byte caps can shorten old detail by
+dropping the oldest terminal batches whole; `retained_batch_ids` says which remain, and
+this alone does not make the snapshot partial. Extraordinary active-only overflow is
+marked partial, with the trimmed collections' `collection_complete` false. Authoritative batch counts
+remain distinct from retained member detail. The public report records its source
+scope and observation times. Worker checkpoint/outcome summaries contain only
+phase/observation/duration, approved provider/model labels and recorded cost
+coverage. Recorded token subtotals retain known-attempt and missing-attempt counts
+for each token category; absent usage is not zero. The canonical tip comes from
+the existing controller status fact, without another Git scan. No raw task payload, claim token, worker path, prompt, model response,
+process command, environment or private error is exported.
+
+Repair workers write an optional atomic `progress.json` beside each private checkpoint. It contains
+the sanitized summary and a local lease binding; the exporter omits that binding. When this file is
+present, monitoring never opens the task or outcome payload, so member context, prompts and final
+diagnostics can grow without making progress unavailable. Accounting includes every recorded attempt
+once; only the model-name display is sampled (with `models_truncated`), independently of cost and
+token totals. A failed progress write leaves the last observation in place and cannot fail a repair.
+Older running workers and historical tasks remain readable without an immediate worker restart.
+That compatibility path loads trusted local checkpoints/outcomes with memory proportional to their
+size; it has no task-size cutoff. Public frame and transport bounds remain unchanged.
+Open tasks may also carry `progress.build`: preparation, verification or streaming
+stage, Lake's reported completed/total **build tasks**, sampler time, log update
+time and the last observed increase in completed tasks. These are not module
+counts or a CI verdict. The sidecar reads at most the last 64 KB of a known local
+build log; no log text, module names or paths leave the machine. The first sample
+has unknown progress-change time. Unchanged counts, including a heartbeat or
+other new log output, do not advance that time. Log replacement, truncation,
+counter regression, a new phase or claim resets the comparison. The phase's own
+checkpoint time stays unchanged. A silent log alone is not a stalled build. Scripted preparation is sampled from the live
+worktree build log while the checkpoint is `artifacts_ready`; the completed copy under
+the task logs is not required. The final Lake job summary supplies the last numeric
+count, without treating a successful local build as a staging verdict.
+
+Worker liveness is distinct from task progress. Busy workers may not rewrite
+worker.json until a long task finishes. On Linux the sidecar can instead verify
+the recorded process using its owner, module, root and birth time (fencing reused
+PIDs). Its observation time then records actual local liveness; a current claim
+and recorded task phase supply the displayed activity. An old checkpoint without
+that evidence stays dated. Missing/inaccessible process evidence means unknown,
+not dead or idle. No PID, command arguments or private paths are exported, and
+the observer never signals a process or controls the task's execution time.
+
+A separate hourly report reuses the existing pilot calculations:
+
+```sh
+python3 -m tauceti_queue.monitoring_history \
+  --database ~/TauCetiQueue-data/queue.sqlite3 \
+  --clone ~/TauCetiQueue-data/clone \
+  --worker-root ~/TauCetiQueue-data/repair \
+  --worker-root ~/TauCetiQueue-data/repair-2 \
+  --baseline ~/TauCetiQueue-data/reports/bors-baseline-2026-11-03.json \
+  --output ~/TauCetiQueue-data/monitoring/history.json \
+  --publish-url https://ci-data.taucetiproject.org/ingest/operations/history \
+  --token-file ~/TauCetiQueue-data/monitoring/token
+```
+
+Schedule this independently of the live publisher. It computes 24-hour, seven-day
+and whole-pilot windows using wall-clock denominators including downtime, unique
+PR identities, retained nonempty commits and unions of CI/claimed-task intervals.
+Overlap is reported separately. Recorded inference costs are subtotals; absent
+estimates and interrupted sessions remain unknown. Baseline nonempty contributions
+and inference costs are unavailable. Attribution/comment correctness and the
+warm-artifact condition still require a separate audit. The public projection
+contains bounded numeric summaries and local IDs, never the private snapshot,
+outcome paths or raw journal detail.
+
+A final empty commit alone does not establish why content disappeared. New
+accepted adoptions journal explicit `member-reduced-to-empty` facts; retained
+scripted already-landed notes remain separate. Historical ambiguous empties stay
+`empty_unknown`.
+
+Members rejected at batch landing are shown as `rejected_empty`, with no `landed_at` timestamp.
+Members an adopted repair emptied, which the queue withdrew at once and sent back to their authors,
+are shown as `withdrawn_empty`.
+The input's landing timestamp, rather than the batch's, is used for each member.
+
+The module's local JSON output is prepared public data; keep its parent directory
+private until it has been inspected against the configured scope. Public browsers
+read R2 only, never this file or the queue's database. Queue publication has a
+15 MB framed-snapshot budget and a 12 MB live projection target; oversize records
+fail before network calls. Normal batches do not change queue scheduling to fit
+monitoring limits. Explicit retained-batch scope lets the receiver retire old
+terminal details without guessing that capped absence means a deleted live item.
+
+
+`GET /statistics` on the current queue controller provides a consistent read-only
+ledger projection (`tauceti-queue.statistics/v1`) for 1h, 3h, 24h and 7d windows.
+Distinct PR landing receipts and landed batches are separate from CI attempt
+outcomes. CI run duration percentiles include setup, result reporting and publication;
+they are not build-only durations. No GitHub calls, source fetches or reconciliation
+are triggered. The retired Bors `/repositories/1/statistics` snapshot is historical
+and must not be presented as current queue history. Native source statistics require
+an explicit qualified public scope and are not exposed by this endpoint.
+
+`GET /statistics/landings?days=N` (N from 1 to 35, default 14) lists each pull
+request whose input recorded a landing in the last N days, as
+`[forge, number, first_approved_at, landed_at]` (`tauceti-queue.landings/v1`);
+`since` is the start of the window or of the ledger, whichever is later.
+`first_approved_at` is the earliest queue admission of any head of that pull
+request, after an all-green review, so opening-to-approval plus approval-to-land
+is its whole opening-to-land time. The statistics generator in TauCetiTools joins
+it with the forges' opening times for the health page's time-to-merge chart. It
+reads the same ledger snapshot rules as `/statistics` and makes no provider calls.
+Like `/status`, which already lists waiting inputs of every source with their
+numbers and approval times, it covers all of the controller's sources.
+
+`GET /claims/forgejo-landers` serves `~/TauCetiQueue-data/claims-forgejo-landers.json`
+(`tauceti-queue.claims-forgejo-landers/v1`) as `tauceti_queue.claims_access` last wrote it: the
+GitHub user ID of each Forgejo author the queue landed, with one landed pull request each, for
+TauCeti's `claims-access` workflow (docs/forgejo-worker.md, "Claim access for contributor
+fleets"). The server only reads the file, and answers 503 until a well-formed one exists.
+
+Live repair activity can be sampled independently of worker checkpoints with
+`python -m tauceti_queue.task_activity --root ROOT --follow` (the provided user
+unit observes all three standard roots). The observer reads only known local
+compiler/driver processes and bounded build/audit markers; it records sanitized
+phase/counter observations in each task's private `activity.json`. It does not
+restart workers or change verdicts. The publisher accepts only observations bound
+to the current claim and sampled within 45 seconds, allowing the transition's
+15-second metadata mirror. Stale observations fall back to the checkpoint.

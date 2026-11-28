@@ -6,13 +6,11 @@ A receipt is durable and incomplete before any child starts; SIGKILL cannot turn
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import contextvars
 import fcntl
 import hashlib
 import json
-import math
 import os
 import platform
 import shlex
@@ -21,28 +19,55 @@ import signal
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .config import Die
 from .constants import LEAN_ROOT
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
-from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 6
-LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
+POLICY_VERSION = 7
+LOCAL_CHECKERS = ("tauceti-local-axioms", "tauceti-local-lint", "tauceti-local-checks")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
+
+
+# The agent's shell kills a command at its budget (`BASH_MAX_TIMEOUT_MS`, one hour by default) with
+# nothing recorded. The verifier stops itself this long before that, so the agent gets an incomplete
+# receipt naming the phase it reached instead of a killed command. Outputs already built are kept.
+DEADLINE_MARGIN_S = 120.0
+# The source watch stats every tracked file and lists the tree: on a 41,000-file checkout under
+# load, about a second each time. Rerun every 2 s it kept a core 40% busy for a whole build, so
+# the next watch waits at least WATCH_DUTY times the last one's cost (at most WATCH_MAX_S): about
+# 1/WATCH_DUTY of a core. The final watch still compares everything before a result is recorded.
+WATCH_MIN_S = 2.0
+WATCH_MAX_S = 60.0
+WATCH_DUTY = 20
+# How often a running phase's log is copied to stderr and its exit and deadline are checked.
+POLL_S = 0.25
+
+
+def own_deadline(environ=None, now=None):
+    """The monotonic time this verification stops by, or None without a known budget."""
+    environ = os.environ if environ is None else environ
+    now = time.monotonic() if now is None else now
+    try:
+        if environ.get("TAUCETI_VERIFY_DEADLINE_S"):
+            return now + float(environ["TAUCETI_VERIFY_DEADLINE_S"])
+        if environ.get("BASH_MAX_TIMEOUT_MS"):
+            return now + max(60.0, float(environ["BASH_MAX_TIMEOUT_MS"]) / 1000 - DEADLINE_MARGIN_S)
+    except ValueError:
+        pass
+    return None
 
 
 class Incomplete(Exception):
@@ -54,7 +79,7 @@ class Incomplete(Exception):
 class _HashCache:
     """Directory-grouped mutable hashes, with per-workspace lazy V1 migration."""
 
-    def __init__(self, state, root=None, *, fresh_candidate=False):
+    def __init__(self, state, root=None):
         self.path = state / "verification-hashes-v2.json"
         payload = read_json(self.path)
         self.entries = self.directories(payload)
@@ -63,7 +88,7 @@ class _HashCache:
         self.imported = bool(self.marker and read_json(self.marker).get("schema") == "tauceti-hash-root/v2")
         self.finished = False
         self.legacy_path = state / "verification-hashes.json"
-        self.legacy = {} if self.imported or fresh_candidate or root is None else None
+        self.legacy = {} if self.imported or root is None else None
         self.retained = set()
         self.inventory_depth = 0
 
@@ -114,6 +139,8 @@ class _HashCache:
     def save(self, immutable_roots):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.with_suffix(".lock").open("a+") as lock:
+            # Bounded on purpose: the caller may already hold this lock through another
+            # descriptor, and the cache is optional (a failed save is only reported).
             deadline = time.monotonic() + 1
             while True:
                 try:
@@ -218,8 +245,12 @@ def cache_root() -> Path:
 def files_under(root: Path):
     if not root.exists():
         return
+    # Stock Lake may place generated artifact downloads below its installation.
+    # These hash-addressed cache outputs are not compiler/distribution inputs;
+    # other workers can populate them while this build is being verified.
+    cache = root / "lake/cache" if (root / "bin/lean").is_file() else None
     for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"})
+        dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"} and Path(directory) / d != cache)
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
             # Lake writes these ignored input-file digests while restoring ProofWidgets.
             # Their source JSON files remain inputs; creating/replacing a derived digest
@@ -334,15 +365,14 @@ class Verification:
         stage="all",
         reuse=True,
         policy="ordinary",
-        deadline=None,
         lint_modules=None,
-        job=None,
     ):
         self.root, self.state = root.resolve(), state.resolve()
         self.base_arg, self.policy = base, policy
         self.lint_modules = lint_modules
         self.requested = list(STAGES) if stage == "all" else [stage]
-        self.reuse, self.deadline = reuse, deadline
+        self.reuse = reuse
+        self.deadline = own_deadline()  # From the start of the verification, as the shell counts.
         self.id = uuid.uuid4().hex
         self.directory = self.state / "verification" / self.id
         self.path = self.directory / "receipt.json"
@@ -362,15 +392,12 @@ class Verification:
         self.watched = {}
         self.static_stamps = {}
         self.static_names = {}
-        self.at_boundary = False
         self.watch_names = set()
         self.dependency_names = None
         self.mutated = False
         self.last_watch = 0.0
+        self.watch_interval = WATCH_MIN_S
         self.live_lease = None
-        self.job = job
-        self.storage_monitor = None
-        self.storage_lease = None
         self.installations = Installations(
             self.state,
             digest=digest,
@@ -388,27 +415,18 @@ class Verification:
     def progress(self, message):
         print(message, file=sys.stderr, flush=True)
 
-    def check_deadline(self):
-        if self.at_boundary:
-            return  # Finish validation/index publication for an already completed phase.
-        margin = float(os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"))
-        if not math.isfinite(margin) or margin < 0:
-            raise ValueError("TAUCETI_VERIFY_CHECKPOINT_MARGIN must be a nonnegative number of seconds")
-        if self.deadline is not None and time.time() >= self.deadline - margin:
-            raise Incomplete("round deadline checkpoint margin reached; checkpoint now", reason="deadline")
-
     def watch(self):
-        self.check_deadline()
-        if self.storage_monitor is not None:
-            self.storage_monitor.check(resources=not self.at_boundary)
-        if self.watched and time.monotonic() - self.last_watch >= 2:
+        if self.watched and time.monotonic() - self.last_watch >= self.watch_interval:
+            started = time.monotonic()
+            changed = stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names
             self.last_watch = time.monotonic()
-            if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
+            self.watch_interval = min(WATCH_MAX_S, max(WATCH_MIN_S, WATCH_DUTY * (self.last_watch - started)))
+            if changed:
                 self.mutated = True
                 raise Incomplete("verification inputs mutated during execution")
 
     def final_watch(self):
-        self.last_watch = 0
+        self.last_watch = float("-inf")  # Always, however long the last watch's backoff.
         self.watch()
         self.installations.validate()
         if stamps(self.static_stamps) != self.static_stamps or any(
@@ -417,6 +435,9 @@ class Verification:
             raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
     def command(self, phase, argv, *, env=None, capture=False):
+        from .verification_resources import defaults
+
+        env = defaults(dict(os.environ if env is None else env))
         self.watch()
         report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
         log = self.directory / f"{len(self.receipt['commands']):03d}-{phase}.log"
@@ -440,17 +461,33 @@ class Verification:
                     )
                 )
                 while process.poll() is None:
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        raise Incomplete(
+                            f"{phase}: stopped at the verification deadline, before the agent's shell budget "
+                            "would kill it. Outputs already built are kept: rerun the verify to continue, or "
+                            "build the modules you changed directly (`lake build Module`).",
+                            reason="deadline",
+                        )
                     if not capture:
                         with log.open("rb") as progress:
                             progress.seek(offset)
                             data = progress.read()
                             offset += len(data)
                             if data:
-                                print(data.decode(errors="replace"), file=sys.stderr, end="", flush=True)
+                                decoded = data.decode(errors="replace")
+                                print(decoded, file=sys.stderr, end="", flush=True)
+                                from .verification_resources import RESOURCE_ERROR, record_wait
+
+                                if RESOURCE_ERROR.search(decoded):
+                                    record_wait("build tool could not create threads; host resource exhaustion")
+                                    raise Incomplete(
+                                        "build tool resource exhaustion; retry after backoff",
+                                        reason="resource-pressure",
+                                    )
                     self.watch()
                     if capture and time.time() - entry["started_at"] > 300:
                         raise Incomplete(f"{phase}: toolchain probe timed out")
-                    time.sleep(0.05)
+                    time.sleep(POLL_S)
                 entry["exit"] = process.returncode
         finally:
             try:
@@ -463,6 +500,12 @@ class Verification:
                 self.save()
         text = log.read_text(errors="replace")
         captured_text = stdout_path.read_text(errors="replace")
+        from .verification_resources import RESOURCE_ERROR, record_wait
+
+        if entry["exit"] and RESOURCE_ERROR.search(text):
+            record_wait("build tool could not create threads; host resource exhaustion")
+            raise Incomplete("build tool resource exhaustion; retry after backoff", reason="resource-pressure")
+
         if capture:
             entry["stdout_log"] = str(stdout_path)
         # Keep the original audit progress/timing lines verbatim in the receipt and full log.
@@ -505,32 +548,41 @@ class Verification:
             }
         }
 
-    def validate_inputs(self, inputs, *, full=False):
-        self.at_boundary = True
+    def tools_inputs(self):
+        from . import verification_tools
+
+        config = verification_tools.configuration()
         try:
-            self.final_watch()
-            if full:
-                unchanged = digest(self.inputs()) == digest(inputs)
-            else:
-                config = os.environ.get("LAKE_CONFIG")
-                unchanged = (
-                    inventory(self.root, self.base) == inputs["sources"]
-                    and scope(self.root, self.base, self.policy) == inputs["scope"]
-                    and self.environment() == inputs["environment"]
-                    and (file_record(Path(config)) if config else None) == inputs["configuration"]
-                    and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
-                    and POLICY_VERSION == inputs["policy_version"]
-                    and {p.name for p in Path(__file__).parent.glob("*.py")}
-                    == set(inputs["verifier"]) - {"wrapper", *LOCAL_CHECKERS}
-                )
-            if self.mutated or not unchanged:
-                raise Incomplete("verification inputs changed during execution")
-            self.final_watch()
-        finally:
-            self.at_boundary = False
+            return dict(
+                root=str(verification_tools.root()),
+                files=self.installations.inventory(verification_tools.root()),
+                configuration=file_record(config) if config else None,
+            )
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
+
+    def validate_inputs(self, inputs, *, full=False):
+        self.final_watch()
+        if full:
+            unchanged = digest(self.inputs()) == digest(inputs)
+        else:
+            config = os.environ.get("LAKE_CONFIG")
+            unchanged = (
+                inventory(self.root, self.base) == inputs["sources"]
+                and scope(self.root, self.base, self.policy) == inputs["scope"]
+                and self.environment() == inputs["environment"]
+                and self.tools_inputs() == inputs["tools"]
+                and (file_record(Path(config)) if config else None) == inputs["configuration"]
+                and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
+                and POLICY_VERSION == inputs["policy_version"]
+                and {p.name for p in Path(__file__).parent.glob("*.py")}
+                == set(inputs["verifier"]) - {"wrapper", *LOCAL_CHECKERS}
+            )
+        if self.mutated or not unchanged:
+            raise Incomplete("verification inputs changed during execution")
+        self.final_watch()
 
     def inputs(self):
-        self.check_deadline()
         toolchain = {}
         for name in ("lake", "lean", "bash", "python3", "git", "tar"):
             executable = shutil.which(name)
@@ -553,8 +605,6 @@ class Verification:
             toolchain[" ".join(command)] = lines[-1] if lines else ""
         prefix = Path(toolchain["lake env lean --print-prefix"])
         if not prefix.is_absolute() or not prefix.is_dir() or not (prefix / "bin" / "lean").is_file():
-            if prefix.is_absolute() and self.job:
-                self.job["toolchain_wait_path"] = str(prefix)
             raise Incomplete("Lean did not report an absolute installed toolchain prefix", reason="tool-missing")
         toolchain["distribution"] = self.installations.inventory(prefix)
         deps = self.root / ".lake" / "packages"
@@ -578,8 +628,9 @@ class Verification:
             toolchain=toolchain,
             verifier=verifier,
             policy_version=POLICY_VERSION,
-            cache_generation=cache_generation(self.state, self.root),
+            cache_generation=None,  # Retained so earlier receipts keep their fingerprints.
             python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
+            tools=self.tools_inputs(),
             lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
         )
 
@@ -609,31 +660,6 @@ class Verification:
                     env,
                 )
             ]
-        if phase == "module-system":
-            return [(["lake", "exe", "module-system"], env)]
-        if phase == "lint":
-            if selected["mode"] == "unknown":
-                raise Incomplete("lint: changed modules unknown; CI owns the full environment lint")
-            commands = [(["bash", "-o", "pipefail", "scripts/lint-style.sh"], env)]
-            lint_list = self.directory / "lint-modules.txt"
-            lint_modules = set(selected["modules"])
-            if self.lint_modules:
-                for module in Path(self.lint_modules).read_text().splitlines():
-                    module = module.strip()
-                    if not module:
-                        continue
-                    path = module.replace(".", "/") + ".lean"
-                    from .verification_scope import MODULE
-
-                    if not MODULE.fullmatch(path) or not (self.root / path).is_file():
-                        raise Incomplete(f"invalid explicit lint module: {module}")
-                    lint_modules.add(module)
-            lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
-            if lint_modules:
-                commands.append(
-                    ([sys.executable, "-I", str(HERE / "scripts/tauceti-local-lint"), "--modules", str(lint_list)], env)
-                )
-            return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
             if not script.exists():
@@ -646,7 +672,8 @@ class Verification:
             merge = selected["merge_base"]
             if not merge:
                 raise Incomplete("shim-expiry: cannot determine merge-base registry")
-            args = ["python3", str(script), "--fail-on-available"]
+            self.check_tools()
+            args = [sys.executable, str(script), "--fail-on-available"]
             baseline = self.directory / "base"
             baseline.mkdir(exist_ok=True)
             try:
@@ -657,7 +684,8 @@ class Verification:
                 (baseline / "mathlib-shims.json").write_bytes(manifest)
                 # No shell pipeline: both git and tar exits are checked independently.
                 archive = self.directory / "base.tar"
-                archive.write_bytes(git(self.root, "archive", merge, LEAN_DIR))
+                paths = base_shim_paths(self.root, merge, manifest)
+                archive.write_bytes(git(self.root, "--literal-pathspecs", "archive", merge, "--", *paths))
                 self.command("shim-baseline", ["tar", "-xf", str(archive), "-C", str(baseline)])
                 args += ["--base-manifest", str(baseline / "mathlib-shims.json"), "--base-root", str(baseline)]
                 pins = git(
@@ -672,66 +700,72 @@ class Verification:
                 )
                 if not pins and self.policy != "bump":
                     args += ["--only-new"]
+                    # As in CI's ordinary-PR scope: everything outside the complete diff is the
+                    # merge base's, which passed the full scan, so the checker rescans only changed
+                    # sources and sources dropped from the base registry instead of every module.
+                    # Like CI, this assumes main passed the scan under the same checker rules.
+                    changed = selected["changed"]
+                    if checker_lines_preserve(changed) and shim_checker_scopes(script, self.root, env):
+                        listing = self.directory / "shim-changed-paths.txt"
+                        listing.write_text("".join(f"{path}\n" for path in changed))
+                        args += ["--changed-paths", str(listing)]
             return [(args, env)]
-        raise ValueError(f"unknown verification phase {phase}")
+        if phase not in {"module-system", "lint"}:
+            raise ValueError(f"unknown verification phase {phase}")
+        if phase == "lint" and selected["mode"] == "unknown":
+            raise Incomplete(f"{phase}: changed modules unknown; CI owns the full checks")
+        self.check_tools()
+        shared = [sys.executable, str(HERE / "scripts/tauceti-local-checks")]
+        common = ["--base", self.base, "--policy", self.policy, "--modules", str(modules)]
+        if phase == "lint":
+            lint_list = self.directory / "lint-modules.txt"
+            selected_modules = set(selected["modules"])
+            if self.lint_modules:
+                from .verification_scope import MODULE
+
+                for module in Path(self.lint_modules).read_text().splitlines():
+                    module = module.strip()
+                    if module and (
+                        not MODULE.fullmatch(module.replace(".", "/") + ".lean")
+                        or not (self.root / (module.replace(".", "/") + ".lean")).is_file()
+                    ):
+                        raise Incomplete(f"invalid explicit lint module: {module}")
+                    if module:
+                        selected_modules.add(module)
+            lint_list.write_text("".join(m + "\n" for m in sorted(selected_modules)))
+            common = ["--base", self.base, "--policy", self.policy, "--modules", str(lint_list)]
+            return [(shared + [part] + common, env) for part in ("sources", "style", "environment")]
+        return [(shared + [phase] + common, env)]
+
+    def check_tools(self):
+        from . import verification_tools
+
+        try:
+            verification_tools.check(self.root, required=True)
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
 
     def run(self):
         self.save()
         previous = {}
         self.live_lease = (self.directory / "live.lock").open("a+")
         fcntl.flock(self.live_lease, fcntl.LOCK_EX)
-        cache = _HashCache(
-            self.state,
-            self.root,
-            fresh_candidate=bool(self.job and self.job.get("isolated") and self.job.get("attempts") == 1),
-        )
+        cache = _HashCache(self.state, self.root)
         cache_token = _HASH_CACHE.set(cache)
         try:
+            if any(phase in self.requested for phase in ("shim-expiry", "axioms", "module-system", "lint")):
+                self.check_tools()
 
             def interrupted(signum, _):
                 raise Incomplete(f"verification interrupted by signal {signum}", reason="signal")
 
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
-            if self.root.parent == self.state / "verification-candidates":
-                from .retention import locked
-                from .verification_storage import Monitor, reserve
-
-                # A direct CLI invocation in an older candidate can create a new job ID.
-                # Protect the actual workspace independently of whichever job refers to it.
-                self.storage_lease = locked(self.state / "verification-storage" / f"{self.root.name}.lock")
-                try:
-                    self.storage_lease.__enter__()
-                except BlockingIOError:
-                    self.storage_lease = None
-                    raise Pressure("candidate storage is being reclaimed; retry verification", reason="busy") from None
-                reserve(self.state, self.root.name)
-                self.storage_monitor = Monitor(self.state, self.root.name)
-                # A direct invocation claims this as an editable workspace, not a disposable
-                # failed copy left by a different invocation.
-                (self.state / "verification-copy-incomplete" / f"{self.root.name}.json").unlink(missing_ok=True)
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
             self.progress(f"scope: {self.receipt['scope']['mode']}: {self.receipt['scope']['reason']}")
             candidate_sources = inventory(self.root, self.base)
-            if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
-                self.checkpoint_sources(dict(sources=candidate_sources))
-            from .verification_jobs import prepare_job
-
-            self.job = prepare_job(self, dict(sources=candidate_sources))
-            self.receipt["job"] = self.job["id"]
-            if self.job.get("isolated") and self.storage_monitor is None:
-                from .verification_storage import Monitor
-
-                self.storage_monitor = Monitor(self.state, self.job["id"])
-            if self.deadline is not None and time.time() >= self.deadline - float(
-                os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600")
-            ):
-                from .verification_jobs import preserve_candidate
-
-                preserve_candidate(self)
-            self.check_deadline()
             self.watch_names = source_names(self.root, self.base)
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
@@ -747,6 +781,10 @@ class Verification:
                 if isinstance(entry, dict) and "path" in entry
             ]
             extra.append(Path(sys.executable))
+            from . import verification_tools
+
+            if config := verification_tools.configuration():
+                extra.append(config)
             self.static_names = {root: {str(p) for p in files_under(root)} for root in self.installations.walked}
             if os.environ.get("LAKE_CONFIG"):
                 extra.append(Path(os.environ["LAKE_CONFIG"]))
@@ -758,25 +796,40 @@ class Verification:
             if not input_file.exists():
                 atomic(input_file, inputs)
             self.receipt.update(inputs=dict(path=str(input_file), sha256=fingerprint), fingerprint=fingerprint)
-            if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
-                self.checkpoint_sources(inputs)
-
-            if digest(inputs["sources"]) != self.job["source_digest"]:
+            if digest(inputs["sources"]) != digest(candidate_sources):
                 raise Incomplete("candidate changed while preparing verification")
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
             self.save()
-            early_style = (
+            early_sources = (
                 len(self.requested) > 1
                 and "lint" in self.requested
+                and self.receipt["scope"]["mode"] != "unknown"
                 and not (self.reuse and self.find_reuse(fingerprint, "lint"))
             )
-            if early_style:
-                from .verification_jobs import preserve_candidate
-
-                preserve_candidate(self, disposable_only=True)
+            if early_sources:
                 self.receipt["phases"]["lint"] = dict(status="incomplete", started_at=time.time(), ended_at=None)
-                self.command("lint", ["bash", "-o", "pipefail", "scripts/lint-style.sh"], env=dict(os.environ))
+                try:
+                    self.command(
+                        "lint",
+                        [
+                            sys.executable,
+                            str(HERE / "scripts/tauceti-local-checks"),
+                            "sources",
+                            "--base",
+                            self.base,
+                            "--policy",
+                            self.policy,
+                        ],
+                        env=dict(os.environ),
+                    )
+                except subprocess.CalledProcessError as error:
+                    if error.returncode in {2, 75}:
+                        raise Incomplete(
+                            "local source checker unavailable; see the phase log",
+                            reason="tool-missing" if error.returncode == 75 else "invalid-input",
+                        ) from error
+                    raise
             for phase in self.requested:
                 self.watch()
                 reused = self.find_reuse(fingerprint, phase) if self.reuse else None
@@ -787,21 +840,20 @@ class Verification:
                     self.progress(f"{phase}: reused exact-input success ({reused})")
                     self.save()
                     continue
-                from .verification_jobs import preserve_candidate
-
-                preserve_candidate(self, disposable_only=True)
                 record = self.receipt["phases"].get(phase) or dict(
                     status="incomplete", started_at=time.time(), ended_at=None
                 )
                 self.receipt["phases"][phase] = record
                 self.save()
                 for argv, env in self.phase_commands(phase, modules):
-                    if early_style and phase == "lint" and "scripts/lint-style.sh" in argv:
+                    if early_sources and phase == "lint" and "sources" in argv:
                         continue
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
-                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
+                        if phase == "shim-expiry":
+                            self.check_tools()  # A removed runtime dependency is not a source defect.
+                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-checks") for arg in error.cmd)
                         if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(
                                 f"local {phase} checker unavailable; see the phase log",
@@ -813,8 +865,6 @@ class Verification:
                 self.index_success()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
             self.validate_inputs(inputs, full=True)
-            if self.storage_monitor is not None:
-                self.storage_monitor.finish()
             self.receipt.update(status="success", ended_at=time.time())
             self.index_success()
         except subprocess.CalledProcessError as error:
@@ -824,52 +874,26 @@ class Verification:
                 incomplete_reason="toolchain" if probing else None,
                 error=f"command exited {error.returncode}: {error.cmd}",
             )
-        except Pressure as error:
-            self.receipt.update(
-                status="incomplete",
-                error=str(error),
-                incomplete_reason="storage-limit"
-                if error.reason == "limit"
-                else "storage-configuration"
-                if error.reason == "configuration"
-                else "verification-busy"
-                if error.reason == "busy"
-                else "disk-pressure",
-                result_type="incomplete",
-                next_action="correct filesystem-headroom settings and invoke verify again"
-                if error.reason == "configuration"
-                else "retry after the current verification/cleanup owner finishes"
-                if error.reason == "busy"
-                else "reclaim verification storage and retry verify in this workspace",
-            )
         except Incomplete as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
         except (Die, OSError, ValueError, RuntimeError) as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason="preparation")
         finally:
             self.receipt["ended_at"] = time.time()
-            if self.storage_monitor is not None:
-                try:
-                    self.storage_monitor.settle_idle()
-                except (OSError, Pressure) as error:
-                    self.progress(f"verification storage accounting deferred: {error}")
             # Retain the legacy field for readers; local checks no longer import an environment.
             self.receipt["audit_phase_timings"] = []
             for phase in self.receipt["phases"].values():
                 if phase.get("ended_at") is None:
                     phase.update(ended_at=self.receipt["ended_at"], status=self.receipt["status"])
-            if self.job:
-                from .verification_jobs import finish_job
-
-                finish_job(self)
+            if self.receipt["status"] == "incomplete":
+                self.receipt.update(
+                    result_type="incomplete",
+                    next_action=self.receipt.get("next_action") or "repair verification inputs and invoke verify again",
+                )
             self.save()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             self.live_lease.close()
-            if self.storage_monitor is not None:
-                self.storage_monitor.close()
-            if self.storage_lease is not None:
-                self.storage_lease.__exit__(None, None, None)
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
             try:
@@ -878,14 +902,7 @@ class Verification:
                 self.progress(f"verification hash cache unavailable: {error}")
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
-            if self.receipt.get("result_type") == "pending":
-                report_runtime(
-                    "verification-pending",
-                    verification_phase=None,
-                    verification_job=self.job["id"] if self.job else Path(self.receipt["continuation_job"]).stem,
-                    detail="durable verification job retained for mechanical continuation",
-                )
-            elif self.receipt["status"] == "incomplete":
+            if self.receipt["status"] == "incomplete":
                 report_runtime("verification-incomplete", verification_phase=None, detail=self.receipt.get("error"))
             else:
                 report_runtime("working", verification_phase=None)
@@ -931,69 +948,55 @@ class Verification:
             return path
         return None
 
-    def checkpoint_sources(self, inputs):
-        """Preserve pre-verification Bubble edits before its disposable container can disappear."""
-        from .retention import locked
-        from .verification_storage import SpaceWriter, release, reserve_checkpoint, settle
 
-        key = digest(dict(base=self.base, sources=inputs["sources"]))
-        target = self.state / "verification-checkpoints" / key
-        try:
-            with locked(self.state / "verification-checkpoint-locks" / f"{key}.lock"):
-                if not (target / "checkpoint.json").exists():
-                    patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
-                    names = sorted(untracked(self.root))
-                    size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
-                    # Observe the archive estimate without gating preservation on an arbitrary
-                    # logical-byte target. Only actual filesystem headroom may interrupt writes.
-                    estimate = size + 16384 + sum(len(name.encode()) * 2 + 8192 for name in names)
-                    reserve_checkpoint(self.state, key, amount=estimate)
-                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    try:
-                        with (target / "source.patch").open("wb") as out:
-                            SpaceWriter(out, target).write(patch)
-                            out.flush()
-                            os.fsync(out.fileno())
-                        with (target / "untracked.tar").open("wb") as out:
-                            with tarfile.open(fileobj=SpaceWriter(out, target), mode="w") as archive:
-                                for name in names:
-                                    archive.add(self.root / name, arcname=name, recursive=False)
-                            out.flush()
-                            os.fsync(out.fileno())
-                        atomic(
-                            target / "checkpoint.json",
-                            dict(
-                                base=self.base,
-                                root=str(self.root),
-                                source_digest=digest(inputs["sources"]),
-                                patch="source.patch",
-                                untracked="untracked.tar",
-                                created_at=time.time(),
-                                payloads={
-                                    name: file_record(target / name) for name in ("source.patch", "untracked.tar")
-                                },
-                            ),
-                        )
-                    finally:
-                        # A failed write retains any partial source payload, but never books a
-                        # permanent 256 MiB for an empty directory or a tiny completed checkpoint.
-                        size = sum(path.stat().st_size for path in target.iterdir() if path.is_file())
-                        if not size:
-                            for name in ("source.patch", "untracked.tar"):
-                                path = target / name
-                                if path.is_file() and path.stat().st_size == 0:
-                                    path.unlink()
-                            if not any(target.iterdir()):
-                                target.rmdir()
-                                with contextlib.suppress(OSError, Pressure):
-                                    release(self.state, key)
-                        else:
-                            with contextlib.suppress(OSError, Pressure):
-                                settle(self.state, key, size, compact=True)
-        except BlockingIOError:
-            raise Pressure("exact source checkpoint is being preserved; retry verification", reason="busy") from None
-        self.receipt["source_checkpoint"] = str(target / "checkpoint.json")
-        self.save()
+def base_shim_paths(root: Path, merge: str, manifest: bytes) -> list[str]:
+    """The merge-base paths the shim checker reads under ``--base-root`` (literal pathspecs).
+
+    The checker opens only the base registry and the base registry's own sources there, so
+    extracting those instead of every library module gives it identical inputs. A registry it
+    cannot read falls back to the whole library: the checker then reports the registry error.
+    """
+    try:
+        entries = json.loads(manifest)
+    except ValueError:
+        return [LEAN_DIR]
+    wanted = {f"{LEAN_DIR}/mathlib-shims.json"}
+    for entry in entries if isinstance(entries, list) else [None]:
+        sources = entry.get("sources") if isinstance(entry, dict) else None
+        if not isinstance(sources, list) or not all(isinstance(source, str) for source in sources):
+            return [LEAN_DIR]
+        # The checker reads each source as ``base_root / Path(source)``; match its normal form.
+        wanted.update(PurePosixPath(source).as_posix() for source in sources)
+    # A base registry may name a source its own commit lacks; the checker reports it if it matters.
+    names = git(root, "ls-tree", "-r", "-z", "--name-only", merge, "--", LEAN_DIR).split(b"\0")
+    present = {name.decode(errors="surrogateescape") for name in names if name}
+    return sorted(wanted & present)
+
+
+def shim_checker_scopes(script: Path, root: Path, env: dict) -> bool:
+    """Whether this checkout's shim checker accepts ``--changed-paths`` (TauCetiTools #203).
+
+    Ask the checker itself, through the same interpreter and environment as the real run: older
+    standalone checkers reject the option, and any doubt keeps the full scan.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and "--changed-paths" in completed.stdout
+
+
+def checker_lines_preserve(paths) -> bool:
+    """Whether the checker's ``splitlines()`` reader would read back exactly these paths."""
+    return all(path and path.splitlines() == [path] for path in paths)
 
 
 def add_parser(sub):
@@ -1007,39 +1010,15 @@ def add_parser(sub):
         "--json", action="store_true", help="emit exactly one JSON result on stdout; progress on stderr"
     )
     parser.add_argument("--no-reuse", action="store_true", help="run requested phases even when exact evidence exists")
-    parser.add_argument("--resume-job", type=Path, help=argparse.SUPPRESS)
 
 
 def command(args):
     state = Path(
-        os.environ.get("TAUCETI_VERIFY_STATE") or HERE / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
+        os.environ.get("TAUCETI_VERIFY_STATE")
+        or legacy_data_root(HERE) / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
     )
     try:
         root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip()).resolve()
-        deadline = float(os.environ["TAUCETI_ROUND_DEADLINE"]) if os.environ.get("TAUCETI_ROUND_DEADLINE") else None
-        if deadline is not None and not math.isfinite(deadline):
-            raise ValueError("round deadline must be finite")
-        job = None
-        if getattr(args, "resume_job", None):
-            job_path = args.resume_job.resolve()
-            job = read_json(job_path)
-            if (
-                job.get("schema") != "tauceti-verification-job/v1"
-                or job_path != state.resolve() / "verification-pending" / f"{job.get('id')}.json"
-                or not isinstance(job.get("root"), str)
-                or not Path(job["root"]).is_absolute()
-                or Path(job["root"]).resolve() != root
-            ):
-                raise ValueError("invalid mechanical verification job")
-            descriptor = int(os.environ.get("TAUCETI_VERIFY_JOB_FD", "-1"))
-            owned = os.fstat(descriptor)
-            lease = (state / "verification-jobs" / f"{job['id']}.lock").stat()
-            if (owned.st_dev, owned.st_ino) != (lease.st_dev, lease.st_ino):
-                raise ValueError("mechanical helper requires its supervisor's job lease")
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # A runtime's state symlink and Git's physical cwd name the same candidate.
-            # Persist the actual execution path; different workspaces remain distinct inputs.
-            job["root"] = str(root)
         verification = Verification(
             root,
             state,
@@ -1047,9 +1026,7 @@ def command(args):
             stage=args.stage,
             reuse=not args.no_reuse,
             policy=os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-            deadline=deadline,
             lint_modules=getattr(args, "lint_modules", None),
-            job=job,
         )
         result = verification.run()
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:

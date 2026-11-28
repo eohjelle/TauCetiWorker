@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Deployment churn retries mechanical stages, preserving the window and paid-stage state."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import hashlib
 import json
@@ -15,10 +18,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tauceti_worker import cli, loop, work_recovery
+from tauceti_worker import cli, loop
 from tauceti_worker import progress_publication as publication
 from tauceti_worker import work_units as wu
-from tauceti_worker.config import Die, DocumentationUnavailable, ProgressPreparationUnavailable
+from tauceti_worker.config import Die, DocumentationUnavailable
 from tauceti_worker.constants import EX_DOCUMENTATION_WAIT, EX_NOPROGRESS, PROGRESS_ERROR_KEY
 from tauceti_worker.survey import progress_due
 
@@ -57,12 +60,21 @@ class GenerationRetryTests(unittest.TestCase):
         )
         self.calls, self.caches, self.timeouts = [], [], []
 
+        def fetched(argv):
+            self.assertEqual(argv, ["git", "-C", str(self.roadmap), "fetch", "-q", "origin"])
+            return subprocess.CompletedProcess([], 0)
+
+        fetch = patch.object(wu.subprocess, "run", side_effect=fetched)
+        self.fetch = fetch.start()
+        self.addCleanup(fetch.stop)
+
     def run_tool(self, stage, *args, capture=False, docs_cache=None):
         self.calls.append(stage)
         assert capture
         assert Path(docs_cache).is_dir()
         self.caches.append((stage, docs_cache))
         if stage == "plan":
+            self.assertEqual(args[args.index("--roadmap-ref") + 1], "origin/main")
             Path(args[args.index("--out") + 1]).write_text(json.dumps(PLAN))
         else:
             Path(args[args.index("--out") + 1]).write_text(json.dumps(FACTS))
@@ -79,6 +91,8 @@ class GenerationRetryTests(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.work.iterdir()}
 
         def churning(stage, *args, **kwargs):
+            if stage == "plan":
+                self.assertEqual(self.fetch.call_count, self.calls.count("plan") + 1)
             proc = self.run_tool(stage, *args, **kwargs)
             return subprocess.CompletedProcess([], 76, "facts partial stdout", LEGACY) if stage == "facts" else proc
 
@@ -86,6 +100,8 @@ class GenerationRetryTests(unittest.TestCase):
             wu._prepare_progress(self.worker, churning, self.roadmap, self.work)
         self.assertIn("3 attempts", str(raised.exception))
         self.assertEqual(self.calls, ["plan", "facts"] * 3)
+        self.assertEqual(self.fetch.call_count, 3)
+        self.fetch.assert_called_with(["git", "-C", str(self.roadmap), "fetch", "-q", "origin"])
         self.assertEqual(len({cache for _, cache in self.caches}), 3)
         for a, b in zip(self.caches[::2], self.caches[1::2], strict=True):
             self.assertEqual(a[1], b[1])
@@ -108,6 +124,18 @@ class GenerationRetryTests(unittest.TestCase):
         prepared = wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work)
         self.assertEqual(json.loads(prepared[1].read_text()), FACTS)
         self.assertEqual(self.calls, ["plan", "facts"])
+        self.assert_uncharged()
+
+    def test_failed_retry_fetch_stops_before_reusing_old_cadence(self):
+        def churning(stage, *args, **kwargs):
+            proc = self.run_tool(stage, *args, **kwargs)
+            return subprocess.CompletedProcess([], 76, "", LEGACY) if stage == "facts" else proc
+
+        self.fetch.side_effect = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+        with self.assertRaisesRegex(Die, "before planning failed"):
+            wu._prepare_progress(self.worker, churning, self.roadmap, self.work)
+        self.assertEqual(self.calls, ["plan", "facts"])
+        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
         self.assert_uncharged()
 
     def pages_fixture(self):
@@ -179,6 +207,150 @@ class GenerationRetryTests(unittest.TestCase):
                 wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work)
         self.assertEqual(self.calls, ["plan", "facts"] * 3)
         self.assert_uncharged()
+
+    SOURCE = {"schema": "tauceti-progress.source/v1", "content": "forgejo:https://forge.invalid/team/Math"}
+
+    def test_source_binding_must_agree_before_paid_writing(self):
+        other = {**self.SOURCE, "content": "forgejo:https://forge.invalid/team/Other"}
+        for plan_source, facts_source in (
+            ({"source": self.SOURCE}, {"source": other}),
+            ({"source": self.SOURCE}, {}),
+            ({}, {"source": self.SOURCE}),
+            ({"source": None}, {}),
+        ):
+            with self.subTest(plan=plan_source, facts=facts_source):
+                self.calls.clear()
+                (self.work / "status-body.md").write_text("prior prose")
+                with patch.dict(PLAN, plan_source), patch.dict(FACTS, facts_source):
+                    with self.assertRaises(DocumentationUnavailable):
+                        self.drive_inner()
+                self.assertEqual(self.calls, ["plan", "facts"] * 3)
+                self.assertEqual((self.work / "status-body.md").read_text(), "prior prose")
+                self.assert_uncharged()
+        for binding in ({"source": self.SOURCE}, {}):
+            with self.subTest(both=binding):
+                self.calls.clear()
+                with patch.dict(PLAN, binding), patch.dict(FACTS, binding):
+                    self.assertIsNotNone(wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work))
+                self.assertEqual(self.calls, ["plan", "facts"])
+
+    def test_changed_source_binding_is_new_identity_for_free_mechanical_retry(self):
+        original_run = self.run_tool
+        selected = 0
+
+        def prepared(stage, *args, **kwargs):
+            nonlocal selected
+            if stage == "plan":
+                selected += 1
+            binding = {"source": self.SOURCE} if selected > 1 else {}
+            with patch.dict(PLAN, binding), patch.dict(FACTS, binding):
+                if stage == "facts" and selected == 1:
+                    self.calls.append(stage)
+                    return subprocess.CompletedProcess([], 78, "", "invalid saved source repository binding; replan")
+                return original_run(stage, *args, **kwargs)
+
+        self.assertIsNotNone(wu._prepare_progress(self.worker, prepared, self.roadmap, self.work))
+        self.assertEqual(self.calls, ["plan", "facts", "plan", "facts"])
+
+    @staticmethod
+    def policy_fixture(commit="a"):
+        raw = json.dumps(
+            {"commits": {commit * 40: None}, "mappings": [], "schema": "tauceti-progress.migration/v1"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        return raw, {"history_migration_sha256": digest, "history_migration_file": f"plan.json.history-{digest}.json"}
+
+    def test_policy_is_promoted_before_plan_and_preserved_with_previous_paid_output(self):
+        raw, policy = self.policy_fixture()
+        old_raw, old_policy = self.policy_fixture("b")
+        (self.work / "plan.json").write_text(json.dumps({**PLAN, **old_policy}))
+        (self.work / old_policy["history_migration_file"]).write_bytes(old_raw)
+        (self.work / "status-body.md").write_text("previous paid prose")
+        original_run = self.run_tool
+        original_install = wu._install_progress_body
+
+        def prepared(stage, *args, **kwargs):
+            result = original_run(stage, *args, **kwargs)
+            if stage == "plan":
+                (Path(args[args.index("--out") + 1]).parent / policy["history_migration_file"]).write_bytes(raw)
+            return result
+
+        def install(source, target):
+            if target.name == "plan.json":
+                self.assertEqual((target.parent / policy["history_migration_file"]).read_bytes(), raw)
+            return original_install(source, target)
+
+        self.run_tool = prepared
+        with patch.dict(PLAN, policy), patch.object(wu, "_install_progress_body", side_effect=install):
+            self.assertEqual(self.drive_inner(), 0)
+        saved = list((self.root / "progress/mechanical").glob("attempt-*/previous"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual((saved[0] / old_policy["history_migration_file"]).read_bytes(), old_raw)
+        self.assertEqual((saved[0] / "status-body.md").read_text(), "previous paid prose")
+        self.assertEqual(publication.history_policy(self.work / "plan.json", verify=True).read_bytes(), raw)
+
+    def test_missing_or_corrupt_policy_prevents_paid_writing(self):
+        raw, policy = self.policy_fixture()
+        original_run = self.run_tool
+        for corrupt in (False, True):
+
+            def prepared(stage, *args, corrupt=corrupt, **kwargs):
+                result = original_run(stage, *args, **kwargs)
+                if stage == "plan" and corrupt:
+                    target = Path(args[args.index("--out") + 1]).parent / policy["history_migration_file"]
+                    target.write_bytes(raw + b"changed")
+                return result
+
+            self.run_tool = prepared
+            with patch.dict(PLAN, policy), self.assertRaises(DocumentationUnavailable):
+                self.drive_inner()
+            self.assertNotIn("writer", self.calls)
+            self.assert_uncharged()
+
+    def test_changed_policy_cannot_pay_again_for_parked_window(self):
+        saved = self.root / "progress/retained/parked"
+        saved.mkdir(parents=True)
+        (saved / "publication.json").write_text(json.dumps({"status": "parked"}))
+        (saved / "plan.json").write_text(json.dumps({**PLAN, "history_migration_sha256": "a" * 64}))
+        (saved / "status-body.md").write_text("previous paid prose")
+        with patch.dict(PLAN, history_migration_sha256="b" * 64):
+            self.assertIsNone(wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work))
+        self.assertEqual(self.calls, ["plan"])
+        self.assertEqual((saved / "status-body.md").read_text(), "previous paid prose")
+        self.assert_uncharged()
+
+    def test_repaired_policy_is_new_identity_for_free_mechanical_retry(self):
+        old_raw, old_policy = self.policy_fixture("b")
+        raw, policy = self.policy_fixture()
+        original_run = self.run_tool
+        selected = 0
+
+        def prepared(stage, *args, **kwargs):
+            nonlocal selected
+            if stage == "plan":
+                selected += 1
+                current_raw, current = (old_raw, old_policy) if selected == 1 else (raw, policy)
+                with patch.dict(PLAN, current):
+                    result = original_run(stage, *args, **kwargs)
+                (Path(args[args.index("--out") + 1]).parent / current["history_migration_file"]).write_bytes(
+                    current_raw
+                )
+                return result
+            if selected == 1:
+                self.calls.append(stage)
+                return subprocess.CompletedProcess([], 78, "", "saved history migration invalid")
+            return original_run(stage, *args, **kwargs)
+
+        self.run_tool = prepared
+        self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(self.calls, ["plan", "facts", "plan", "facts", "prompt", "writer"])
+        self.assertEqual(
+            json.loads((self.work / "plan.json").read_text())["history_migration_sha256"],
+            policy["history_migration_sha256"],
+        )
+        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
 
     def test_pages_bundle_is_promoted_and_archived_with_plan(self):
         bundle, pin = self.pages_fixture()
@@ -341,8 +513,8 @@ class GenerationRetryTests(unittest.TestCase):
             if args[0] == "git":
                 return subprocess.CompletedProcess(args, 0, "", "")
             stage = args[1]
-            self.assertLessEqual(kwargs["timeout"], 1800)
-            self.timeouts.append(kwargs["timeout"])
+            # No timeout of their own: only the round's hard cap bounds the tools.
+            self.assertNotIn("timeout", kwargs)
             if stage == timeout_stage:
                 raise subprocess.TimeoutExpired(args, 1800, output=b"partial stdout", stderr=b"partial stderr")
             if stage in ("plan", "facts"):
@@ -362,7 +534,7 @@ class GenerationRetryTests(unittest.TestCase):
             self.calls.append(stage)
             return subprocess.CompletedProcess(args, 0, "writer prompt", "prompt stderr")
 
-        def writer(*_args):
+        def writer(*_args, **_kwargs):
             self.calls.append("writer")
             self.assertEqual(json.loads((self.work / "plan.json").read_text())["to_sha"], NEW)
             self.assertEqual(json.loads((self.work / "facts.json").read_text())["docs_sha"], NEW)
@@ -380,8 +552,6 @@ class GenerationRetryTests(unittest.TestCase):
                 (publication, "parked_window", None),
                 (publication, "save", {}),
                 (publication, "defer", {}),
-                (work_recovery, "guard", SimpleNamespace(ok=True)),
-                (work_recovery, "note_owner", None),
                 (wu, "prepare_checkout", checkout_ok),
                 (wu, "_apply_prepared_progress", 0),
             ):
@@ -539,16 +709,11 @@ class GenerationRetryTests(unittest.TestCase):
             self.assertIn("round_waited", [c.args[0] for c in emit.call_args_list])
             self.assertNotIn("round_finished", [c.args[0] for c in emit.call_args_list])
 
-    def test_stage_timeout_fits_the_remaining_round_budget(self):
+    def test_round_deadline_never_defers_preparation(self):
+        # A deadline already in the past is not a reason to wait: only the hard cap ends a round.
         with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() - 1)}):
-            with self.assertRaises(ProgressPreparationUnavailable):
-                self.drive_inner()
-        self.assertNotIn("plan", self.calls)
-        self.assert_uncharged()
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 600)}):
             self.assertEqual(self.drive_inner(), 0)
-        self.assertTrue(self.timeouts)
-        self.assertTrue(all(timeout <= 585 for timeout in self.timeouts))
+        self.assertIn("writer", self.calls)
 
     def test_checkout_failure_preserves_cadence_and_defers_mechanical_work(self):
         with self.assertRaisesRegex(Die, "checkout failed"):
@@ -559,25 +724,6 @@ class GenerationRetryTests(unittest.TestCase):
         with patch("tauceti_worker.survey.subprocess.run") as tool:
             self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
             tool.assert_not_called()
-
-    def test_deadline_cut_timeout_is_an_uncharged_non_churn_wait(self):
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 600)}):
-            with self.assertRaises(ProgressPreparationUnavailable) as raised:
-                self.drive_inner(timeout_stage="facts")
-        self.assertEqual(raised.exception.state, "waiting-progress-preparation")
-        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
-        self.assertEqual(self.values.get("progress-docs-waits", 0), 0)
-        self.assertNotIn("writer", self.calls)
-        self.assert_uncharged()
-        self.assertIn("partial stdout", next(self.cfg.logdir.glob("progress-facts-*.log")).read_text())
-
-    def test_insufficient_writer_budget_waits_before_spending_cadence(self):
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 120)}):
-            with self.assertRaises(ProgressPreparationUnavailable):
-                self.drive_inner()
-        self.assertIn("prompt", self.calls)
-        self.assertNotIn("writer", self.calls)
-        self.assert_uncharged()
 
     def test_mechanical_traces_are_bounded_and_prepared_archives_survive(self):
         archive = self.root / "progress/mechanical/attempt-prepared/previous"
@@ -615,6 +761,7 @@ class GenerationRetryTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"TAUCETI_USE_BUDGET": "0"}),
             patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "github_budget", return_value=None),
             patch.object(
                 loop, "run_round_subprocess", side_effect=[EX_NOPROGRESS, EX_DOCUMENTATION_WAIT, EX_NOPROGRESS]
             ),

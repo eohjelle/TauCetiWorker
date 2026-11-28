@@ -8,10 +8,15 @@ the hard guard). The claim remains cooperative and fail-open. These tests stub o
 and the namespace resolver, so they can pin repository selection without touching GitHub.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -175,6 +180,58 @@ def acquire_error_fails_open():
         assert os.environ["TAUCETI_PUSH_EXPECT"] == "abc"
 
 
+def simultaneous_claim_creates_select_one_worker():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        remote, barrier = root / "remote.git", root / "barrier"
+        subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+        barrier.mkdir()
+        hook = remote / "hooks/pre-receive"
+        # Both receive processes advertise the absent ref before either can
+        # create it, reproducing Git's "reference already exists" rejection.
+        hook.write_text(
+            "#!/usr/bin/env python3\nimport os,pathlib,time,sys\n"
+            "p=pathlib.Path(os.environ['RACE_BARRIER']);(p/str(os.getpid())).touch()\n"
+            "until=time.monotonic()+10\n"
+            "while len(list(p.iterdir()))<2:\n"
+            " if time.monotonic()>until:sys.exit(1)\n"
+            " time.sleep(.01)\n"
+        )
+        hook.chmod(0o755)
+        env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": f"url.{remote}.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://github.com/fixture/claims",
+            "GIT_CONFIG_KEY_1": "protocol.file.allow",
+            "GIT_CONFIG_VALUE_1": "always",
+            "RACE_BARRIER": str(barrier),
+            "CLAIM_REPO": "fixture/claims",
+        }
+
+        def acquire(worker, key="branch/123"):
+            return subprocess.run(
+                [REPO / "scripts/claim.sh", "acquire", key, "1500"],
+                env={**env, "TAUCETI_WORKER_ID": worker, "CLAIM_GITDIR": str(root / f"{worker}.git")},
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(acquire, ("first", "second")))
+        assert sorted(result.returncode for result in results) == [0, 1], [
+            (result.returncode, result.stderr) for result in results
+        ]
+        # A rejected write without a live peer is still an infrastructure error;
+        # the existing worker path remains free to proceed unclaimed.
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        rejected = acquire("third", "branch/456")
+        assert rejected.returncode == 2, rejected.stderr
+
+
 def heartbeat_child_uses_selected_repo():
     captured = {}
     real_popen = round_mod.subprocess.Popen
@@ -210,7 +267,10 @@ def safe_push_scopes_claim_repo():
         claim.chmod(0o755)
         git = tmp / "git"
         git.write_text(
-            '#!/bin/sh\ncase "$*" in *rev-parse*|*mktag*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;; esac\nexit 0\n'
+            # mktag drains its input like the real one: git-safe-push runs under pipefail, so a fake
+            # that exits before printf has written would fail the push with SIGPIPE at random.
+            '#!/bin/sh\ncase "$*" in *mktag*) cat >/dev/null; echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n'
+            "*rev-parse*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;; esac\nexit 0\n"
         )
         git.chmod(0o755)
         env = {
@@ -230,6 +290,150 @@ def safe_push_scopes_claim_repo():
         assert claim_log.read_text().splitlines() == [f"{CLAIMS}|holds"]
 
 
+def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
+    """Drive cmd_heartbeat with a fake wall clock: each sleep advances it, each renewal returns the
+    next code after taking its duration. Returns (exit code, renewal start times)."""
+    clock = [1000.0]
+    attempts = []
+    codes = iter(renewals)
+    spans = iter(durations or [])
+    real = (round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log)
+
+    def fake_renew(key):
+        assert key == "branch/143"
+        attempts.append(clock[0] - 1000)
+        code = next(codes)
+        clock[0] += next(spans, 0)
+        return None if code == "timeout" else code
+
+    def fake_sleep(seconds):
+        assert seconds >= 0
+        clock[0] += seconds
+
+    real_sigterm = round_mod.signal.getsignal(round_mod.signal.SIGTERM)
+    round_mod._renew = fake_renew
+    round_mod.time.sleep = fake_sleep
+    round_mod.time.time = lambda: clock[0]
+    round_mod.log = lambda _message: None
+    saved = {k: os.environ.get(k) for k in ("CLAIM_TTL", "CLAIM_LEASE_STARTED")}
+    os.environ["CLAIM_TTL"] = str(ttl)
+    os.environ["CLAIM_LEASE_STARTED"] = repr(1000.0 if started is None else 1000.0 + started)
+    try:
+        rc = round_mod.cmd_heartbeat(SimpleNamespace(key="branch/143", ppipe=None))
+    finally:
+        round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log = real
+        round_mod.signal.signal(round_mod.signal.SIGTERM, real_sigterm)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return rc, attempts
+
+
+def heartbeat_lost_lease_cancels_at_once():
+    rc, attempts = run_heartbeat([0, 1])
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts == [300, 600], attempts
+
+
+def heartbeat_retries_a_renewal_error_while_the_lease_lasts():
+    # Two failed renewals (a forge outage) followed by a success keep the lease and the round.
+    rc, attempts = run_heartbeat([2, "timeout", 0, 1])
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts == [300, 330, 360, 660], attempts
+
+
+def heartbeat_gives_up_before_an_unrenewed_lease_can_expire():
+    # The last good renewal began at 0, so the lease ends by 1500; no attempt may run past it,
+    # however long each one takes.
+    rc, attempts = run_heartbeat([2] * 100, durations=[round_mod.RENEW_TIMEOUT_S] * 100)
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts[0] == 300, attempts
+    assert attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1500, attempts
+
+
+def heartbeat_dates_the_lease_from_its_acquisition():
+    # An acquisition that started 400s before the heartbeat leaves only that much less lease.
+    rc, attempts = run_heartbeat([2] * 100, started=-400)
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts and attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1100, attempts
+
+
+def renewal_timeout_kills_its_process_group():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "child.pid"
+        script = Path(tmp) / "claim.sh"
+        script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {marker}\nwait\n")
+        script.chmod(0o755)
+        real = (round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S)
+        round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S = str(script), 1
+        try:
+            assert round_mod._renew("branch/143") is None
+        finally:
+            round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S = real
+        child = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the renewal's child outlived its timeout")
+
+
+def terminated_heartbeat_kills_its_renewal():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "child.pid"
+        script = Path(tmp) / "claim.sh"
+        script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {marker}\nwait\n")
+        script.chmod(0o755)
+        code = (
+            "import sys, types; sys.path.insert(0, sys.argv[1]); from tauceti_worker import round as r; "
+            "r.CLAIM_SH = sys.argv[2]; r.CLAIM_HEARTBEAT_S = 0; "
+            "r.cmd_heartbeat(types.SimpleNamespace(key='branch/143', ppipe=None))"
+        )
+        hb = subprocess.Popen([sys.executable, "-c", code, str(REPO), str(script)])
+        try:
+            for _ in range(100):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("the renewal never started")
+            hb.terminate()
+            assert hb.wait(10) == 0
+        finally:
+            hb.kill()
+        child = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the renewal's child outlived the heartbeat")
+
+
+def source_claim_setup_failure_is_unavailable_not_lost():
+    from tauceti_tools.forge import ForgeError
+
+    from tauceti_worker import source_claims
+
+    real = source_claims._main
+
+    def failing():
+        raise ForgeError("Forgejo GET returned HTTP 502", status=502)
+
+    source_claims._main = failing
+    try:
+        assert source_claims.main() == 2
+    finally:
+        source_claims._main = real
+
+
 fails = sum(
     check(name, case)
     for name, case in (
@@ -239,8 +443,22 @@ fails = sum(
         ("explicit CLAIM_REPO remains authoritative", explicit_override),
         ("a skipped candidate cannot leak into the next candidate", skipped_candidate_does_not_leak),
         ("claim errors still proceed unclaimed under branch CAS", acquire_error_fails_open),
+        ("simultaneous claim creation has one winner and one collision", simultaneous_claim_creates_select_one_worker),
         ("heartbeat child inherits the selected repository", heartbeat_child_uses_selected_repo),
         ("git-safe-push scopes its lease check to the selected repository", safe_push_scopes_claim_repo),
+        ("a heartbeat whose lease was taken reports it lost at once", heartbeat_lost_lease_cancels_at_once),
+        (
+            "a heartbeat retries renewal errors while the lease lasts",
+            heartbeat_retries_a_renewal_error_while_the_lease_lasts,
+        ),
+        (
+            "a heartbeat gives up before an unrenewed lease can expire",
+            heartbeat_gives_up_before_an_unrenewed_lease_can_expire,
+        ),
+        ("a heartbeat dates the lease from its acquisition", heartbeat_dates_the_lease_from_its_acquisition),
+        ("a claim-source setup failure is unavailable, not lost", source_claim_setup_failure_is_unavailable_not_lost),
+        ("a renewal that times out is killed with its children", renewal_timeout_kills_its_process_group),
+        ("a terminated heartbeat kills its renewal", terminated_heartbeat_kills_its_renewal),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

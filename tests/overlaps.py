@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Shared-state races, coverage validation, retry publication and phase integration."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import signal
@@ -204,6 +207,33 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(github.gh_run(["gh", "api", "--method", "POST", "repos/a/b/issues"]).returncode, 1)
             self.assertEqual(run.call_count, 1)
             sleep.assert_not_called()
+
+
+class SourceTreeTests(unittest.TestCase):
+    def test_idle_pinned_trees_are_collected_but_never_the_current_or_a_locked_one(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            now = 10_000_000.0
+            current, idle, recent, held = ("a" * 40, "b" * 40, "c" * 40, "d" * 40)
+            stale_temporary = parent / ("e" * 40 + "-123")
+            for name in (current, idle, recent, held):
+                (parent / name / "Mathlib").mkdir(parents=True)
+            (stale_temporary / "Mathlib").mkdir(parents=True)
+            (parent / "unrelated").mkdir()
+            old = now - overlaps.SOURCES_IDLE - 1
+            for path in (parent / current, parent / idle, parent / held, stale_temporary, parent / "unrelated"):
+                os.utime(path, (old, old))
+            os.utime(parent / recent, (now, now))
+            with open(parent / (held + ".lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                removed = overlaps.collect_sources(parent, parent / current, now=now)
+            self.assertEqual(sorted(p.name for p in removed), sorted([idle, stale_temporary.name]))
+            self.assertEqual(
+                sorted(p.name for p in parent.iterdir() if p.suffix != ".lock"),
+                sorted([current, recent, held, "unrelated"]),
+            )
 
 
 class StateTests(unittest.TestCase):
@@ -753,11 +783,27 @@ class InterfaceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             event = threading.Event()
-            timer = threading.Timer(0.15, event.set)
+            ready = Path(tmp) / "agent-ready"
+
+            def lose_lease_once_running() -> None:
+                # Lose the lease only after the agent is running: a fixed delay can expire before
+                # the launch on a loaded CI runner, which tests the pre-launch check instead.
+                deadline = time.monotonic() + 60
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                event.set()
+
+            timer = threading.Thread(target=lose_lease_once_running, daemon=True)
             timer.start()
             try:
                 rc = agents.run_agent_proc(
-                    [sys.executable, "-u", "-c", "import time; print('ready', flush=True); time.sleep(30)"],
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        "import pathlib, sys, time; pathlib.Path(sys.argv[1]).touch(); print('ready', flush=True); time.sleep(30)",
+                        str(ready),
+                    ],
                     env=dict(os.environ),
                     logdir=Path(tmp),
                     label="cancel",
@@ -765,7 +811,8 @@ class InterfaceTests(unittest.TestCase):
                     cancel_event=event,
                 )
             finally:
-                timer.cancel()
+                event.set()
+                timer.join()
             self.assertLess(rc, 0)
             telemetry = json.loads((Path(tmp) / "cancel-telemetry.json").read_text())
             self.assertEqual(telemetry["compactions"], 0)

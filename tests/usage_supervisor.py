@@ -1,5 +1,8 @@
 """Unpaid process fixtures for durable launch, crash recovery and late evidence."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import signal
@@ -18,6 +21,7 @@ from tauceti_worker.budget import Budget, BudgetError, process_identity
 from tauceti_worker.usage_accounting import UsageJournal, read_usage
 from tauceti_worker.usage_lifecycle import alive, durable, identity, resolve
 from tauceti_worker.usage_supervisor import (
+    definitely_dead,
     ensure_supervisor,
     lifecycle_path,
     read_lifecycle,
@@ -37,6 +41,9 @@ class SupervisorTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        activity_env = patch.dict(os.environ, TAUCETI_ACTIVITY_DIR=str(self.root / "activity"))
+        activity_env.start()
+        self.addCleanup(activity_env.stop)
         self.budget = Budget(self.root)
         self.budget.configure(grant=100)
         self.bridge = self.root / "bridges" / uuid.uuid4().hex
@@ -70,6 +77,58 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertIsInstance(cache["sessions"], dict)
         self.assertEqual(cache["sessions"][self.id]["status"], "settled")
+
+    def test_acknowledged_estimated_terminal_is_not_announced_again(self):
+        from tauceti_worker.activity_live import root
+        from tauceti_worker.runtime_status import atomic_json
+
+        self.budget.settle(self.id, 2, provenance="token-priced")
+        cache = {}
+        with patch("tauceti_worker.usage_supervisor.recover_invocation"):
+            tick(self.budget, cache)
+            with self.budget.locked():
+                sequence = self.budget.current()["seq"]
+            atomic_json(root() / "live-inputs.json", dict(ledger_sequence=sequence, sessions={}))
+            cache["live_sessions"] = {}
+            cache["live_pending"] = {}
+            self.budget.configure(grant=1)
+            tick(self.budget, cache)
+        self.assertNotIn(self.id, cache["live_pending"])
+
+    def test_settled_estimate_stops_polling_only_after_all_delivery_is_proven_finished(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        cache = {}
+        tick(self.budget, cache)
+        at = self.budget.clock()
+        self.budget.clock = lambda: at + 61
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            tick(self.budget, cache)
+        self.assertEqual(self.saved()["status"], "settled")
+        before = self.saved()["cost"]
+        dead_parent = self.sleeper()
+        owner, parent = process_identity(dead_parent.pid), identity(dead_parent.pid)
+        self.stop(dead_parent)
+        value = read_lifecycle(self.root, self.id)
+        value.update(owner=owner, parent=parent)
+        durable(lifecycle_path(self.root, self.id), value)
+        self.budget.clock = lambda: at + 122
+        tick(self.budget, cache)
+        self.assertFalse(lifecycle_path(self.root, self.id).exists())
+        self.assertEqual(read_lifecycle(self.root, self.id)["phase"], "reconciled")
+        self.assertEqual(self.saved()["cost"], before)
+        with patch(
+            "tauceti_worker.usage_supervisor.recover_invocation", side_effect=AssertionError("polled retired history")
+        ):
+            tick(self.budget, cache)
+
+    def test_missing_or_unreadable_birth_evidence_is_not_proof_of_death(self):
+        self.assertFalse(definitely_dead({"pid": 999999999}))
+        self.assertFalse(definitely_dead({**identity(), "unsupported": True}))
+        with patch("tauceti_worker.usage_supervisor.identity", side_effect=PermissionError("unreadable")):
+            self.assertFalse(definitely_dead(self.owner))
 
     def ensure_supervisor(self, **kwargs):
         ensure_supervisor(self.root, **kwargs)
@@ -143,6 +202,29 @@ class SupervisorTests(unittest.TestCase):
         tick(self.budget)
         self.assertEqual(self.budget.ledger.read_bytes(), before)
 
+    def test_minute_pass_settles_stopped_uncertainty_and_late_receipt_corrects(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        cache = {}
+        tick(self.budget, cache)
+        self.assertEqual(self.saved()["status"], "provisional")
+        # Simulate the stopped bridge owner while retaining exact native birth checks.
+        at = self.budget.clock()
+        self.budget.clock = lambda: at + 61
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            tick(self.budget, cache)
+        self.assertEqual(self.saved()["status"], "settled")
+        self.assertTrue(self.saved()["recovery_audit"])
+        durable(
+            self.bridge / "inbox" / (self.id + ".receipt"), dict(id=self.id, totals={"provider": "4"}, outcome="exit:0")
+        )
+        self.budget.clock = lambda: at + 122
+        tick(self.budget, cache)
+        self.assertEqual(Decimal(self.saved()["cost"]), 4)
+        self.assertEqual(self.saved()["cost_provenance"], "native-reported")
+
     def test_sigkill_during_request_preserves_priced_prefix(self):
         native = self.launch()
         self.response(complete=False)
@@ -179,6 +261,67 @@ class SupervisorTests(unittest.TestCase):
         durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=identity(native.pid)))
         tick(self.budget)
         self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
+
+    def admitted_invocation(self):
+        """A second admitted invocation with its own bridge, shim and usage journal; settles the first."""
+        bridge = self.root / "bridges" / uuid.uuid4().hex
+        (bridge / "inbox").mkdir(parents=True)
+        (bridge / "outbox").mkdir()
+        invocation = uuid.uuid4().hex
+        lifecycle = registration(
+            invocation,
+            uuid.uuid4().hex,
+            bridge,
+            identity(self.sleeper().pid),
+            enabled=True,
+            owner=self.owner,
+            parent=identity(),
+        )
+        # A settled cost for the model lets a second live session past calibration.
+        self.budget.settle_receipt(dict(id=self.id, totals={self.id: "1"}, outcome="exit:0"))
+        admission = self.budget.admit(
+            invocation, "fixture-2", MODEL, "fix", bridge=str(bridge), owner=self.owner, lifecycle=lifecycle
+        )
+        self.assertTrue(admission["allowed"])
+        register(self.root, lifecycle)
+        UsageJournal(self.root / "usage" / bridge.name, invocation, model=MODEL)
+        return bridge, invocation
+
+    def test_waiting_gate_is_permitted_before_recovery_work(self):
+        permit = self.bridge / "outbox" / (self.id + ".permit")
+        native = self.sleeper()
+        durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=identity(native.pid)))
+        seen = []
+        with patch("tauceti_worker.usage_supervisor.recover_invocation", lambda *a, **k: seen.append(permit.exists())):
+            tick(self.budget)
+        self.assertEqual(seen, [True])
+
+    def test_fast_pass_never_permits_a_settled_session(self):
+        native = self.sleeper()
+        durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=identity(native.pid)))
+        self.budget.settle_receipt(dict(id=self.id, totals={self.id: "0"}, outcome="launch-failed"))
+        self.assertEqual(self.saved()["status"], "settled")
+        with patch("tauceti_worker.usage_supervisor.recover_invocation"):
+            tick(self.budget)
+        self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
+
+    def test_gate_that_starts_waiting_during_slow_recovery_is_served_before_the_next_item(self):
+        bridge, invocation = self.admitted_invocation()
+        permit = bridge / "outbox" / (invocation + ".permit")
+        native = self.sleeper()
+        seen = []
+
+        def slow_recovery(*args, **kwargs):
+            if not seen:
+                durable(bridge / "inbox" / (invocation + ".launch"), dict(id=invocation, native=identity(native.pid)))
+            seen.append(permit.exists())
+
+        with (
+            patch("tauceti_worker.usage_supervisor.LAUNCH_PASS_SECONDS", 0),
+            patch("tauceti_worker.usage_supervisor.recover_invocation", slow_recovery),
+        ):
+            tick(self.budget)
+        self.assertEqual(seen, [False, True])
 
     def test_missing_journal_never_gets_launch_permit(self):
         self.journal.path.unlink()
@@ -552,6 +695,7 @@ class SupervisorTests(unittest.TestCase):
                 owner=identity(),
                 heartbeat=time.time(),
                 protocol=1,
+                ledger_optional=True,
                 source="/another/install/usage_supervisor.py",
                 code_version="other",
             ),
@@ -567,6 +711,27 @@ class SupervisorTests(unittest.TestCase):
         second = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
         self.assertFalse(alive(first))
         self.assertNotEqual(first, second)
+
+    def test_old_supervisor_from_another_install_is_upgraded_automatically(self):
+        from tauceti_worker import usage_supervisor
+
+        self.ensure_supervisor()
+        first = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
+        read = usage_supervisor.safe_message
+
+        def legacy_ready(path):
+            value = read(path)
+            if path.name == "usage-supervisor.json" and value.get("owner") == first:
+                value.pop("ledger_optional", None)
+                value["source"] = "/older/install/usage_supervisor.py"
+            return value
+
+        with patch.object(usage_supervisor, "safe_message", side_effect=legacy_ready):
+            self.ensure_supervisor()
+        second = json.loads((self.root / "usage-supervisor.json").read_text())
+        self.assertFalse(alive(first))
+        self.assertTrue(second["ledger_optional"])
+        self.assertNotEqual(first, second["owner"])
 
     def test_round_end_reporting_failure_preserves_round_returncode(self):
         from types import SimpleNamespace

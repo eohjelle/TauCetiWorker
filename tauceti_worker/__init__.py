@@ -6,6 +6,7 @@ the driver loop); `tauceti status` prints the read-only survey.
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and treats that
 account's own PRs as the ones it tends. Each round does exactly ONE unit of work, chosen in
 priority order: rebase -> bump -> lint-repair -> progress -> fix-ci -> fix -> review -> roadmap.
+Work of any of those kinds on an automatic Mathlib bump PR comes before all other work.
 
 This package was split from a single-file script for navigability. The split is behaviour-
 preserving. For both the test harness (which reaches `tauceti_worker.<NAME>`) and the historical
@@ -17,10 +18,60 @@ a function on the module that actually looks it up.
 
 from __future__ import annotations
 
-from tauceti_tools.project import bootstrap as _bootstrap_project
+_RUST_MIN_STACK = 256 * 1024 * 1024
+
+
+def _raise_stack_limit() -> None:
+    # leantar 0.1.21 (Lean v4.37.0-rc1) overflows the default 8 MiB stack on a large olean (exit 139).
+    # Every process of this package raises its soft stack limit to the hard limit on import, so the
+    # Lake builds, cache staging and restores it starts inherit it, whatever its entry point.
+    # RLIMIT_STACK sizes only the main thread: leantar unpacks a multi-archive batch on Rust threads,
+    # whose stacks default to 2 MiB whatever the rlimit, and abort with "has overflowed its stack".
+    # RUST_MIN_STACK sizes those; it reserves address space, and only touched pages use memory.
+    import os
+
+    os.environ.setdefault("RUST_MIN_STACK", str(_RUST_MIN_STACK))
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_STACK, (hard, hard))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
+_raise_stack_limit()
+
+
+from tauceti_tools.project import bootstrap_qualified as _bootstrap_project
+
+
+def _bootstrap_worker_project():
+    project = _bootstrap_project()
+    if project is None:
+        return
+    import os
+
+    from tauceti_tools.forge import GITHUB
+    from tauceti_tools.project import QUALIFIED_CONTEXT_VARIABLES
+
+    from .source_project import shared_settings
+
+    reference = project.repository_ref("content")
+    settings = shared_settings(project)
+    if reference.forge == GITHUB:
+        return
+    environment = settings.environment()
+    environment.update(dict.fromkeys(QUALIFIED_CONTEXT_VARIABLES, ""))
+    environment.update(TAUCETI_PROJECT_STATE=str(project.state_root), TAUCETI_PROJECT_KEY=project.key)
+    os.environ.update(environment)
+    os.environ.setdefault("TAUCETI_FORGEJO_ORIGIN", reference.forge.url)
+    os.environ.setdefault("TAUCETI_FORGEJO_REPO", reference.name)
+
 
 try:
-    _bootstrap_project()
+    _bootstrap_worker_project()
 except (ValueError, OSError) as _configuration_error:
     import sys
 

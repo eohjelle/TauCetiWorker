@@ -6,16 +6,12 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 
 ## Reproduce and adapt
 Read the failing CI log first and reproduce the stage that failed, not every check. The usual
-failure is the build: run `lake exe cache get` once, then `lake build`. If the log shows the
-expired-shim check failing, run it:
+failure is the build: preparation already provided the bumped Mathlib, so run `lake build --iofail`
+(not `lake exe cache get` or `lake update`). If the expired-shim check failed, run the shared phase:
 ```
-git fetch -q origin main
-shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"
-base_ref="$(git merge-base origin/main HEAD)"
-if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); fi
-if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
-rm -f "$base_shims"; rm -rf "$base_root"
+"$TAUCETI_VERIFY_PYTHON" "__BIN__/tauceti-local-checks" shim-expiry --policy bump
 ```
+This checks the inherited registry and exact replacements without fetching GitHub data.
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 - The shim-expiry command may be the only failing check even when `lake build` succeeds. Its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
 - For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
@@ -35,27 +31,22 @@ Reproduce the first root failure, inspect the relevant upstream Mathlib change, 
 module group. Build that group and its dependencies where possible. Read previous repair commits
 and avoid repeating an approach that already failed.
 
-Prepare one coherent source repair checkpoint per session. Push it once through the safe wrapper,
-then end the session, even when unrelated modules still fail. Keep the pins fixed and never introduce `sorry`, `admit`, `native_decide`, axioms, or
+Push coherent source repairs through the safe wrapper, even when unrelated modules still fail, and
+end the session once the work you can finish is pushed. Keep the pins fixed and never introduce `sorry`, `admit`, `native_decide`, axioms, or
 option overrides. Describe what compiled and what remains broken in the commit body. The branch
 and CI logs are the next session's starting point; no separate progress file is needed.
 
-Work within the round deadline supplied below. Stop starting new groups ten minutes before it,
-and save completed repairs before the worker terminates the session. Run builds synchronously in
-the foreground; a background build will be abandoned when the session ends. Push the checkpoint
-before ending your turn; no later turn will recover unpushed edits. Full-library compilation and
-all audits remain required for merging; a partial checkpoint must never be described as green.
+Run builds synchronously in the foreground; a background build will be abandoned when the session
+ends. Push completed repairs before ending your turn: anything unpushed is discarded when the round
+ends. Full-library compilation and all audits remain required for merging; a partial repair must
+never be described as green.
 
 When the migration is complete, run the final verification below if time permits. Otherwise
 push the completed repairs and let full CI verify them. Do not spend the session waiting for CI.
 
 ## Final verification when time permits
 __LOCAL_VERIFICATION__
-A pin bump changes what every module depends on, so its audit stays whole-library: the recipe
-prints `full: ...` for this branch. Once the migration is complete, run the shim-expiry command
-above, `lake build --iofail`, then the scope recipe and the audit, once each.
-
-Full CI runs these checks even when a partial repair cannot run the full library yet.
+Run the shared final verification above once after completing the migration. Full transitive axiom and duplicate-declaration audits remain in CI.
 
 ## Submit
 - Commit the adaptation (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
@@ -67,4 +58,4 @@ Full CI runs these checks even when a partial repair cannot run the full library
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry, `scope:`, `lake build` and `local-axioms:` results observed, distinguishing partial checkpoints from complete local verification, and local checks from CI. Do not claim green unless you saw it.
+End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry, `scope:`, `lake build` and `local-axioms:` results observed, distinguishing partial repairs from complete local verification, and local checks from CI. Do not claim green unless you saw it.

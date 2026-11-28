@@ -1,5 +1,8 @@
 """Selection parity, roadmap-first filtering, outage fallback and compact coverage."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import importlib
 import io
@@ -113,6 +116,41 @@ with tempfile.TemporaryDirectory() as tmp:
         with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
             peer = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
         assert 1 not in [c.pr for c in peer.reviewable.actionable]
+        # A verified local assertion admits review without inventing a green build;
+        # missing dedicated policy evidence returns the PR to ordinary CI.
+        old_rollup = compact[1]["pr"]["statusCheckRollup"]
+        compact[1]["pr"]["statusCheckRollup"] = [
+            {"context": "build", "state": "FAILURE"},
+            {"context": "self-tested/2", "state": "SUCCESS"},
+        ]
+        compact[1]["pr"]["labels"].append({"name": "self-tested"})
+        with (
+            patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)),
+        ):
+            local = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review", "fix-ci"])
+        assert 2 in [c.pr for c in local.reviewable.actionable]
+        assert not next(p for p in local.open_prs if p.number == 2).build_success
+        assert 2 not in [c.pr for c in local.red_ci.actionable]
+        compact[1]["pr"]["statusCheckRollup"].pop()
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            ordinary = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert 2 in [c.pr for c in ordinary.reviewable.actionable], (
+            "persistent label must schedule review without a receipt"
+        )
+        # PR status posts PR CI's failed `scope` on a self-tested head over the diff-size guards,
+        # which admission refuses, so no review is spent on it. The status binds that head only.
+        compact[1]["pr"]["statusCheckRollup"].append({"context": "scope", "state": "FAILURE"})
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            oversized = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review", "fix-ci"])
+        assert 2 not in [c.pr for c in oversized.reviewable.actionable], "a failed scope must not be reviewed"
+        assert 2 not in [c.pr for c in oversized.red_ci.actionable], "a self-tested head is never sent to fix-ci"
+        compact[1]["pr"]["statusCheckRollup"][-1]["state"] = "SUCCESS"
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            passing = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert 2 in [c.pr for c in passing.reviewable.actionable], "only a failed scope withholds review"
+        compact[1]["pr"]["statusCheckRollup"].pop()
+        compact[1]["pr"]["labels"].pop()
+        compact[1]["pr"]["statusCheckRollup"] = old_rollup
         compact[0]["review"]["contest"] = {"id": 101, "rubric": "reuse", "created_at": "now"}
         with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
             contested = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])

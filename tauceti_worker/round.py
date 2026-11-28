@@ -12,8 +12,8 @@ import sys
 import threading
 import time
 
-from .config import Config, Die, log
-from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
+from .config import ClaimCollision, Config, Die, log
+from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_LOCK_WAIT, ROUND_TIMEOUT
 from .github import claims_repo
 from .paths import CLAIM_SH, self_argv, self_env
 from .storage import clean_round_temp, snapshot_round_temp
@@ -48,19 +48,34 @@ class RoundContext:
     def __enter__(self) -> RoundContext:
         self.cfg.state.mkdir(parents=True, exist_ok=True)
         path = self.cfg.state / "round.lock"
+        # spawn_round sets this for a loop's rounds; a one-off round refuses at once. Popped so the
+        # round's own children (an agent running `tauceti work`) do not inherit it.
+        wait = float(os.environ.pop("TAUCETI_ROUND_LOCK_WAIT", "0") or 0)
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
         os.set_inheritable(fd, False)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not lock_round(fd, wait, f"worker '{self.cfg.wid}' round.lock is held"):
             os.close(fd)
-            raise Die(
-                f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
-            ) from None
+            message = f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
+            if wait:
+                # Not a failed round: the loop reselects shortly, without failure backoff.
+                raise ClaimCollision(f"{message} (still held after {wait:.0f}s)")
+            raise Die(message)
         self._fd = fd
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        # Rounds are all-or-nothing; delete the continuation and recovery state older releases kept.
+        # Holding round.lock, nothing of this worker can be using it.
+        try:
+            from .retention import fresh_report, purge_legacy
+
+            purged = purge_legacy(self.cfg.state, fresh_report(), checkout=self.cfg.checkout)
+            for error in purged["errors"]:
+                log(f"retention: {error}")
+            if purged["removed"]:
+                log(f"retention: deleted legacy continuation and recovery state: {', '.join(purged['removed'])}")
+        except Exception as error:
+            log(f"retention: legacy state cleanup deferred: {error}")
         if self.record_activity:
             from .retention import recycle
 
@@ -72,6 +87,14 @@ class RoundContext:
                     log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
             except Exception as error:
                 log(f"retention: cache recycling deferred: {error}")
+            # Every run mode passes here (one-off rounds, --loop, Docker, managed workers), so the
+            # collector reaches hosts without an installed service, at most hourly.
+            try:
+                from .retention import ROUND_REQUEST_SPACING, request_cleanup
+
+                request_cleanup(fallback=True, spacing=ROUND_REQUEST_SPACING)
+            except Exception as error:
+                log(f"retention: cleanup request deferred: {error}")
         if self.record_activity:
             from .cache_storage import admit
             from .storage import maintain_host_lake_storage, prune_obsolete_host_lean_toolchains
@@ -111,6 +134,10 @@ class RoundContext:
                 fn()
             except Exception as e:
                 log(f"cleanup step failed: {e}")
+        # Still under the round lock: forget the round's worktrees (removed only without persistence).
+        from .round_worktrees import release
+
+        release(self.cfg)
         if self._fd is not None:
             try:
                 if self.record_activity:
@@ -132,6 +159,29 @@ class RoundContext:
         return False
 
 
+def lock_round(fd: int, wait: float, what: str) -> bool:
+    """Take an exclusive flock on `fd`, waiting up to `wait` seconds for its holder to let go.
+
+    A loop's next round can find its worker's lock briefly held by another worker's round that is
+    removing this worker's leftover worktree (round_worktrees.sweep), or by a round of a loop that was
+    restarted while it ran. Waiting turns either into a short delay instead of a failed round."""
+    deadline = time.monotonic() + wait
+    waiting = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if waiting:
+                log(f"{what}: acquired after waiting")
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            if not waiting:
+                log(f"{what}: waiting up to {wait:.0f}s for its holder to release it")
+                waiting = True
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT, temporary=None) -> subprocess.Popen:
     """Spawn one round as a child in its OWN session (so the loop can kill the whole group). Invokes
     the current interpreter directly on this file (NOT via the uv shebang) to avoid a uv wrapper
@@ -139,6 +189,8 @@ def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT, temporary
     cmd = self_argv("_round", *argv_tail)
     env = self_env()
     env["TAUCETI_ROUND_DEADLINE"] = str(time.time() + timeout)
+    env["TAUCETI_ROUND_LOCK_WAIT"] = str(ROUND_LOCK_WAIT)
+    env["TAUCETI_LOOP_ROUND"] = "1"  # The loop starts the between-rounds relink after this round.
     if temporary is not None:
         env["TMPDIR"] = str(temporary)
     return subprocess.Popen(cmd, start_new_session=True, env=env)
@@ -241,6 +293,7 @@ class Claims:
         self.lost = threading.Event()
         self._stopped = threading.Event()
         self.collisions = 0
+        self.lease_started: float | None = None
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -253,6 +306,7 @@ class Claims:
         key = f"branch/{pr}"
         claim_repo = claims_repo()
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
+        self.lease_started = time.time()  # claim.sh dates the lease's expiry from no earlier than this
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
             self.collisions += 1
@@ -264,7 +318,7 @@ class Claims:
         os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
         if rc == 0:
             self.held = (key, claim_repo)
-            # Keep this scoped to the push arbiter: unrelated agent-invoked claims remain canonical.
+            # The push arbiter keeps this branch lease namespace independently of an agent's target claim.
             os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
             os.environ["TAUCETI_CLAIM_KEY"] = key
             self.ctx.add_cleanup(self.release)
@@ -279,6 +333,29 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
         return True
 
+    def begin_target_work(self, area: str, slug: str) -> int:
+        """Take the authoring claim `author/<area>/<slug>` before the agent launches, so workers that
+        share a target list settle who writes what. Returns claim.sh's verdict: 0 held (heartbeat
+        running, released with the round), 1 held by another worker, 2 the claim could not be
+        registered. A claim still held from earlier in the round is released first. Cooperative only:
+        it sets none of the push-arbiter env, and losing the lease mid-round is logged without
+        stopping the agent."""
+        if self.held:
+            # A branch claim from a repair that fell through to authoring. Its renewer goes first,
+            # so a failed release leaves the lease to expire rather than to a forgotten heartbeat.
+            self.stop_heartbeat()
+            self.release()
+        key = f"author/{area}/{slug}"
+        claim_repo = claims_repo()
+        claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
+        self.lease_started = time.time()  # claim.sh dates the lease's expiry from no earlier than this
+        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
+        if rc == 0:
+            self.held = (key, claim_repo)
+            self.ctx.add_cleanup(self.release)
+            self.start_heartbeat(key, claim_repo)
+        return rc
+
     def start_heartbeat(self, key: str, claim_repo: str) -> None:
         rfd, wfd = os.pipe()
         os.set_inheritable(rfd, True)
@@ -289,6 +366,7 @@ class Claims:
                 "CLAIM_REPO": claim_repo,
                 "TAUCETI_CLAIM_SH": CLAIM_SH,
                 "CLAIM_TTL": str(CLAIM_TTL_S),
+                "CLAIM_LEASE_STARTED": repr(self.lease_started or time.time()),
             }
         )
         self._hb = subprocess.Popen(cmd, pass_fds=[rfd], env=env)
@@ -300,8 +378,13 @@ class Claims:
         self._stopped = stopped = threading.Event()
 
         def watch(hb=self._hb):
-            if hb.wait(None) == HEARTBEAT_LOST and not stopped.is_set():
-                log(f"claim {key}: lease lost; cancelling the branch work that depends on it")
+            # Any other exit (a crash, a signal) also leaves the lease unrenewed until it expires.
+            if hb.wait(None) != 0 and not stopped.is_set():
+                branch = key.startswith("branch/")
+                log(
+                    f"claim {key}: lease lost; "
+                    + ("cancelling the branch work that depends on it" if branch else "no longer renewing it")
+                )
                 lost.set()
 
         threading.Thread(target=watch, daemon=True).start()
@@ -334,18 +417,87 @@ class Claims:
 
 
 HEARTBEAT_LOST = 3
+# claim.sh renew: 0 renewed, 1 lost (taken over or gone), anything else an error that says nothing
+# about who holds the lease.
+RENEW_LOST = 1
+RENEW_ERROR_RETRY_S = 30
+RENEW_TIMEOUT_S = 60
+# Give up this long before the last renewed lease expires: the slack covers a renewal's own
+# duration and peers' clocks.
+RENEW_EXPIRY_MARGIN_S = RENEW_TIMEOUT_S + 30
+
+
+_renewal: subprocess.Popen | None = None  # the heartbeat's renewal in flight, killed with the heartbeat
+
+
+def _kill_renewal() -> None:
+    if _renewal is not None:
+        try:
+            os.killpg(_renewal.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _renew(key: str) -> int | None:
+    """One `claim.sh renew`, bounded by RENEW_TIMEOUT_S; None when it could not finish. A renewal
+    that times out is killed with its whole process group, so retries do not pile up Git children."""
+    global _renewal
+    # Hold SIGTERM until the child is recorded, so the handler can never miss a renewal it started.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        _renewal = subprocess.Popen(
+            [CLAIM_SH, "renew", key],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            # The child inherits the blocked mask; the renewal itself must stay terminable.
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM}),
+        )
+    except OSError:
+        return None
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+    try:
+        return _renewal.wait(RENEW_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _kill_renewal()
+        _renewal.wait()
+        return None
+    finally:
+        _renewal = None
 
 
 def cmd_heartbeat(args) -> int:
     """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
-    lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext)."""
+    lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext).
+
+    Only a renewal that reports the lease taken or gone loses it at once. A renewal that errors (the
+    forge or its Git transport briefly unavailable, or a renewal that times out) is retried sooner,
+    because the lease renewed last is still ours until it expires. The heartbeat gives up while a
+    margin of that lease remains, so no renewal attempt can outlast it. Times are wall-clock, the
+    clock claim.sh dates `expires_at` by; a renewal's expiry is dated from no earlier than when it
+    was started."""
     import select
 
+    def terminated(_signum, _frame):
+        # stop_heartbeat terminates this process; its renewal runs in its own session and goes too.
+        _kill_renewal()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, terminated)
     key = args.key
     ppipe = args.ppipe
+    ttl = int(os.environ.get("CLAIM_TTL") or CLAIM_TTL_S)
+    try:
+        renewed = float(os.environ["CLAIM_LEASE_STARTED"])
+    except (KeyError, ValueError):
+        renewed = time.time()
+    interval = CLAIM_HEARTBEAT_S
     while True:
+        if time.time() + interval + RENEW_EXPIRY_MARGIN_S >= renewed + ttl:
+            interval = max(0, renewed + ttl - RENEW_EXPIRY_MARGIN_S - time.time())
         if ppipe is not None:
-            r, _, _ = select.select([ppipe], [], [], CLAIM_HEARTBEAT_S)
+            r, _, _ = select.select([ppipe], [], [], interval)
             if r:  # readable ⇒ EOF (we never write to the pipe) ⇒ parent gone
                 try:
                     if os.read(ppipe, 1) == b"":
@@ -353,9 +505,18 @@ def cmd_heartbeat(args) -> int:
                 except OSError:
                     return 0
         else:
-            time.sleep(CLAIM_HEARTBEAT_S)
-        if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
+            time.sleep(interval)
+        attempted = time.time()
+        if attempted + RENEW_EXPIRY_MARGIN_S >= renewed + ttl:
+            return HEARTBEAT_LOST  # no renewal can finish inside the lease that is still ours
+        rc = _renew(key)
+        if rc == 0:
+            renewed, interval = attempted, CLAIM_HEARTBEAT_S
+            continue
+        if rc == RENEW_LOST:
             return HEARTBEAT_LOST  # stop renewing so it can expire, and tell the round
+        interval = min(CLAIM_HEARTBEAT_S, RENEW_ERROR_RETRY_S)
+        log(f"claim {key}: renewal unavailable (rc={rc}); retrying in {interval}s")
 
 
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:

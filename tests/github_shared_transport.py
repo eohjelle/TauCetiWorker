@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Cross-process cache correctness, complete GraphQL histories and safe exhaustion behavior."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +17,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 from tauceti_worker import github_transport as tr
 
 for kind in ("code", "commits", "issues", "prs", "repos"):
@@ -365,7 +373,7 @@ gh: API rate limit exceeded
         cfg=SimpleNamespace(state=Path(tmp), logdir=Path(tmp), store_dir=Path(tmp), wid="test"),
         counters=counters,
         rs=SimpleNamespace(review_rounds=lambda *a: 0),
-        gh=SimpleNamespace(),
+        gh=SimpleNamespace(repo="TauCetiProject/TauCeti"),
     )
     candidate = SimpleNamespace(pr=7, head="abc", contest=None, contest_reply_id=None, rebase_budget_key="rebase-pr-7")
 
@@ -475,13 +483,38 @@ gh: API rate limit exceeded
                 read.assert_not_called()
                 launch.assert_not_called()
 
-    # Host engine compatibility retains jq's compact/raw output and forces a live ownership read.
-    with patch.object(GitHub, "issue_comments", return_value=[{"id": 2, "body": "hello"}]) as comments:
-        p = tr.migrated_history(
-            ["api", "--paginate", "--jq", ".[] | @json", "/repos/org/repo/issues/7/comments?per_page=100"]
-        )
-        if p is not None:  # jq is optional; absent jq uses the untouched CLI path.
-            assert p.returncode == 0 and json.loads(p.stdout)["id"] == 2
+    # The actual facade must retain shared reads, including forced discovery and
+    # the engine's scoreboard/contest histories. No direct requests/pages/retries.
+    assert shutil.which("jq"), "jq is required to verify the review-history bridge"
+    mirror = [{"id": 2, "node_id": "node-2", "body": "<!--tauceti-scoreboard-->hello"}]
+    scoreboard_projection = (
+        '.[] | select((.body // "") | contains("<!--tauceti-scoreboard-->")) '
+        '| {id, login: (.user.login // ""), updated_at: (.updated_at // "")} | @json'
+    )
+    shared_calls = []
+
+    def shared_history(repo, operation, **args):
+        assert not tr.direct_reads()
+        shared_calls.append((repo, operation, args))
+        return True, mirror
+
+    with (
+        patch("tauceti_worker.github_state.read", side_effect=shared_history),
+        patch.object(GitHub, "_issue_comments", side_effect=AssertionError("unexpected live issue history")),
+        patch.object(GitHub, "_review_comments", side_effect=AssertionError("unexpected live review history")),
+    ):
+        for endpoint in ("issues", "pulls"):
+            for projection in (".[]", ".[] | @json", scoreboard_projection):
+                p = tr.migrated_history(
+                    ["api", "--paginate", "--jq", projection, f"/repos/org/repo/{endpoint}/7/comments?per_page=100"]
+                )
+                expected = (
+                    {"id": 2, "login": "", "updated_at": ""} if projection == scoreboard_projection else mirror[0]
+                )
+                assert p is not None and p.returncode == 0 and json.loads(p.stdout) == expected
+        with tr.read_context(fresh=True):
+            assert GitHub("org/repo").issue_comments(7) == mirror
+        assert len(shared_calls) == 7
         assert tr.migrated_history(["api", "-X", "POST", "/repos/org/repo/issues/7/comments?per_page=100"]) is None
 
 print("PASS: shared cache, complete GraphQL histories, endpoint accounting and exhaustion")

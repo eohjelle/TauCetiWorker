@@ -9,9 +9,12 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
+import signal
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -20,7 +23,15 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import activity_ci, activity_costs, activity_summary
+from . import (
+    activity_attribution,
+    activity_ci,
+    activity_costs,
+    activity_forgejo,
+    activity_git,
+    activity_summary,
+    github_state,
+)
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
@@ -83,6 +94,9 @@ class Round:
         self.done = False
         self.kind = "no-work"
         self.rc = 0
+        self.observation = None
+        self.selections = 0
+        os.environ["TAUCETI_ACTIVITY_ROUND_ID"] = self.id
         self.started_at = time.time()
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE", "inf"))
         _round = self
@@ -98,13 +112,30 @@ class Round:
 
     def select(self, kind):
         self.kind = kind
-        emit("round_selected", key=self.id + ":select", round_id=self.id, worker=self.worker, round_type=kind)
+        self.observation = None
+        # A round that finds nothing to do in one stage selects another, for
+        # example a review that a peer owns followed by roadmap authoring. Each
+        # selection is its own receipt so the live kind follows the latest one.
+        self.selections += 1
+        emit(
+            "round_selected",
+            key=f"{self.id}:select:{self.selections}",
+            selection=self.selections,
+            round_id=self.id,
+            worker=self.worker,
+            round_type=kind,
+            review_archive=str(activity_attribution.archive_root()) if kind == "review" else None,
+            review_outbox=str(activity_attribution.archive_outbox(self.worker)) if kind == "review" else None,
+            **{k: v for k, v in activity_attribution.invocation_context(kind).items() if k != "round_id"},
+        )
 
     def finish(self, exc=None):
         global _round
         if self.done:
             return
         self.done = True
+        if os.environ.get("TAUCETI_ACTIVITY_ROUND_ID") == self.id:
+            os.environ.pop("TAUCETI_ACTIVITY_ROUND_ID", None)
         code = getattr(exc, "code", None) if exc is not None else self.rc
         if exc is not None and code is None:
             # NoProgress is intentionally separate from execution failures.
@@ -134,6 +165,7 @@ class Round:
             "AdmissionUnavailable",
             "DocumentationUnavailable",
             "ProgressPreparationUnavailable",
+            "BuildCacheWait",
             "GitHubUnavailable",
             "SharedStateUnavailable",
         ):
@@ -150,7 +182,7 @@ class Round:
             round_id=self.id,
             worker=self.worker,
             round_type=self.kind,
-            outcome=outcome,
+            outcome=self.observation if outcome == "completed" and self.observation else outcome,
         )
         if _round is self:
             _round = None
@@ -159,6 +191,11 @@ class Round:
 def select(kind):
     if _round is not None:
         _round.select(kind)
+
+
+def observation(outcome):
+    if _round is not None:
+        _round.observation = outcome
 
 
 def current_round_id():
@@ -173,11 +210,19 @@ def _connect():
     db.executescript("""
       PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS round_publications(round_id TEXT,worker TEXT,scope TEXT,publication TEXT,
+        PRIMARY KEY(round_id,worker,scope,publication));
+      CREATE TABLE IF NOT EXISTS round_selections(round_id TEXT PRIMARY KEY,selection INTEGER);
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
-      CREATE INDEX IF NOT EXISTS round_finish ON rounds(finished,kind);
-      CREATE INDEX IF NOT EXISTS round_worker ON rounds(worker,finished);
-      CREATE INDEX IF NOT EXISTS round_scope ON rounds(scope,finished);
+      DROP INDEX IF EXISTS round_finish_covering;
+      DROP INDEX IF EXISTS round_finish;
+      DROP INDEX IF EXISTS round_worker_covering;
+      DROP INDEX IF EXISTS round_worker;
+      DROP INDEX IF EXISTS round_scope_covering;
+      DROP INDEX IF EXISTS round_scope;
+      CREATE INDEX IF NOT EXISTS round_interrupted ON rounds(outcome,started DESC,id DESC,worker,scope)
+        WHERE outcome='interrupted-unfinished';
       CREATE TABLE IF NOT EXISTS prs(repo TEXT,number INTEGER,worker TEXT,scope TEXT,created REAL,
         state TEXT,landed REAL,observed REAL,checked REAL,head TEXT,source TEXT,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY,inode INTEGER,offset INTEGER);
@@ -185,19 +230,17 @@ def _connect():
       CREATE TRIGGER IF NOT EXISTS activity_round_history_cutoff BEFORE INSERT ON rounds
         WHEN NEW.id LIKE 'resource:%' AND EXISTS(SELECT 1 FROM meta WHERE key='history_cutoff')
         BEGIN SELECT RAISE(IGNORE); END;
-      CREATE TRIGGER IF NOT EXISTS activity_pr_history_cutoff BEFORE INSERT ON prs
-        WHEN NEW.created < (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')
-        BEGIN SELECT RAISE(IGNORE); END;
-      CREATE TRIGGER IF NOT EXISTS activity_pr_history_cutoff_update AFTER UPDATE OF created ON prs
-        WHEN NEW.created < (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')
-        BEGIN DELETE FROM prs WHERE repo=NEW.repo AND number=NEW.number; END;
+      DROP TRIGGER IF EXISTS activity_pr_history_cutoff;
+      DROP TRIGGER IF EXISTS activity_pr_history_cutoff_update;
     """)
     activity_costs.install(db)
     db.executescript("""
       CREATE TABLE IF NOT EXISTS pr_contributions(id TEXT PRIMARY KEY,repo TEXT,number INTEGER,
         worker TEXT,scope TEXT,at REAL,activity TEXT);
-      CREATE INDEX IF NOT EXISTS contribution_scope ON pr_contributions(scope,at);
-      CREATE INDEX IF NOT EXISTS contribution_worker ON pr_contributions(worker,at);
+      DROP INDEX IF EXISTS contribution_scope_covering;
+      DROP INDEX IF EXISTS contribution_scope;
+      DROP INDEX IF EXISTS contribution_worker_covering;
+      DROP INDEX IF EXISTS contribution_worker;
       CREATE TABLE IF NOT EXISTS pr_loc(repo TEXT,number INTEGER,head TEXT,added INTEGER,deleted INTEGER,
         observed REAL,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS pr_observations(repo TEXT,number INTEGER,state TEXT,created REAL,
@@ -214,7 +257,51 @@ def _connect():
         # Older preparers advanced these journals while filtering review starts out.
         # Replay once; stable event IDs keep already-counted activity idempotent.
         db.execute("DELETE FROM cursors WHERE path NOT LIKE '%/resources.jsonl'")
+    if db.execute("INSERT OR IGNORE INTO meta VALUES ('landing_window_schema','1')").rowcount:
+        # Replay retained creation journals to recover identities discarded by
+        # the former creation cutoff, without losing registered journal paths.
+        db.execute("UPDATE cursors SET offset=0 WHERE path NOT LIKE '%/resources.jsonl'")
+    from .activity_rollup_sources import install as install_rollups
+
+    install_rollups(db)
+    activity_attribution.install(db)
     return db
+
+
+def _reconcile_publication(db, e, worker, scope):
+    """Keep positive publication evidence across receipt ordering and restarts.
+
+    Only matching, normally finished rounds can be reconciled. A push or closure
+    proves a repair outcome; creation proves authorship. Replies alone cannot
+    prove a repair that required a push. Never invent a completion timestamp or
+    turn an execution failure into a successful round.
+    """
+    rid = e.get("round_id")
+    if not rid:
+        return
+    publication = (
+        "creation"
+        if e["kind"] == "pr_created"
+        else "push"
+        if e["kind"] == "pr_activity" and e.get("activity") == "branch_push"
+        else "closure"
+        if e["kind"] == "pr_activity" and e.get("publication") == "closure"
+        else None
+    )
+    if publication:
+        db.execute("INSERT OR IGNORE INTO round_publications VALUES (?,?,?,?)", (rid, worker, scope, publication))
+    if publication or e["kind"].startswith("round_"):
+        db.execute(
+            """UPDATE rounds SET outcome='completed'
+               WHERE id=? AND worker=? AND scope=? AND finished IS NOT NULL
+                 AND outcome IN ('unknown','unconfirmed')
+                 AND EXISTS(SELECT 1 FROM round_publications p
+                   WHERE p.round_id=rounds.id AND p.worker=rounds.worker AND p.scope=rounds.scope
+                     AND ((p.publication='creation' AND rounds.kind IN ('roadmap','bump'))
+                       OR (p.publication IN ('push','closure') AND rounds.kind IN
+                         ('fix','fix-ci','rebase','bump','lint-repair','overlap-fix'))))""",
+            (rid, worker, scope),
+        )
 
 
 def _ingest(db, e):
@@ -223,15 +310,24 @@ def _ingest(db, e):
     if e.get("round_id", "").startswith("resource:"):
         return
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
-    if cutoff and e["at"] < cutoff[0]:
+    if cutoff and e["at"] < cutoff[0] and e.get("kind") != "pr_created":
         return
     kind, worker, scope = e["kind"], e.get("worker", "unknown"), e.get("group", e.get("machine_id", "local"))
+    activity_attribution.ingest(db, e)
+    if kind == "pr_created":
+        # Replays must restore PRs removed by older collectors even when the
+        # event's deduplication tombstone already exists.
+        db.execute(
+            "INSERT OR IGNORE INTO prs(repo,number,worker,scope,created) VALUES (?,?,?,?,?)",
+            (e["repository"], e["pr"], worker, scope, e["at"]),
+        )
     if kind == "pr_activity":
         db.execute(
             "INSERT OR IGNORE INTO pr_contributions VALUES (?,?,?,?,?,?,?)",
             (e["id"], e["repository"], e["pr"], worker, scope, e["at"], e.get("activity", "work")),
         )
     if not db.execute("INSERT OR IGNORE INTO events VALUES (?)", (e["id"],)).rowcount:
+        _reconcile_publication(db, e, worker, scope)
         return
     if kind == "review_coordination":
         row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
@@ -251,25 +347,32 @@ def _ingest(db, e):
                 (e["at"], e.get("pid"), e.get("process_identity"), e.get("hostname"), rid),
             )
         elif kind == "round_selected":
-            db.execute("UPDATE rounds SET kind=? WHERE id=?", (e["round_type"], rid))
+            # Receipts arrive in hash order, possibly across collector runs: only a
+            # round's latest selection names it, and the finish receipt's kind is final.
+            selection = e.get("selection")
+            selection = selection if type(selection) is int else 0  # receipts from before numbering
+            if db.execute(
+                """INSERT INTO round_selections SELECT id,? FROM rounds WHERE id=? AND finished IS NULL
+                   ON CONFLICT(round_id) DO UPDATE SET selection=excluded.selection
+                   WHERE excluded.selection>round_selections.selection""",
+                (selection, rid),
+            ).rowcount:
+                db.execute("UPDATE rounds SET kind=? WHERE id=?", (e["round_type"], rid))
         elif kind == "round_finished":
+            db.execute("DELETE FROM round_selections WHERE round_id=?", (rid,))
             db.execute(
                 "UPDATE rounds SET kind=?,finished=?,outcome=? WHERE id=?",
                 (e["round_type"], e["at"], e["outcome"], rid),
             )
         elif kind == "round_waited":
             db.execute("UPDATE rounds SET outcome='waiting' WHERE id=?", (rid,))
-    elif kind == "pr_created":
-        db.execute(
-            "INSERT OR IGNORE INTO prs(repo,number,worker,scope,created) VALUES (?,?,?,?,?)",
-            (e["repository"], e["pr"], worker, scope, e["at"]),
-        )
-
     elif kind == "ci_result":
         db.execute(
             "INSERT OR IGNORE INTO ci_activity VALUES (?,?,?,?,?,?)",
             (e["id"], scope, e["at"], e.get("conclusion"), e.get("wait_seconds"), e.get("run_seconds")),
         )
+
+    _reconcile_publication(db, e, worker, scope)
 
 
 def _consume(db, errors):
@@ -336,16 +439,18 @@ def backfill(db, history_roots=()):
 def _clean_history(db):
     # Pin the start once, using the first native lifecycle receipt. Preserve event
     # deduplication tombstones so replaying a journal cannot restore discarded facts.
-    db.execute("""
-      INSERT OR IGNORE INTO meta(key,value)
-      SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
-      WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
-    """)
-    db.execute("DELETE FROM rounds WHERE id LIKE 'resource:%'")
+    if not db.execute("SELECT 1 FROM meta WHERE key='history_cutoff'").fetchone():
+        db.execute("""
+          INSERT OR IGNORE INTO meta(key,value)
+          SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
+          WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
+        """)
+    db.execute("DELETE FROM rounds WHERE id>='resource:' AND id<'resource;'")
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     if cutoff:
         db.execute("DELETE FROM rounds WHERE COALESCE(started,finished) < ?", (cutoff[0],))
-        db.execute("DELETE FROM prs WHERE created < ?", (cutoff[0],))
+        # Older PRs may still land inside a reporting window. Keep their identity
+        # and refresh observations; only authorship counts use the history cutoff.
         db.execute("DELETE FROM pr_contributions WHERE at < ?", (cutoff[0],))
         db.execute("DELETE FROM ci_activity WHERE at < ?", (cutoff[0],))
     db.execute("DELETE FROM cursors WHERE path LIKE '%/resources.jsonl'")
@@ -404,30 +509,67 @@ def _refresh_prs(db, config, now, errors):
     from .worker_manager import load_worker_specs
 
     specs = {s.id: s for s in load_worker_specs(config)} if config else {}
-    tracked = {
-        (r["repo"], r["number"]): r["worker"] for r in db.execute("SELECT repo,number,worker FROM pr_contributions")
-    }
-    owned = {(r["repo"], r["number"]): dict(r) for r in db.execute("SELECT * FROM prs")}
-    tracked.update({key: p["worker"] for key, p in owned.items()})
-    for repo, number in tracked:
-        db.execute("INSERT OR IGNORE INTO pr_observations(repo,number) VALUES (?,?)", (repo, number))
+    # Indexed due work replaces enumerating every PR and contribution receipt.
+    due = db.execute(
+        "SELECT repo,number,worker FROM report_pr_refresh WHERE next_at<=? ORDER BY next_at LIMIT 1000", (now,)
+    ).fetchall()
     batches = {}
-    for h in db.execute("SELECT * FROM pr_observations"):
-        key = (h["repo"], h["number"])
-        if key not in tracked:
+    for repo, number, worker in due:
+        key = (repo, number)
+        if activity_forgejo.is_forgejo(repo):
+            # activity_forgejo observes these from Forgejo, not the GitHub state service.
+            db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo=? AND number=?", key)
             continue
-        p = owned.get(key, h)
+        if not github_state.mirrored(repo):
+            # The state service no longer holds this repository, so it has nothing to observe.
+            db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo=? AND number=?", key)
+            continue
+        db.execute("INSERT OR IGNORE INTO pr_observations(repo,number) VALUES (?,?)", key)
+        p = db.execute("SELECT * FROM prs WHERE repo=? AND number=?", key).fetchone()
+        h = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", key).fetchone()
+        p = p or h
         checked = max(h["checked"] or 0, p["checked"] or 0)
         loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", key).fetchone()
-        if checked > now - 300 or (p["landed"] is not None and loc and loc[0] == p["head"]):
+        counts = db.execute(
+            "SELECT head,count,checked,observed FROM pr_review_counts WHERE repo=? AND number=?", key
+        ).fetchone()
+        landed_loc = p["landed"] is not None and loc and loc[0] == p["head"]
+        settled = (
+            landed_loc
+            and counts
+            and counts[0] == p["head"]
+            and counts[1] is not None
+            and counts[3] is not None
+            and counts[2] >= p["landed"]
+        )
+        expired = bool(landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
+        db.execute(
+            "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
+            (
+                None
+                if settled or expired
+                else max(now, checked) + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
+                *key,
+            ),
+        )
+        if settled or expired or checked > now - 300:
             continue
-        spec = specs.get(tracked[key])
+        spec = specs.get(worker)
         url = getattr(spec, "github_state_url", None) or os.environ.get("TAUCETI_GITHUB_STATE_URL")
         token = getattr(spec, "github_state_token_file", None) or os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
         if url and token:
-            batches.setdefault((url, str(token), h["repo"]), []).append(h["number"])
+            batches.setdefault((url, str(token), repo), []).append(number)
     prior = db.execute("SELECT value FROM meta WHERE key='observation_errors'").fetchone()
     observation_errors = json.loads(prior[0]) if prior else {}
+    # A removed/settled repository will never have another observation attempt
+    # to clear its old error. Retain failures only while refresh work remains.
+    observation_errors = {
+        repo: error
+        for repo, error in observation_errors.items()
+        if db.execute(
+            "SELECT 1 FROM report_pr_refresh WHERE repo=? AND next_at IS NOT NULL LIMIT 1", (repo,)
+        ).fetchone()
+    }
     deadline = time.monotonic() + 10
     for (url, token, repo), numbers in batches.items():
         observation_errors.pop(repo, None)
@@ -448,9 +590,24 @@ def _refresh_prs(db, config, now, errors):
                 seen = [p["number"] for p in value["prs"]] + value["missing"]
                 if len(seen) != len(set(seen)) or set(seen) != set(batch):
                     raise ValueError("incomplete observation response")
+                if any(
+                    p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED") for p in value["prs"]
+                ):
+                    raise ValueError("invalid PR observation")
+                stored_locs = {}
                 for p in value["prs"]:
-                    if p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED"):
-                        raise ValueError("invalid PR observation")
+                    loc = db.execute(
+                        "SELECT head,added,deleted FROM pr_loc WHERE repo=? AND number=?", (repo, p["number"])
+                    ).fetchone()
+                    if loc and loc[0] == p.get("head_sha"):
+                        stored_locs[p["number"]] = dict(head_sha=loc[0], added=loc[1], deleted=loc[2])
+                missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None and p["number"] not in stored_locs]
+                git_locs = activity_git.measure(root(), repo, missing_loc)
+                if any(p.get("head_sha") and p.get("base_sha") and p["number"] not in git_locs for p in missing_loc):
+                    message = "Some exact PR LOC comparisons are unavailable; normal refresh will retry"
+                    if message not in errors:
+                        errors.append(message)
+                for p in value["prs"]:
                     fields = (
                         p["state"],
                         _epoch(p.get("landed_at")),
@@ -470,14 +627,46 @@ def _refresh_prs(db, config, now, errors):
                         "UPDATE pr_observations SET state=?,landed=COALESCE(?,landed),observed=?,checked=?,head=?,source=COALESCE(?,source),created=COALESCE(?,created) WHERE repo=? AND number=?",
                         fields,
                     )
-                    loc = p.get("lean_loc")
+                    counter = p.get("review_passes")
+                    count = counter.get("count") if isinstance(counter, dict) else None
+                    stamp = counter.get("observed_at") if isinstance(counter, dict) else None
+                    valid = (
+                        type(count) is int
+                        and 0 <= count <= 2**53 - 1
+                        and counter.get("basis") == "scoreboard-round-counters"
+                        and type(stamp) in (int, float)
+                        and math.isfinite(stamp)
+                        and stamp >= 0
+                    )
+                    counter_values = (
+                        p.get("head_sha"),
+                        count if valid else None,
+                        stamp / 1000 if valid else None,
+                        now,
+                        "scoreboard-round-counters" if valid else "unavailable",
+                        repo,
+                        p["number"],
+                    )
+                    db.execute(
+                        "UPDATE pr_review_counts SET head=?,count=?,observed=?,checked=?,basis=? WHERE repo=? AND number=?",
+                        counter_values,
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO pr_review_counts(head,count,observed,checked,basis,repo,number) VALUES (?,?,?,?,?,?,?)",
+                        counter_values,
+                    )
+                    loc = p.get("lean_loc") or git_locs.get(p["number"]) or stored_locs.get(p["number"])
                     if loc is not None:
                         if loc.get("head_sha") != p.get("head_sha") or not all(
                             type(loc.get(k)) is int and loc[k] >= 0 for k in ("added", "deleted")
                         ):
                             raise ValueError("invalid LOC observation")
                         db.execute(
-                            "INSERT OR REPLACE INTO pr_loc VALUES (?,?,?,?,?,?)",
+                            "UPDATE pr_loc SET head=?,added=?,deleted=?,observed=? WHERE repo=? AND number=?",
+                            (loc["head_sha"], loc["added"], loc["deleted"], p["observed_at"] / 1000, repo, p["number"]),
+                        )
+                        db.execute(
+                            "INSERT OR IGNORE INTO pr_loc VALUES (?,?,?,?,?,?)",
                             (repo, p["number"], loc["head_sha"], loc["added"], loc["deleted"], p["observed_at"] / 1000),
                         )
                     else:
@@ -497,6 +686,34 @@ def _refresh_prs(db, config, now, errors):
             db.executemany(
                 "UPDATE pr_observations SET checked=? WHERE repo=? AND number=?", [(now, repo, n) for n in batch]
             )
+            for number in batch:
+                p = db.execute("SELECT * FROM prs WHERE repo=? AND number=?", (repo, number)).fetchone()
+                if p is None:
+                    p = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", (repo, number)).fetchone()
+                loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", (repo, number)).fetchone()
+                counts = db.execute(
+                    "SELECT head,count,checked,observed FROM pr_review_counts WHERE repo=? AND number=?", (repo, number)
+                ).fetchone()
+                landed_loc = p and p["landed"] is not None and loc and loc[0] == p["head"]
+                settled = (
+                    landed_loc
+                    and counts
+                    and counts[0] == p["head"]
+                    and counts[1] is not None
+                    and counts[3] is not None
+                    and counts[2] >= p["landed"]
+                )
+                db.execute(
+                    "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
+                    (
+                        None
+                        if settled
+                        or (landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
+                        else now + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
+                        repo,
+                        number,
+                    ),
+                )
     db.execute("INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)", (json.dumps(observation_errors),))
     errors.extend(observation_errors.values())
 
@@ -544,6 +761,30 @@ def _worker_scope(db, worker):
     return machine if machine and worker.startswith("fleet-" + machine[:8] + "-") else "local"
 
 
+def _landed_touches(db, now, column=None, identity=None):
+    """Landed PRs a scope authored or did meaningful work on, with landing times."""
+    from .activity_rollup_sources import MEANINGFUL
+
+    args = [identity] if column else []
+    touches = {
+        (repo, number): landed
+        for repo, number, landed in db.execute(
+            "SELECT repo,number,landed FROM prs WHERE landed IS NOT NULL AND landed<=?"
+            + (f" AND {column}=?" if column else ""),
+            [now, *args],
+        )
+    }
+    kinds = sorted(MEANINGFUL)
+    for repo, number, landed in db.execute(
+        "SELECT o.repo,o.number,o.landed FROM pr_observations o WHERE o.landed IS NOT NULL AND o.landed<=? "
+        "AND EXISTS(SELECT 1 FROM pr_contributions c WHERE c.repo=o.repo AND c.number=o.number "
+        f"AND c.activity IN ({','.join('?' for _ in kinds)})" + (f" AND c.{column}=?)" if column else ")"),
+        [now, *kinds, *args],
+    ):
+        touches.setdefault((repo, number), landed)
+    return touches
+
+
 def _summary(db, now, column=None, identity=None):
     local_row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
     local_buckets = json.loads(local_row[0]) if local_row else {}
@@ -555,94 +796,102 @@ def _summary(db, now, column=None, identity=None):
             )
             for field in ("started", "git_held")
         }
+    from . import activity_rollup as rollup
+    from .activity_rollup_sources import flush
+
+    flush(db, now)
+    upper, totals = rollup.snapshot(db, now, WINDOWS, column=column, identity=identity)
     where, args = (f"WHERE {column}=?", [identity]) if column else ("", [])
     rounds = {}
-    for label, seconds in WINDOWS.items():
-        condition = "finished<=?" if seconds is None else "finished>=? AND finished<=?"
-        times = [now] if seconds is None else [now - seconds, now]
-        rows = db.execute(
-            f"SELECT kind,COUNT(*) n,SUM(outcome IN ('failed','timeout','interrupted')) failures,SUM(outcome='unknown') unknown FROM rounds {where} {'AND' if where else 'WHERE'} {condition} GROUP BY kind",
-            args + times,
-        )
-        rounds[label] = {r["kind"]: dict(finished=r["n"], failed=r["failures"], unknown=r["unknown"]) for r in rows}
-    prs = [dict(r) for r in db.execute(f"SELECT * FROM prs {where}", args)]
-    # Closed and verified landed PRs are settled history. Their observations may
-    # stop updating permanently, so they cannot indicate stale current coverage.
-    unresolved = [p for p in prs if p["landed"] is None and p["state"] != "CLOSED"]
-    first_round = db.execute(f"SELECT MIN(COALESCE(started,finished)) FROM rounds {where}", args).fetchone()[0]
-    first_pr = min((p["created"] for p in prs), default=None)
-    since = min((v for v in (first_round, first_pr) if v is not None), default=None)
+    for window, values in totals.items():
+        kinds = {json.loads(key[6:])[0] for key in values if key.startswith("round:") and values[key]}
+        rounds[window] = {
+            kind: {
+                field: int(values.get("round:" + json.dumps([kind, field]), 0))
+                for field in ("finished", "failed", "unknown")
+            }
+            for kind in kinds
+        }
+        for kind, row in rounds[window].items():
+            # Only present when nonzero, so older readers and summaries keep their shape.
+            if closed := int(values.get("round:" + json.dumps([kind, "closed"]), 0)):
+                row["closed"] = closed
+
+    def minimum(table, field, extra=""):
+        predicate = where + (" AND " if where else " WHERE ") + field + " IS NOT NULL"
+        if extra:
+            predicate += " AND " + extra
+        return db.execute(f"SELECT {field} FROM {table} {predicate} ORDER BY {field} LIMIT 1", args).fetchone()
+
+    first_round = minimum("rounds", "COALESCE(started,finished)")
+    cutoff_row = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
+    first_pr = minimum(
+        "prs",
+        "created",
+        "created >= (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')" if cutoff_row else "",
+    )
+    since = min((row[0] for row in (first_round, first_pr) if row is not None), default=None)
+    native_since = minimum("rounds", "started")
     pr_windows = {
-        label: dict(
-            authored=sum((seconds is None or p["created"] >= now - seconds) and p["created"] <= now for p in prs),
-            landed=sum(
-                p["landed"] is not None and (seconds is None or p["landed"] >= now - seconds) and p["landed"] <= now
-                for p in prs
-            ),
-        )
-        for label, seconds in WINDOWS.items()
+        window: {
+            key: int(values.get(key, 0))
+            for key in ("authored", "authored_forgejo", "landed", "landed_forgejo", "assisted", "reviews", "fixes")
+        }
+        for window, values in totals.items()
     }
-    native_since = db.execute(f"SELECT MIN(started) FROM rounds {where}", args).fetchone()[0]
     interrupted_where = f"{where} {'AND' if where else 'WHERE'} outcome='interrupted-unfinished'"
-    interrupted = db.execute(
-        f"SELECT COUNT(*) total, COALESCE(SUM(started BETWEEN ? AND ?),0) started_1h, "
-        f"COALESCE(SUM(started BETWEEN ? AND ?),0) started_24h FROM rounds {interrupted_where}",
-        [now - 3600, now, now - 86400, now, *args],
-    ).fetchone()
     latest_interrupted = db.execute(
         f"SELECT id round_id,worker,started FROM rounds {interrupted_where} "
         "AND started IS NOT NULL ORDER BY started DESC,id DESC LIMIT 1",
         args,
     ).fetchone()
-    cutoff_row = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     cutoff = cutoff_row[0] if cutoff_row else since
     costs = activity_costs.summarize(db, now, cutoff, column, identity)
-    locs = {(r["repo"], r["number"]): dict(r) for r in db.execute("SELECT * FROM pr_loc")}
-    for window, seconds in activity_costs.COST_WINDOWS.items():
-        begin = max(cutoff or 0, now - seconds) if seconds is not None else cutoff or 0
-        cohort = [p for p in prs if begin <= p["created"] <= now]
-        landed = [p for p in cohort if p["landed"] is not None and p["landed"] <= now]
-        opened = [p for p in cohort if p["state"] == "OPEN" and p["landed"] is None]
-
-        def measured(p):
-            loc = locs.get((p["repo"], p["number"]))
-            return loc if loc and loc["head"] == p["head"] else None
-
-        landed_loc = sum((measured(p) or {}).get("added", 0) for p in landed)
-        open_loc = sum((measured(p) or {}).get("added", 0) for p in opened)
-        missing = sum(measured(p) is None for p in [*landed, *opened]) + sum(
-            p["state"] is None and p["landed"] is None for p in cohort
-        )
+    for window in activity_costs.COST_WINDOWS:
+        values = totals[window]
         row = costs["windows"][window]
         row.update(
-            landed_loc_added=landed_loc,
-            open_loc_added=open_loc,
-            landed_prs=len(landed),
-            open_prs=len(opened),
-            missing_loc_prs=missing,
-            known_loc_prs=len(landed) + len(opened) - sum(measured(p) is None for p in [*landed, *opened]),
-            measured_pr_weight=sum(measured(p) is not None for p in landed)
-            + sum(measured(p) is not None for p in opened) / 2,
+            {
+                key: int(values.get(key, 0))
+                for key in (
+                    "landed_loc_added",
+                    "landed_prs",
+                    "missing_loc_prs",
+                    "known_loc_prs",
+                )
+            }
         )
+        row["loc_basis"] = "landed_at"
         row.update(activity_summary.loc_estimate(row))
-    contributions = [dict(r) for r in db.execute(f"SELECT * FROM pr_contributions {where}", args)]
-    owned_keys = {(p["repo"], p["number"]) for p in prs}
-    for window, seconds in WINDOWS.items():
-        begin = float("-inf") if seconds is None else now - seconds
-        others = [c for c in contributions if begin <= c["at"] <= now and (c["repo"], c["number"]) not in owned_keys]
-        meaningful = [
-            c
-            for c in others
-            if c["activity"] in ("review", "fix", "fix-ci", "rebase", "bump", "lint-repair", "branch_push")
-        ]
-        pr_windows[window].update(
-            assisted=len({(c["repo"], c["number"]) for c in meaningful}),
-            reviews=db.execute(
-                f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} kind='review' AND outcome='completed' AND finished>=? AND finished<=?",
-                [*args, begin, now],
-            ).fetchone()[0],
-            fixes=sum(c["activity"] in ("fix", "fix-ci", "rebase", "bump", "lint-repair") for c in others),
+    landed_touches = None
+    for window, attribution in activity_attribution.summarize(db, now, activity_costs.COST_WINDOWS, column, identity):
+        row = costs["windows"][window]
+        attribution["attribution_missing_prs"] += max(
+            0, row["landed_prs"] - attribution.get("attribution_authored_prs", 0)
         )
+        identities = attribution.get("attribution_prs")
+        if identities is not None:
+            if landed_touches is None:
+                landed_touches = _landed_touches(db, now, column, identity)
+            # Landed PRs this scope authored or worked on but has no attribution
+            # record for (no linked cost yet, or not yet prepared) are missing too.
+            listed = {
+                (repo, number) for state in identities.values() for repo, numbers in state.items() for number in numbers
+            }
+            seconds = WINDOWS[window]
+            missing = {repo: set(numbers) for repo, numbers in identities["missing"].items()}
+            for (repo, number), landed in landed_touches.items():
+                if (seconds is None or landed >= now - seconds) and (repo, number) not in listed:
+                    missing.setdefault(repo, set()).add(number)
+            identities["missing"] = {repo: sorted(numbers) for repo, numbers in missing.items()}
+            attribution["attribution_known_prs"] = sum(len(n) for n in identities["known"].values())
+            attribution["attribution_missing_prs"] = sum(len(n) for n in identities["missing"].values())
+        row.update(attribution)
+    raw_observed = minimum("prs", "observed")
+    raw_checked = minimum("prs", "checked")
+    unresolved = "landed IS NULL AND state IS NOT 'CLOSED'"
+    oldest_observed = minimum("prs", "observed", unresolved)
+    oldest_missing = minimum("prs", "created", unresolved + " AND observed IS NULL")
     return dict(
         prepared_at=now,
         review_coordination={
@@ -665,22 +914,36 @@ def _summary(db, now, column=None, identity=None):
             if native_since is not None
             else None
         ),
-        interrupted_unfinished=interrupted["total"],
+        interrupted_unfinished=int(upper.get("interrupted_total", 0)),
         interrupted_unfinished_details=dict(
-            started_1h=interrupted["started_1h"],
-            started_24h=interrupted["started_24h"],
+            started_1h=int(totals["1h"].get("interrupted", 0)),
+            started_24h=int(totals["24h"].get("interrupted", 0)),
             latest=dict(latest_interrupted) if latest_interrupted else None,
         ),
-        open_prs=sum(p["state"] == "OPEN" and p["landed"] is None for p in prs),
-        unknown_prs=sum(p["state"] is None for p in prs),
-        unknown_landings=sum(p["state"] == "MERGED" and p["landed"] is None for p in prs),
-        pr_observed_at=min((p["observed"] for p in prs if p["observed"]), default=None),
-        pr_checked_at=min((p["checked"] for p in prs if p["checked"]), default=None),
+        open_prs=int(upper.get("open_stock", 0)),
+        unknown_prs=int(upper.get("unknown_prs", 0)),
+        unknown_landings=int(upper.get("unknown_landings", 0)),
+        pr_observed_at=raw_observed[0] if raw_observed else None,
+        pr_checked_at=raw_checked[0] if raw_checked else None,
         pr_freshness=dict(
-            observed_at=min((p["observed"] for p in unresolved if p["observed"] is not None), default=None),
-            missing_since=min((p["created"] for p in unresolved if p["observed"] is None), default=None),
+            observed_at=oldest_observed[0] if oldest_observed else None,
+            missing_since=oldest_missing[0] if oldest_missing else None,
         ),
     )
+
+
+def _observation_error_subjects(db):
+    """Resolve only errored repositories once, using repository-indexed facts."""
+    prior = db.execute("SELECT value FROM meta WHERE key='observation_errors'").fetchone()
+    subjects = {}
+    for repo, error in (json.loads(prior[0]) if prior else {}).items():
+        affected = subjects.setdefault(error, set())
+        for worker, scope in db.execute(
+            "SELECT worker,scope FROM prs WHERE repo=? UNION SELECT worker,scope FROM pr_contributions WHERE repo=?",
+            (repo, repo),
+        ):
+            affected.update((("worker", worker), ("scope", scope)))
+    return subjects
 
 
 def prepare(config=None, *, import_history=False, history_roots=(), now=None):
@@ -713,62 +976,89 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Local CI history preparation failed; retaining last-known data")
                 try:
                     activity_costs.prepare(db, now, lambda worker: _worker_scope(db, worker))
+                    pending = db.execute("SELECT value FROM meta WHERE key='activity_cost_error'").fetchone()
+                    if pending:
+                        errors.append("Conversation cost preparation incomplete: " + pending[0])
                 except (OSError, ValueError, KeyError) as error:
                     db.execute("INSERT OR REPLACE INTO meta VALUES ('activity_cost_error',?)", (type(error).__name__,))
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
+                from .worker_manager import load_worker_specs
+
+                forgejo = next((s for s in (load_worker_specs(config) if config else []) if s.forgejo), None)
+                if machine and forgejo:
+                    activity_forgejo.refresh(db, machine, now, errors, dict(forgejo.env))
+                    activity_forgejo.measure(db, now, errors, dict(forgejo.env))
                 _bors(db, errors)
-            from . import expanded_cache, shared_mathlib, work_recovery
-
-            try:
-                work_recovery.housekeep()
-            except Exception as error:
-                errors.append(f"Recovery housekeeping deferred ({type(error).__name__}); retryable jobs retained")
-            from . import verification_storage
-
-            try:
-                from .retention import worker_configs
-
-                states = [state for cfg in worker_configs() for state in (cfg.state, cfg.state / "verification-state")]
-                verification_storage.housekeep(states)
-            except Exception as error:
-                errors.append(f"Verification storage housekeeping deferred ({type(error).__name__})")
-            sharing = shared_mathlib.summary()
-            value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
-            value["all"]["shared_mathlib"] = sharing
-            value["all"]["work_recovery"] = work_recovery.summary()
-            value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
-            value["all"]["expanded_cache"] = expanded_cache.summary()
-            value["all"]["verification_storage"] = read_json(verification_storage.root() / "status.json")
-            for column, key in (("worker", "workers"), ("scope", "groups")):
-                ids = db.execute(
-                    f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
-                    + (" UNION SELECT scope FROM ci_activity" if column == "scope" else "")
-                ).fetchall()
-                for row in ids:
-                    value[key][row[0]] = _summary(db, now, column, row[0])
-                    value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
-                        **{"scope" if key == "groups" else "worker": row[0]}
+                try:
+                    activity_attribution.prepare(db, now)
+                except Exception as error:
+                    errors.append(
+                        "Local attribution preparation failed; retaining last-known summary ("
+                        + type(error).__name__
+                        + ")"
                     )
-                    members = (
-                        {r[0] for r in db.execute("SELECT DISTINCT worker FROM rounds WHERE scope=?", (row[0],))}
-                        if key == "groups"
-                        else {row[0]}
-                    )
-                    value[key][row[0]]["work_recovery"] = work_recovery.summary(workers=members)
-                    if key == "groups":
-                        # Storage belongs to the host, not to the accounting worker window.
-                        value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
-                        value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
-                    atomic_json(
-                        scope_path(key, row[0]), dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors)
-                    )
-            # Detail is separate; status readers never transfer a growing PR inventory.
-            atomic_json(
-                root() / "prs.json",
-                dict(version=1, prepared_at=now, prs=[dict(r) for r in db.execute("SELECT * FROM prs")]),
+            from . import expanded_cache, shared_mathlib
+
+            with db:
+                error_subjects = _observation_error_subjects(db)
+                sharing = shared_mathlib.summary()
+                value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
+                value["all"]["shared_mathlib"] = sharing
+                value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
+                value["all"]["expanded_cache"] = expanded_cache.summary()
+                from . import activity_live
+
+                report_paths = [root() / "summary.json"]
+                reports = []
+                live_context = activity_live.publication_context()
+                from .activity_rollup_sources import flush
+
+                flush(db, now)
+                subjects = [
+                    json.loads(row[0]) for row in db.execute("SELECT subject FROM report_subjects WHERE refs>0")
+                ]
+                for column, key in (("worker", "workers"), ("scope", "groups")):
+                    ids = [(identity,) for kind, identity in subjects if kind == column]
+                    for row in ids:
+                        if row[0] is None:
+                            continue
+                        value[key][row[0]] = _summary(db, now, column, row[0])
+                        value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
+                            **{"scope" if key == "groups" else "worker": row[0]}
+                        )
+                        if key == "groups":
+                            # Storage belongs to the host, not to the accounting worker window.
+                            value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
+                            value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
+                        report_path = scope_path(key, row[0])
+                        report_paths.append(report_path)
+                        reports.append(
+                            (
+                                report_path,
+                                dict(
+                                    version=1,
+                                    prepared_at=now,
+                                    all=value[key][row[0]],
+                                    errors=[
+                                        e
+                                        for e in errors
+                                        if e not in error_subjects or (column, row[0]) in error_subjects[e]
+                                    ],
+                                    live_subject={"worker" if key == "workers" else "scope": row[0]},
+                                ),
+                            )
+                        )
+            for report_path, report in reports:
+                activity_live.publish_report(report_path, report, carry=live_context)
+            # These are rebuildable views. Receipts and SQLite remain durable;
+            # readers need atomic replacement, not a disk barrier for every view.
+            activity_live.publish_report(
+                root() / "summary.json",
+                {k: v for k, v in value.items() if k not in ("workers", "groups")},
+                carry=live_context,
             )
-            atomic_json(root() / "summary.json", {k: v for k, v in value.items() if k not in ("workers", "groups")})
+            activity_live.publish_inputs(value, report_paths)
             return value
 
 
@@ -799,16 +1089,47 @@ def start_collector(config):
     stopping = threading.Event()
 
     def run():
+        from . import processes, worker_scopes
+        from .paths import self_argv, self_env
+
+        oom_since = time.time() - 300
         while not stopping.is_set():
+            started = time.monotonic()
+            observed_at = time.time()
             try:
-                prepare(config)
+                if worker_scopes.collect_oom_events(config, oom_since):
+                    oom_since = observed_at
+            except Exception:
+                pass
+            try:
+                # SQLite row stepping must not contend with manager socket I/O
+                # for the GIL. Reuse the existing one-shot command and lock.
+                argv = self_argv("activity", "refresh", "--json") + (["--config", str(config)] if config else [])
+                processes.run(argv, env=self_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
             except Exception as error:
-                with contextlib.suppress(Exception):
-                    atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
-            stopping.wait(60)
+                intentional_stop = isinstance(error, subprocess.CalledProcessError) and error.returncode in (
+                    -signal.SIGTERM,
+                    -signal.SIGINT,
+                )
+                if not stopping.is_set() and not intentional_stop:
+                    with contextlib.suppress(Exception):
+                        atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
+            stopping.wait(max(0, 60 - (time.monotonic() - started)))
 
     thread = threading.Thread(target=run, name="activity-preparation", daemon=True)
     thread.start()
+
+    def live():
+        from .activity_live import INTERVAL, sample
+
+        while not stopping.is_set():
+            try:
+                sample()
+            except Exception:
+                pass  # Reporting must never stop the manager or paid work.
+            stopping.wait(INTERVAL)
+
+    threading.Thread(target=live, name="live-spending", daemon=True).start()
     return stopping
 
 
@@ -823,13 +1144,20 @@ def command(args):
     if args.action == "refresh":
         prepare(args.config, import_history=args.backfill, history_roots=args.history_root)
     if args.inventory:
-        value = read_json(root() / "prs.json")
-        if args.worker or args.group:
-            value["prs"] = [
-                p
-                for p in value.get("prs", [])
-                if (not args.worker or p["worker"] == args.worker) and (not args.group or p["scope"] == args.group)
-            ]
+        # A complete inventory is an explicit request, never a periodic export.
+        # Read the prepared facts without schema changes, collectors or network.
+        path = root() / "activity.sqlite"
+        value = dict(version=1, prs=[])
+        if path.exists():
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                predicates, args_ = [], []
+                for column, selected in (("worker", args.worker), ("scope", args.group)):
+                    if selected:
+                        predicates.append(column + "=?")
+                        args_.append(selected)
+                where = " WHERE " + " AND ".join(predicates) if predicates else ""
+                value["prs"] = [dict(row) for row in db.execute("SELECT * FROM prs" + where, args_)]
     else:
         value = cached(worker=args.worker, group=args.group)
     if args.json or args.inventory:

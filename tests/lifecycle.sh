@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.." || exit 1
 PY="${PY:-$(command -v python3)}"   # run-all injects the matrix interpreter; fall back to system python3
 WID="lifecycle-test"
 export TAUCETI_WORKER_ID="$WID"
+unset TAUCETI_ROUND_LOCK_WAIT   # a one-off round refuses a held lock at once
 LIFECYCLE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/tauceti-lifecycle-XXXXXX")
 hold_group=""
 cleanup() {
@@ -13,6 +14,11 @@ cleanup() {
   rm -rf "$LIFECYCLE_TMP"
 }
 trap cleanup EXIT
+# Keep the rounds' activity and state out of the operator's real directories, also when this script
+# runs directly rather than under tests/run-all (which sets the root to the module's own subtree).
+export TAUCETI_TEST_STATE_ROOT="${TAUCETI_TEST_STATE_ROOT:-$LIFECYCLE_TMP/state}"
+isolation="$("$PY" tests/_isolated_state.py --exports)" || exit 1
+eval "$isolation"
 pass=0; fail=0
 ok()  { echo "  [PASS] $1"; pass=$((pass+1)); }
 no()  { echo "  [FAIL] $1"; fail=$((fail+1)); }
@@ -28,7 +34,7 @@ NEWSESS=("$PY" -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1
 # Imports can take longer than one second on a busy host. The hook logs readiness only
 # after RoundContext owns the lock and has installed both signal handlers.
 wait_ready() {
-  local pid=$1 logfile=$2 deadline=$((SECONDS + 15))
+  local pid=$1 logfile=$2 deadline=$((SECONDS + 90))
   while (( SECONDS < deadline )); do
     grep -qF "[test] holding the lock and sleeping" "$logfile" && return 0
     kill -0 "$pid" 2>/dev/null || break
@@ -39,12 +45,40 @@ wait_ready() {
   return 1
 }
 
+# The holders below sleep far longer than any check and are released explicitly (SIGTERM, which
+# RoundContext turns into exit 143 after unlocking): a short fixed sleep can end while a competing
+# round is still importing on a loaded runner, so the competitor would find the lock free.
+# Started inline, not through run(), so $! is the round itself rather than a subshell.
+release() { kill -TERM "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
+
 echo "== 1. flock: a second concurrent round dies on the lock =="
-TAUCETI_TEST_SLEEP=4 run _round >"$LIFECYCLE_TMP/lc1.log" 2>&1 &
+TAUCETI_TEST_SLEEP=300 "$PY" ./tauceti _round >"$LIFECYCLE_TMP/lc1.log" 2>&1 &
 bg=$!; wait_ready "$bg" "$LIFECYCLE_TMP/lc1.log"
 TAUCETI_TEST_SLEEP=4 run _round >"$LIFECYCLE_TMP/lc2.log" 2>&1; rc=$?
 grep -q "holds .*round.lock" "$LIFECYCLE_TMP/lc2.log" && (( rc == 1 )) && ok "second round refused (rc=$rc)" || no "second round not refused (rc=$rc)"
-wait $bg
+release $bg
+
+echo "== 1b. a loop's round waits for a held lock, and a lock still held is no failure =="
+# spawn_round sets TAUCETI_ROUND_LOCK_WAIT: another worker's sweep, or a round of a restarted loop,
+# can hold this worker's lock for a while, and the next round must neither fail nor back off.
+TAUCETI_TEST_SLEEP=300 "$PY" ./tauceti _round >"$LIFECYCLE_TMP/lc1b.log" 2>&1 &
+bg=$!; wait_ready "$bg" "$LIFECYCLE_TMP/lc1b.log"
+TAUCETI_ROUND_LOCK_WAIT=1 TAUCETI_TEST_SLEEP=0 run _round >"$LIFECYCLE_TMP/lc2b.log" 2>&1; rc=$?
+grep -q "holds .*round.lock" "$LIFECYCLE_TMP/lc2b.log" && (( rc == 81 )) \
+  && ok "a lock still held after the wait is a claim collision (rc=$rc)" \
+  || { no "a lock still held after the wait exited rc=$rc (expected 81)"; cat "$LIFECYCLE_TMP/lc2b.log"; }
+TAUCETI_ROUND_LOCK_WAIT=300 TAUCETI_TEST_SLEEP=0 "$PY" ./tauceti _round >"$LIFECYCLE_TMP/lc3b.log" 2>&1 &
+waiter=$!
+# Release the holder only once the waiter is waiting for it.
+deadline=$((SECONDS + 90))
+until grep -q "waiting up to" "$LIFECYCLE_TMP/lc3b.log" || ! kill -0 "$waiter" 2>/dev/null || (( SECONDS >= deadline )); do
+  sleep 0.05
+done
+release $bg
+wait "$waiter"; rc=$?
+grep -q "acquired after waiting" "$LIFECYCLE_TMP/lc3b.log" && (( rc == 0 )) \
+  && ok "the round waited for the lock and ran (rc=$rc)" \
+  || { no "the waiting round exited rc=$rc"; cat "$LIFECYCLE_TMP/lc3b.log"; }
 
 echo "== 2. fd-leak negative: a sleeping grandchild must NOT keep the lock =="
 # Keep the deliberate surviving grandchild in our own process group for exact cleanup.
@@ -65,7 +99,9 @@ pgid=$(ps -o pgid= -p "$child" | tr -d ' ')
 self=$(ps -o pgid= -p $$ | tr -d ' ')
 if [ -n "$pgid" ] && [ "$pgid" != "$self" ]; then
   kill -TERM -- "-$pgid" 2>/dev/null
-  sleep 1
+  # The teardown runs Python cleanup; on a loaded runner that can take seconds, not one.
+  deadline=$((SECONDS + 30))
+  while kill -0 "$child" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
   kill -0 "$child" 2>/dev/null && { no "round survived SIGTERM"; kill -KILL -- "-$pgid" 2>/dev/null; } \
                                || ok "round group torn down by SIGTERM"
 else

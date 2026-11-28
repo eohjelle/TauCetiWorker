@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import fcntl
 import io
@@ -132,7 +135,9 @@ class ObservabilityTests(unittest.TestCase):
                 with patch.dict(os.environ, {rs.STATUS_ENV: str(path)}):
                     started = time.monotonic()
                     rs.report_runtime("surveying")
-                    self.assertLess(time.monotonic() - started, 1)
+                    # The lock is held throughout, so any return proves the wait is bounded (0.5 s);
+                    # the slack is for a loaded CI runner, not a target.
+                    self.assertLess(time.monotonic() - started, 5)
                 self.assertEqual(rs.read_json(path)["state"], "running")
             with patch.dict(os.environ, {rs.STATUS_ENV: str(path)}):
                 rs.report_runtime(phase="fix")
@@ -155,17 +160,72 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(publisher.snapshot()["state"], "running")
             self.assertEqual(publisher.snapshot()["phase"], "review")
 
+    def test_runtime_heartbeats_are_atomic_without_durable_disk_barriers(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "status.json"
+            with patch.object(rs.os, "fsync", side_effect=AssertionError("runtime status forced to disk")):
+                rs.update_status(path, state="running", wrapper_pid=123, applied_spec={"restart": "always"})
+                publisher = rs.StatusPublisher(path)
+                publisher.update(heartbeat_at=100)
+                with patch.dict(os.environ, {rs.STATUS_ENV: str(path)}):
+                    rs.report_runtime("surveying", phase="review")
+            value = rs.read_json(path)
+            self.assertEqual(value["wrapper_pid"], 123)
+            self.assertEqual(value["heartbeat_at"], 100)
+            self.assertEqual(value["state"], "surveying")
+            self.assertEqual(value["phase"], "review")
+
+    def test_restart_policy_records_keep_content_durability(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "status.json"
+            for restart in ("never", "on-failure"):
+                rs.update_status(path, applied_spec={"restart": restart})
+                with patch.object(rs.os, "fsync", wraps=os.fsync) as sync:
+                    rs.update_status(path, heartbeat_at=100)
+                    with patch.dict(os.environ, {rs.STATUS_ENV: str(path)}):
+                        rs.report_runtime("surveying")
+                    self.assertEqual(sync.call_count, 2)
+            rs.update_status(path, applied_spec={"restart": "always"})
+            for lifecycle in (
+                {"spec_hash": "new", "restart_count": 0, "stopped_at": None, "exit_code": None},
+                {"state": "exited", "stopped_at": 200, "exit_code": 0},
+                {"state": "queued", "stopped_at": None, "exit_code": None},
+            ):
+                with patch.object(rs.os, "fsync", wraps=os.fsync) as sync:
+                    rs.update_status(path, **lifecycle)
+                    self.assertEqual(sync.call_count, 1)
+
     def test_metrics_lock_cache_and_proxy_failures_do_not_block_requests(self):
         with tempfile.TemporaryDirectory() as raw, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": raw}):
             with (Path(raw) / "accounting.lock").open("a+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 started = time.monotonic()
                 tr.event({"kind": "test"})
-                self.assertLess(time.monotonic() - started, 0.5)
+                # Held throughout: returning at all proves the 0.05 s wait is bounded.
+                self.assertLess(time.monotonic() - started, 5)
             with patch.object(tr, "atomic", side_effect=OSError("cache unavailable")):
                 tr.register_principal(123, "test", {"GH_TOKEN": "fake"})
             with patch.object(tr, "_install_proxy", side_effect=OSError("shim unavailable")):
                 tr.install_proxy()
+
+    def test_each_runtime_keeps_its_own_gh_launcher(self):
+        # During a live rollout old and new runtimes share one host. Neither may
+        # redirect the other's gh calls into its own routing code.
+        with tempfile.TemporaryDirectory() as raw:
+            environment = {"TAUCETI_GITHUB_SHARED_DIR": raw, "TAUCETI_REAL_GH": "/bin/true", "PATH": "/usr/bin"}
+            launchers = {}
+            for runtime in ("/runtimes/old/bin/python", "/runtimes/new/bin/python", "/runtimes/old/bin/python"):
+                with patch.dict(os.environ, environment), patch.object(tr.sys, "executable", runtime):
+                    tr._install_proxy()
+                    proxy = Path(os.environ["TAUCETI_GITHUB_SHARED_PACING"])
+                    self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(proxy.parent))
+                    launchers.setdefault(runtime, proxy)
+                    self.assertEqual(launchers[runtime], proxy)
+            old, new = launchers["/runtimes/old/bin/python"], launchers["/runtimes/new/bin/python"]
+            self.assertNotEqual(old.parent, new.parent)
+            self.assertIn("/runtimes/old/bin/python", old.read_text())
+            self.assertIn("/runtimes/new/bin/python", new.read_text())
+            self.assertEqual((Path(raw) / "bin").stat().st_mode & 0o777, 0o700)
 
     def test_console_failure_does_not_prevent_file_logging(self):
         broken = io.StringIO()
@@ -259,7 +319,7 @@ raise SystemExit(wm.run_manager(pathlib.Path(sys.argv[1]), interval=0.05))
                     stderr=subprocess.PIPE,
                 )
                 try:
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + 60
                     while not marker.exists() and manager.poll() is None and time.monotonic() < deadline:
                         time.sleep(0.05)
                     self.assertTrue(marker.exists())

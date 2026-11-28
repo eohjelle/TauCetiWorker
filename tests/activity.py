@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Activity counts are local, replay-safe, and never fall back to upstream reads."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json
 import os
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -38,17 +44,195 @@ class ActivityTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.addCleanup(setattr, a, "_round", None)
-        from tauceti_worker import work_recovery
-
-        recovery_home = patch.object(work_recovery, "HERE", Path(self.tmp.name) / "worker")
-        recovery_home.start()
-        self.addCleanup(recovery_home.stop)
         self.now = time.time()
+
+    def test_collector_keeps_minute_cadence_without_overlapping_or_replaying_missed_ticks(self):
+        from tauceti_worker import processes, worker_scopes
+
+        clock = [0.0]
+        starts, waits = [], []
+        durations = iter([40, 82, 3, 1, 2])
+        exits = iter([0, 0, 1, -signal.SIGTERM, -signal.SIGKILL])
+
+        class Stop:
+            def is_set(self):
+                return len(waits) == 5
+
+            def wait(self, delay):
+                waits.append(delay)
+                clock[0] += delay
+
+        def refresh(argv, **kwargs):
+            self.assertEqual(
+                argv[-5:], ["activity", "refresh", "--json", "--config", str(Path(self.tmp.name) / "workers.toml")]
+            )
+            self.assertEqual(kwargs["env"]["TAUCETI_ACTIVITY_DIR"], self.tmp.name)
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            self.assertTrue(kwargs["check"])
+            starts.append(clock[0])
+            clock[0] += next(durations)
+            returncode = next(exits)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, argv)
+
+        # Run the actual collector body synchronously with a controlled clock.
+        # Thread creation is the only scheduling boundary replaced here.
+        def start_thread(**kwargs):
+            return SimpleNamespace(start=kwargs["target"])
+
+        with (
+            patch.object(a.threading, "Event", return_value=Stop()),
+            patch.object(a.threading, "Thread", side_effect=start_thread),
+            patch.object(a.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(processes, "run", side_effect=refresh),
+            patch.object(a, "atomic_json", wraps=a.atomic_json) as publish,
+            patch.object(worker_scopes, "collect_oom_events", return_value=False),
+        ):
+            a.start_collector(Path(self.tmp.name) / "workers.toml")
+        self.assertEqual(starts, [0, 60, 142, 202, 262])
+        self.assertEqual(waits, [20, 0, 57, 59, 58])
+        self.assertEqual(publish.call_count, 2, "failed/OOM children report errors; intentional SIGTERM does not")
+        self.assertEqual(a.read_json(a.root() / "preparation-error.json")["error"], "CalledProcessError")
+
+    def test_live_sampling_continues_while_historical_refresh_is_blocked(self):
+        from tauceti_worker import activity_live, processes, worker_scopes
+
+        entered, release, sampled = threading.Event(), threading.Event(), threading.Event()
+
+        def refresh(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+
+        with (
+            patch.object(processes, "run", side_effect=refresh),
+            patch.object(worker_scopes, "collect_oom_events", return_value=False),
+            patch.object(activity_live, "sample", side_effect=sampled.set),
+        ):
+            stop = a.start_collector(None)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(sampled.wait(2), "live sampling must not wait for the historical subprocess")
+            finally:
+                stop.set()
+                release.set()
+                for thread in threading.enumerate():
+                    if thread.name in {"activity-preparation", "live-spending"}:
+                        thread.join(2)
+
+    def test_collector_owner_exit_cleans_refresh_descendants_and_releases_locks(self):
+        import fcntl
+
+        from tauceti_worker.paths import self_env
+
+        marker = a.root() / "child-started"
+        locks = [a.root() / "prepare.lock", a.root() / "helper.lock"]
+        helper = (
+            "import fcntl,sys,time;from pathlib import Path;"
+            "lock=open(sys.argv[1],'a');fcntl.flock(lock,fcntl.LOCK_EX);"
+            "Path(sys.argv[2]).touch();time.sleep(60)"
+        )
+        refresh = (
+            "import fcntl,subprocess,sys;"
+            "lock=open(sys.argv[1],'a');fcntl.flock(lock,fcntl.LOCK_EX);"
+            f"subprocess.run([sys.executable,'-c',{helper!r},sys.argv[2],sys.argv[3]],check=True)"
+        )
+        argv = [sys.executable, "-c", refresh, *map(str, locks), str(marker)]
+        wait_for_child = f"while not Path({str(marker)!r}).exists(): time.sleep(.01)"
+        owner_code = (
+            "import os,time;from pathlib import Path;from tauceti_worker import activity,paths,worker_scopes;"
+            f"paths.self_argv=lambda *args:{argv!r};"
+            "worker_scopes.collect_oom_events=lambda *args:False;activity.start_collector(None);"
+            f"exec({wait_for_child!r});os._exit(0)"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", owner_code],
+            env=self_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        ) as owner:
+            try:
+                owner.wait(timeout=15)
+            except BaseException:
+                owner.kill()
+                raise
+            self.assertEqual(owner.returncode, 0)
+        self.assertTrue(marker.exists(), "refresh helper never acquired its lock")
+        for path in locks:
+            with path.open("a") as lock:
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail(f"orphaned refresh process still holds {path.name}")
+                        time.sleep(0.01)
+
+    def test_refresh_child_inherits_activity_root_and_respects_existing_preparation_lock(self):
+        import fcntl
+
+        from tauceti_worker.paths import self_argv, self_env
+
+        published = dict(version=1, prepared_at=self.now, all={"marker": "previous publication"}, errors=[])
+        a.atomic_json(a.root() / "summary.json", published)
+        with (a.root() / "prepare.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            child = subprocess.run(
+                self_argv("activity", "refresh", "--json", "--config", str(a.root() / "workers.toml")),
+                env=self_env(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+        self.assertEqual(json.loads(child.stdout)["summary"], published["all"])
+        self.assertEqual(a.read_json(a.root() / "summary.json"), published)
+        self.assertFalse((a.root() / "activity.sqlite").exists())
 
     def finish(self, age, kind="review", outcome="completed", rid=None):
         rid = rid or str(age)
         with patch.object(a.time, "time", return_value=self.now - age):
             a.emit("round_finished", key=rid, round_id=rid, round_type=kind, outcome=outcome)
+
+    def test_receipts_stay_durable_and_missing_derived_views_rebuild_from_ingested_facts(self):
+        from tauceti_worker import runtime_status
+
+        with patch.object(runtime_status.os, "fsync", wraps=os.fsync) as sync:
+            self.assertTrue(
+                a.emit("round_finished", round_id="durable-round", round_type="review", outcome="completed")
+            )
+            self.assertEqual(sync.call_count, 1)
+        with patch("tauceti_worker.activity_live.atomic_json", wraps=a.atomic_json) as publish:
+            a.prepare(now=time.time() + 1)
+        views = [call for call in publish.call_args_list if call.args[0].name != "preparation-error.json"]
+        self.assertTrue(views)
+        self.assertTrue(all(call.kwargs.get("durable") is False for call in views), views)
+        self.assertFalse(list((a.root() / "pending").glob("*.json")))
+        for path in (a.root() / "summary.json", a.scope_path("workers", "worker"), a.scope_path("groups", "machine")):
+            path.write_text("")  # Simulate a disposable cache lost during a power failure.
+        self.assertFalse(a.cached()["available"])
+        a.prepare(now=time.time() + 2)
+        for selection in ({}, {"worker": "worker"}, {"group": "machine"}):
+            restored = a.cached(**selection)
+            self.assertTrue(restored["available"], restored)
+            self.assertEqual(restored["summary"]["rounds"]["total"]["review"]["finished"], 1)
+
+    def test_nondurable_view_still_replaces_atomically_and_cleans_failed_temp_file(self):
+        from tauceti_worker import runtime_status
+
+        path = a.root() / "view.json"
+        a.atomic_json(path, {"old": True})
+        with (
+            patch.object(runtime_status.os, "fsync", side_effect=AssertionError("derived view forced to disk")),
+            patch.object(runtime_status.os, "replace", side_effect=OSError("rename failed")),
+            self.assertRaises(OSError),
+        ):
+            a.atomic_json(path, {"new": True}, durable=False)
+        self.assertEqual(a.read_json(path), {"old": True})
+        self.assertFalse(list(a.root().glob(".view.json.*")))
 
     def test_upgrade_preserves_usage_history_and_ignores_old_containment_projection(self):
         with contextlib.closing(a._connect()) as db, db:
@@ -97,13 +281,52 @@ class ActivityTests(unittest.TestCase):
         pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
         self.assertEqual(lines[pr_start - 1], "")
 
-    def test_housekeeping_failure_does_not_abort_activity_refresh(self):
-        from tauceti_worker import work_recovery
-
-        with patch.object(work_recovery, "housekeep", side_effect=OSError("fixture housekeeping failure")):
-            value = a.prepare(now=self.now)
-        self.assertTrue(a.cached()["available"])
-        self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
+    def test_mathlib_worker_message_states_survive_fleet_aggregation(self):
+        a.prepare(now=self.now)
+        one, two, older = a.cached(), a.cached(), a.cached()
+        private_reason = "Mathlib dependency is not available for sharing"
+        clear_reason = "sharing was skipped because the Mathlib checkout was absent."
+        idle_reason = "shared view released; awaiting next natural round"
+        one["summary"]["shared_mathlib"] = dict(
+            private=2,
+            idle=14,
+            reasons=[private_reason, idle_reason],
+            reasons_by_mode={"private": [private_reason], "idle": [idle_reason]},
+        )
+        two["summary"]["shared_mathlib"] = dict(
+            private=1, reasons=[clear_reason], reasons_by_mode={"private": [clear_reason]}
+        )
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=["legacy reason"])
+        for value in (one, a.activity_summary.combine([one, two, older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertEqual(output.getvalue().count(f"  Private builds: {clear_reason}\n"), 1)
+            self.assertNotIn(idle_reason, output.getvalue())
+            self.assertNotIn(f"  {private_reason}\n", output.getvalue())
+        self.assertIn("  Worker message (state unavailable): legacy reason\n", output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn("  Worker message (state unavailable): legacy reason\n", output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(idle=1, reasons=[idle_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.activity_summary.combine([older]))
+        self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=[private_reason, idle_reason])
+        for value in (older, a.activity_summary.combine([older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn(f"  Private builds: {clear_reason}\n", output.getvalue())
+            self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(blocked=1, reasons=[private_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(
+            "  Blocked builds: the Mathlib checkout was absent, but sharing is required.\n", output.getvalue()
+        )
+        older["summary"]["shared_mathlib"]["private"] = 1
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(f"  Worker message (state unavailable): {private_reason}\n", output.getvalue())
 
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
@@ -131,6 +354,17 @@ class ActivityTests(unittest.TestCase):
         a.prepare(now=self.now)
         self.assertEqual(a.cached()["summary"]["rounds"], s["rounds"])
 
+    def test_own_pr_closure_is_a_finished_round_and_not_a_failure(self):
+        self.finish(10, kind="rebase", outcome="closed-by-agent")
+        self.finish(20, kind="rebase", outcome="failed")
+        a.prepare(now=self.now)
+        s = a.cached(group="machine")["summary"]
+        self.assertEqual(s["rounds"]["1h"]["rebase"], dict(finished=2, failed=1, unknown=0, closed=1))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.cached(group="machine"))
+        self.assertRegex(output.getvalue(), r"\n    failed/timed out +1 ")
+        self.assertRegex(output.getvalue(), r"\n    closed own PR +1 ")
+
     def test_round_lifecycle_selection_no_work_waits_and_interruption(self):
         r = a.Round("worker")
         r.select("roadmap")
@@ -157,16 +391,431 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["interrupted_unfinished"], 1)
         self.assertEqual(s["running"], 0)
 
+    def test_live_round_kind_follows_its_latest_selection(self):
+        def kind(rid):
+            with contextlib.closing(a._connect()) as db, db:
+                a._consume(db, [])
+                return db.execute("SELECT kind FROM rounds WHERE id=?", (rid,)).fetchone()[0]
+
+        r = a.Round("worker")
+        r.select("review")
+        self.assertEqual(kind(r.id), "review")
+        pending = a.root() / "pending"
+        # Later selections apply in sequence order, not receipt arrival or clock order,
+        # including an older selection that reaches a later collector run.
+        with patch.object(a.time, "time", return_value=self.now - 60):
+            r.select("roadmap")
+        held = {path: path.read_bytes() for path in pending.glob("*.json")}
+        for path in held:
+            path.unlink()
+        r.select("fix")
+        self.assertEqual(kind(r.id), "fix")
+        for path, body in held.items():
+            path.write_bytes(body)
+        self.assertEqual(kind(r.id), "fix")
+        r.finish()
+        self.assertEqual(kind(r.id), "fix")
+        # A selection receipt replayed after the finish cannot relabel the finished round.
+        a.emit("round_selected", round_id=r.id, worker="worker", round_type="review", selection=99)
+        self.assertEqual(kind(r.id), "fix")
+        with contextlib.closing(a._connect()) as db, db:
+            self.assertIsNone(db.execute("SELECT 1 FROM round_selections WHERE round_id=?", (r.id,)).fetchone())
+
+    def test_deferred_creation_keeps_origin_and_reconciles_without_moving_finish(self):
+        from tauceti_worker import github_outbox as outbox
+
+        r = a.Round("worker")
+        r.select("roadmap")
+        original = r.id
+        with patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": self.tmp.name + "/shared", "GH_TOKEN": "fixture"}):
+            env = dict(os.environ)
+            argv = ["gh", "pr", "create", "--repo", "org/repo", "--head", "author:branch", "--body", "proof"]
+            path = outbox.prepare(argv, env, self.tmp.name)
+            outbox.finish(path, subprocess.CompletedProcess(argv, 1, "", "rate limit exceeded"), before_request=True)
+            a.observation("unconfirmed")
+            r.finish()
+            # Preparation counts only what happened by its `now`. Rounds and receipts record the real
+            # clock, which a loaded runner can carry seconds past setUp's, so a preparation that must
+            # see them is timed from the clock rather than from self.now (as below and elsewhere).
+            prepared = time.time() + 1
+            a.prepare(now=prepared)
+            with contextlib.closing(a._connect()) as db:
+                before = dict(db.execute("SELECT * FROM rounds WHERE id=?", (original,)).fetchone())
+                self.assertEqual(before["outcome"], "unconfirmed")
+            # The retry runs in a different round, with a different current host
+            # identity. The retained intent owns attribution, not the drainer.
+            with (
+                patch.dict(
+                    os.environ, {"TAUCETI_ACTIVITY_ROUND_ID": "later-round", "TAUCETI_FLEET_MACHINE_ID": "later-host"}
+                ),
+                patch.object(
+                    outbox.tr,
+                    "execute",
+                    return_value=subprocess.CompletedProcess(argv, 0, "https://github.com/org/repo/pull/7", ""),
+                ),
+            ):
+                self.assertEqual(outbox.drain(env), [])
+        a.prepare(now=max(prepared + 1, time.time() + 1))
+        with contextlib.closing(a._connect()) as db:
+            after = dict(db.execute("SELECT * FROM rounds WHERE id=?", (original,)).fetchone())
+            self.assertEqual(after, {**before, "outcome": "completed"})
+            self.assertIsNone(db.execute("SELECT * FROM rounds WHERE id='later-round'").fetchone())
+            self.assertEqual(
+                tuple(db.execute("SELECT worker,scope FROM prs WHERE number=7").fetchone()), ("worker", "machine")
+            )
+        self.assertEqual(a.cached()["summary"]["rounds"]["total"]["roadmap"], dict(finished=1, failed=0, unknown=0))
+
+    def test_publication_evidence_is_order_independent_and_conservative(self):
+        import itertools
+
+        base = dict(version=1, worker="worker", group="machine")
+        for n, order in enumerate(itertools.permutations(("start", "finish", "publication"))):
+            rid = f"ordering-{n}"
+            receipts = dict(
+                start=dict(kind="round_started", at=self.now - 20),
+                finish=dict(kind="round_finished", round_type="roadmap", outcome="unconfirmed", at=self.now - 10),
+                publication=dict(kind="pr_created", repository="org/repo", pr=n + 10, at=self.now),
+            )
+            with contextlib.closing(a._connect()) as db, db:
+                for key in (*order, *order):  # Both delivery order and duplicate replay.
+                    a._ingest(db, {**base, **receipts[key], "id": rid + key, "round_id": rid})
+                row = db.execute("SELECT outcome,finished FROM rounds WHERE id=?", (rid,)).fetchone()
+                self.assertEqual(tuple(row), ("completed", self.now - 10))
+        cases = (
+            ("unconfirmed", "roadmap", "worker", "machine", "pr_created", {}, "completed"),
+            ("unknown", "fix", "worker", "machine", "pr_activity", dict(activity="branch_push"), "completed"),
+            ("unconfirmed", "fix", "worker", "machine", "pr_activity", dict(publication="closure"), "completed"),
+            ("unconfirmed", "fix", "worker", "machine", "pr_activity", dict(publication="reply"), "unconfirmed"),
+            ("unconfirmed", "fix", "worker", "machine", "pr_created", {}, "unconfirmed"),
+            ("unconfirmed", "roadmap", "peer", "machine", "pr_created", {}, "unconfirmed"),
+            ("unconfirmed", "roadmap", "worker", "other", "pr_created", {}, "unconfirmed"),
+            ("failed", "roadmap", "worker", "machine", "pr_created", {}, "failed"),
+            ("timeout", "roadmap", "worker", "machine", "pr_created", {}, "timeout"),
+            ("no-progress", "roadmap", "worker", "machine", "pr_created", {}, "no-progress"),
+        )
+        with contextlib.closing(a._connect()) as db, db:
+            for n, (outcome, phase, worker, scope, kind, fields, expected) in enumerate(cases):
+                rid = f"conservative-{n}"
+                a._ingest(
+                    db,
+                    {
+                        **base,
+                        "id": rid,
+                        "round_id": rid,
+                        "kind": "round_finished",
+                        "round_type": phase,
+                        "outcome": outcome,
+                        "at": self.now - 10,
+                    },
+                )
+                a._ingest(
+                    db,
+                    {
+                        **base,
+                        "id": rid + "pub",
+                        "round_id": rid,
+                        "kind": kind,
+                        "repository": "org/repo",
+                        "pr": n + 100,
+                        "worker": worker,
+                        "group": scope,
+                        "at": self.now,
+                        **fields,
+                    },
+                )
+                self.assertEqual(db.execute("SELECT outcome FROM rounds WHERE id=?", (rid,)).fetchone()[0], expected)
+            # A process that never emitted a finish still has no trusted finish time.
+            a._ingest(
+                db, {**base, "id": "unfinished", "round_id": "unfinished", "kind": "round_started", "at": self.now - 10}
+            )
+            a._ingest(
+                db,
+                {
+                    **base,
+                    "id": "unfinished-pub",
+                    "round_id": "unfinished",
+                    "kind": "pr_created",
+                    "repository": "org/repo",
+                    "pr": 200,
+                    "at": self.now,
+                },
+            )
+            self.assertEqual(
+                tuple(db.execute("SELECT finished,outcome FROM rounds WHERE id='unfinished'").fetchone()), (None, None)
+            )
+
+    def test_lost_creation_acknowledgement_reconciles_original_round(self):
+        from tauceti_worker import github_outbox as outbox
+
+        with patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": self.tmp.name + "/shared", "GH_TOKEN": "fixture"}):
+            r = a.Round("worker")
+            r.select("roadmap")
+            env = dict(os.environ)
+            argv = ["gh", "pr", "create", "--repo", "org/repo", "--head", "author:branch", "--body", "proof"]
+            path = outbox.prepare(argv, env, self.tmp.name)
+            outbox.finish(path, subprocess.CompletedProcess(argv, 1, "", "lost response"))
+            a.observation("unconfirmed")
+            r.finish()
+            data = {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "nodes": [
+                                {
+                                    "url": "https://github.com/org/repo/pull/7",
+                                    "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                    "headRepositoryOwner": {"login": "author"},
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            }
+            with patch.object(
+                outbox.tr, "execute", return_value=subprocess.CompletedProcess([], 0, json.dumps(data), "")
+            ) as read:
+                self.assertEqual(outbox.drain(env), [])
+                self.assertEqual(read.call_count, 1)
+                self.assertEqual(read.call_args.args[0][:3], ["gh", "api", "graphql"])
+        a.prepare(now=time.time() + 1)
+        self.assertEqual(a.cached()["summary"]["rounds"]["total"]["roadmap"], dict(finished=1, failed=0, unknown=0))
+
+    def test_legacy_publication_does_not_borrow_the_draining_round(self):
+        with patch.dict(os.environ, {"TAUCETI_ACTIVITY_ROUND_ID": "unrelated"}):
+            fleet_events.mutation(
+                {"argv": ["pr", "create"]}, SimpleNamespace(stdout="https://github.com/org/repo/pull/7")
+            )
+        receipts = [json.loads(p.read_text()) for p in (a.root() / "pending").glob("*.json")]
+        self.assertEqual(len(receipts), 1)
+        self.assertNotIn("round_id", receipts[0])
+
+    def test_closing_an_already_closed_pr_is_not_a_closure(self):
+        close = {"argv": ["pr", "close", "7", "--repo", "org/repo"]}
+        fleet_events.mutation(close, SimpleNamespace(stdout="", stderr="! Pull request org/repo#7 is already closed"))
+        fleet_events.mutation(close, SimpleNamespace(stdout="", stderr="✓ Closed pull request org/repo#7"))
+        receipts = [json.loads(p.read_text()) for p in (a.root() / "pending").glob("*.json")]
+        self.assertEqual(sorted(str(r.get("publication")) for r in receipts), ["None", "closure"])
+
     def test_pr_creation_is_recorded_without_fleet_journal(self):
         with patch.dict(os.environ, {"TAUCETI_FLEET_EVENTS": ""}):
             fleet_events.mutation(
                 {"argv": ["pr", "create"]}, SimpleNamespace(stdout="https://github.com/org/repo/pull/7")
             )
         with patch.object(a, "observe", side_effect=AssertionError("No configured endpoint")):
-            a.prepare(now=self.now + 1)
+            a.prepare(now=time.time() + 1)
         s = a.cached()["summary"]
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         self.assertEqual(s["unknown_prs"], 1)
+
+    def test_forgejo_prs_count_by_forge_and_never_collide_with_github_numbers(self):
+        from tauceti_worker import activity_forgejo
+
+        machine = "11e2756f00000000"
+        config = Path(self.tmp.name) / "workers.toml"
+        config.write_text('version = 1\n[[workers]]\nid = "w"\nforgejo = true\nnew_pr_forge = "forgejo"\n')
+
+        def iso(at):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+        bors = activity_forgejo.BORS_MERGED_PREFIX
+        issues = [
+            dict(number=5, state="open", title="feat: a", closed_at=None, pull_request=dict(merged=False)),
+            dict(
+                number=6,
+                state="closed",
+                title=bors + "feat: b",
+                closed_at=iso(self.now - 1800),
+                pull_request=dict(merged=False),
+            ),
+            dict(number=7, state="open", title="feat: c", closed_at=None, pull_request=dict(merged=False)),
+        ]
+        branches = {5: "roadmap/a-fleet-11e2756f-3", 6: "roadmap/b-fleet-11e2756f-4", 7: "roadmap/c-fleet-1752e85b-1"}
+        requests = []
+
+        def get(repo, path):
+            requests.append(path)
+            if path.startswith("/issues"):
+                return issues if "page=1" in path else []
+            number = int(path.rsplit("/", 1)[1])
+            # A landed PR's branch is gone; only its label keeps the name.
+            head = dict(label=branches[number], ref=f"refs/pull/{number}/head", sha="")
+            return dict(number=number, created_at=iso(self.now - 3600 * number), head=head)
+
+        with patch.dict(os.environ, {"TAUCETI_FLEET_MACHINE_ID": machine}):
+            fleet_events.mutation(  # GitHub PR #5 is a different PR from Forgejo #5.
+                {"argv": ["pr", "create"]}, SimpleNamespace(stdout="https://github.com/TauCetiProject/TauCeti/pull/5")
+            )
+            with (
+                patch.object(activity_forgejo, "_get", side_effect=get),
+                patch.object(a, "observe", return_value=None),
+                patch.object(activity_forgejo, "measure"),  # Landed PRs' measurements are tested separately.
+            ):
+                a.prepare(config, now=self.now + 1)
+                self.assertEqual(sum(p.startswith("/pulls/") for p in requests), 3)
+                s = a.cached(group=machine)["summary"]
+                self.assertEqual(s["pr_windows"]["24h"]["authored"], 3)
+                self.assertEqual(s["pr_windows"]["24h"]["authored_forgejo"], 2)
+                self.assertEqual(s["pr_windows"]["24h"]["landed"], 1)
+                self.assertEqual(s["pr_windows"]["24h"]["landed_forgejo"], 1)
+                self.assertEqual(s["open_prs"], 1)  # Forgejo #5; GitHub #5 is not yet observed.
+                # The next pass lists only updates since this one and fetches no PR again.
+                requests.clear()
+                a.prepare(config, now=self.now + 1 + activity_forgejo.INTERVAL)
+                self.assertEqual([p for p in requests if p.startswith("/pulls/")], [])
+                self.assertIn("since=", requests[0])
+
+    def test_landed_forgejo_prs_record_lean_loc_and_review_passes_once(self):
+        from tauceti_worker import activity_forgejo
+
+        machine = "11e2756f00000000"
+        config = Path(self.tmp.name) / "workers.toml"
+        config.write_text('version = 1\n[[workers]]\nid = "w"\nforgejo = true\nnew_pr_forge = "forgejo"\n')
+
+        def iso(at):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+        def board(round, head):
+            meta = json.dumps(dict(round=round, head_sha=head, mode="commit"))
+            return dict(body=f"<!--tauceti-scoreboard-->\nScores\n<!--tauceti-meta:v1 {meta}-->")
+
+        bors = activity_forgejo.BORS_MERGED_PREFIX
+        landed = dict(state="closed", closed_at=iso(self.now - 1800), pull_request=dict(merged=False))
+        issues = [dict(landed, number=n, title=bors + "feat: x") for n in (6, 8)]
+        files = {
+            6: [
+                dict(filename="A.lean", additions=300, deletions=2),
+                dict(filename="B.lean", additions=50, deletions=0),
+                dict(filename="README.md", additions=7, deletions=1),
+            ],
+            8: [dict(filename="C.lean", additions=10, deletions=0)],  # The listing misses a file.
+        }
+        totals = {6: (357, 3), 8: (20, 0)}
+        comments = {6: [dict(body="LGTM"), board(1, "old"), board(2, "final")], 8: [board(1, "final")]}
+        requests = []
+
+        def get(repo, path, timeout=10):
+            requests.append(path)
+            if path.startswith("/issues?"):
+                return issues if "page=1" in path else []
+            number = int(path.split("/")[2].split("?")[0])
+            if path.endswith("/files?limit=50&page=1"):
+                return files[number]
+            if path.endswith("/comments"):
+                return comments[number]
+            if "?" in path:
+                return []
+            head = dict(label=f"roadmap/x-fleet-11e2756f-{number}", ref=f"refs/pull/{number}/head", sha="final")
+            additions, deletions = totals[number]
+            return dict(
+                number=number, created_at=iso(self.now - 3600), head=head, additions=additions, deletions=deletions
+            )
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_FLEET_MACHINE_ID": machine}),
+            patch.object(activity_forgejo, "_get", side_effect=get),
+            patch.object(a, "observe", return_value=None),
+        ):
+            a.prepare(config, now=self.now + 1)
+            costs = a.cached(group=machine)["summary"]["costs"]["windows"]["24h"]
+            self.assertEqual((costs["known_loc_prs"], costs["missing_loc_prs"]), (1, 1))
+            self.assertEqual(costs["landed_loc_added"], 350)
+            with contextlib.closing(a._connect()) as db:
+                counts = dict(db.execute("SELECT number,count FROM pr_review_counts").fetchall())
+            self.assertEqual(counts, {6: 3, 8: 1})
+            # Measured PRs are not read again; the incomplete one waits for its retry.
+            requests.clear()
+            a.prepare(config, now=self.now + 2)
+            self.assertEqual([p for p in requests if p.startswith("/pulls/")], [])
+            files[8].append(dict(filename="D.lean", additions=10, deletions=0))
+            a.prepare(config, now=self.now + 2 + activity_forgejo.RETRY)
+            costs = a.cached(group=machine)["summary"]["costs"]["windows"]["24h"]
+            self.assertEqual((costs["known_loc_prs"], costs["missing_loc_prs"]), (2, 0))
+            self.assertEqual(costs["landed_loc_added"], 370)
+
+    def test_forgejo_review_passes_skip_malformed_boards_and_reject_unsafe_counters(self):
+        from tauceti_worker.activity_forgejo import review_passes
+
+        def board(meta):
+            return dict(body=f"<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {meta}-->")
+
+        good = board(json.dumps(dict(round=2, head_sha="h")))
+        self.assertEqual(review_passes([board("{not json"), good], "h"), 2)
+        self.assertIsNone(review_passes([good], "other"))
+        self.assertIsNone(review_passes([board(json.dumps(dict(round=2**63, head_sha="h")))], "h"))
+        self.assertIsNone(review_passes([good, board(json.dumps(dict(round=2**53 - 2, head_sha="h")))], "h"))
+
+    def test_failing_forgejo_measurement_does_not_block_older_landings(self):
+        import urllib.error
+
+        from tauceti_worker import activity_forgejo
+
+        with contextlib.closing(a._connect()) as db, db:
+            for number, age in ((1, 100), (2, 200)):
+                db.execute(
+                    "INSERT INTO prs(repo,number,worker,scope,created,landed,state) VALUES (?,?,?,?,?,?,'CLOSED')",
+                    ("forgejo:x", number, "w", "m", self.now - 1000, self.now - age),
+                )
+        reads = []
+
+        def get(repo, path, timeout=10):
+            reads.append(path)
+            if path.startswith("/pulls/1"):
+                raise urllib.error.HTTPError(path, 500, "server error", {}, None)
+            if path == "/pulls/2":
+                return dict(head=dict(sha="h2"), additions=1, deletions=0)
+            if path.startswith("/pulls/2/files"):
+                return [dict(filename="A.lean", additions=1, deletions=0)] if "page=1" in path else []
+            return []
+
+        env = dict(TAUCETI_FORGEJO_ORIGIN="https://forge.invalid")
+        with (
+            contextlib.closing(a._connect()) as db,
+            patch.object(activity_forgejo, "repository", return_value=SimpleNamespace(key="forgejo:x")),
+            patch.object(activity_forgejo, "_get", side_effect=get),
+        ):
+            for at in (self.now, self.now + 1):
+                activity_forgejo.measure(db, at, [], env)
+            self.assertEqual([tuple(r) for r in db.execute("SELECT number,added FROM pr_loc")], [(2, 1)])
+        # The failed PR waits for its retry instead of being read on every pass.
+        self.assertEqual(reads.count("/pulls/1"), 1)
+
+    def test_forgejo_read_cut_short_by_the_pass_budget_is_not_a_failure(self):
+        from tauceti_worker import activity_forgejo
+
+        with contextlib.closing(a._connect()) as db, db:
+            for number, age in ((1, 100), (2, 200)):
+                db.execute(
+                    "INSERT INTO prs(repo,number,worker,scope,created,landed,state) VALUES (?,?,?,?,?,?,'CLOSED')",
+                    ("forgejo:x", number, "w", "m", self.now - 1000, self.now - age),
+                )
+        clock = [0.0]
+
+        def get(repo, path, timeout=10):
+            if path.startswith("/pulls/1") or path.startswith("/issues/1"):
+                clock[0] += 3  # PR 1 is slow but completes; PR 2's read then meets the budget.
+                if path == "/pulls/1":
+                    return dict(head=dict(sha="h1"), additions=0, deletions=0)
+                return []
+            clock[0] += timeout
+            raise TimeoutError("timed out")
+
+        def run():
+            errors = []
+            with (
+                contextlib.closing(a._connect()) as db,
+                patch.object(activity_forgejo, "repository", return_value=SimpleNamespace(key="forgejo:x")),
+                patch.object(activity_forgejo, "_get", side_effect=get),
+                patch.object(activity_forgejo.time, "monotonic", side_effect=lambda: clock[0]),
+                db,
+            ):
+                activity_forgejo.measure(db, self.now, errors, {})
+                return errors, [r[0] for r in db.execute("SELECT number FROM pr_review_counts ORDER BY number")]
+
+        # PR 2 is cut short by the budget: no error, and no attempt recorded.
+        self.assertEqual(run(), ([], [1]))
+        # Next pass PR 2 comes first with a whole budget; it still cannot finish, so it backs off.
+        self.assertEqual(run(), (["Forgejo PR measurements unavailable; normal refresh will retry"], [1, 2]))
 
     def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
         # These were all discovered together. Recent counts must use their
@@ -196,11 +845,11 @@ class ActivityTests(unittest.TestCase):
         )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(value)
-        self.assertIn("Rounds missing finish records (by start time): 2 in 1h; 3 in 24h; 5 all time", output.getvalue())
-        self.assertIn("Latest affected round started", output.getvalue())
+        self.assertIn("Round reporting gaps: 2 in 1h; 3 in 24h (by start time)", output.getvalue())
+        self.assertIn("latest start 1m ago", output.getvalue())
         self.assertIn("worker, round recent", output.getvalue())
-        self.assertIn("excluded from finished counts", output.getvalue())
-        self.assertIn("Check worker logs", output.getvalue())
+        self.assertIn("excluded from finished totals", output.getvalue())
+        self.assertNotIn("all time", output.getvalue())
 
         # A delayed finish reconciles the round rather than leaving a permanent
         # interruption warning or counting it in both categories.
@@ -234,8 +883,33 @@ class ActivityTests(unittest.TestCase):
             self.assertNotIn("interrupted_unfinished_details", value["summary"])
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 a.display(value)
-            self.assertIn("all time; recent timing unavailable", output.getvalue())
-            self.assertNotIn("Latest affected round", output.getvalue())
+            self.assertIn("historical; recent counts unavailable", output.getvalue())
+            self.assertNotIn("latest start", output.getvalue())
+
+    def test_old_reporting_gaps_are_quiet_and_recent_history_is_compact(self):
+        self.finish(0)
+        a.prepare(now=self.now)
+        value = a.cached()
+        s = value["summary"]
+        s["interrupted_unfinished"] = 176
+        detail = dict(
+            started_1h=0,
+            started_24h=14,
+            latest=dict(started=self.now - 13 * 3600, worker="worker", round_id="long-round-identity"),
+        )
+        s["interrupted_unfinished_details"] = detail
+        with patch("tauceti_worker.activity_summary.time.time", return_value=self.now):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn(
+                "Round reporting gaps: 0 in 1h; 14 in 24h (by start time); latest start 13h ago", output.getvalue()
+            )
+            self.assertNotIn("long-round-identity", output.getvalue())
+            detail["started_24h"] = 0
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertNotIn("Round reporting gaps", output.getvalue())
+        self.assertEqual(s["interrupted_unfinished"], 176)
 
     def test_transport_wait_is_not_counted_as_a_failed_round(self):
         from tauceti_worker.config import Die
@@ -268,6 +942,33 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual(observation.call_count, 1)
         self.assertEqual(a.cached()["summary"]["open_prs"], 1)
 
+    def test_missing_loc_uses_exact_git_comparison_in_normal_refresh(self):
+        a.emit("pr_created", repository="org/repo", pr=7)
+        head, base = "a" * 40, "b" * 40
+        response = dict(
+            prs=[
+                dict(number=7, state="OPEN", observed_at=self.now * 1000, head_sha=head, base_sha=base, lean_loc=None)
+            ],
+            missing=[],
+        )
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(a, "observe", return_value=response),
+            patch.object(
+                a.activity_git, "measure", return_value={7: dict(added=17, deleted=3, head_sha=head)}
+            ) as measure,
+        ):
+            a.prepare(now=self.now + 1)
+            a.prepare(now=self.now + 61)
+        self.assertEqual(measure.call_count, 1)
+        with contextlib.closing(a._connect()) as db:
+            row = db.execute("SELECT head,added,deleted FROM pr_loc WHERE repo='org/repo' AND number=7").fetchone()
+            self.assertEqual(tuple(row), (head, 17, 3))
+
     def test_read_and_display_do_not_open_database_or_network(self):
         self.finish(10)
         a.prepare(now=self.now)
@@ -295,6 +996,65 @@ class ActivityTests(unittest.TestCase):
             "Shared PR observations unavailable for org/roadmap (HTTP 403; repository unavailable or access denied); retaining last-known data",
             a.cached()["errors"],
         )
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.cached())
+        self.assertIn(
+            "PR reporting: org/roadmap access denied (HTTP 403); open/landed counts may be stale", output.getvalue()
+        )
+        self.assertIn("Retrying in background", output.getvalue())
+
+    def test_unmirrored_repository_is_not_observed_and_leaves_refresh_work(self):
+        a.emit("pr_created", repository="TauCetiProject/TauCetiRoadmap", pr=7)
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(a, "observe", side_effect=AssertionError("github-state no longer holds Roadmap")),
+        ):
+            a.prepare(now=self.now + 1)
+        with contextlib.closing(a._connect()) as db:
+            pending = db.execute(
+                "SELECT 1 FROM report_pr_refresh WHERE repo='TauCetiProject/TauCetiRoadmap' AND next_at IS NOT NULL"
+            ).fetchall()
+        self.assertEqual(pending, [])
+        self.assertEqual(a.cached()["errors"], [])
+
+    def test_observation_errors_expire_without_refresh_work_and_survive_retry_delay(self):
+        a.emit("pr_created", repository="org/roadmap", pr=7)
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)",
+                (json.dumps({"org/repo": "orphan warning", "org/roadmap": "real warning"}),),
+            )
+        with patch.object(a, "observe", side_effect=AssertionError("No retry before due")):
+            a.prepare(now=self.now + 60)
+        self.assertEqual(a.cached()["errors"], ["real warning"])
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo='org/roadmap'")
+        a.prepare(now=self.now + 61)
+        self.assertEqual(a.cached()["errors"], [])
+
+    def test_repository_warning_only_reaches_affected_workers_and_groups(self):
+        self.finish(0)
+        a.emit("pr_created", repository="TauCetiProject/TauCeti", pr=1)
+        a.emit(
+            "pr_activity", repository="org/repo", pr=7, worker="other-worker", group="other-machine", activity="review"
+        )
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)",
+                (json.dumps({"org/repo": "unrelated repository access failure"}),),
+            )
+        a.prepare(now=self.now + 60)
+        self.assertEqual(a.cached(worker="worker")["errors"], [])
+        self.assertEqual(a.cached(group="machine")["errors"], [])
+        self.assertEqual(a.cached(worker="other-worker")["errors"], ["unrelated repository access failure"])
+        self.assertEqual(a.cached(group="other-machine")["errors"], ["unrelated repository access failure"])
+        self.assertEqual(a.cached()["errors"], ["unrelated repository access failure"])
 
     def test_pr_freshness_excludes_settled_history_and_respects_scope(self):
         old = self.now - 3 * 86400
@@ -441,7 +1201,7 @@ class ActivityTests(unittest.TestCase):
         s = a.cached()["summary"]
         self.assertEqual(sum(r["finished"] for r in s["rounds"]["total"].values()), 1)
 
-    def test_migration_keeps_native_activity_and_cannot_restore_old_data(self):
+    def test_history_cutoff_keeps_native_rounds_and_preserves_older_pr_identities(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute(
                 "INSERT INTO rounds(id,worker,scope,kind,finished,outcome) VALUES ('resource:old','worker','machine','unknown',?,'unknown')",
@@ -460,7 +1220,7 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["history_since"], self.now - 60)
         self.assertEqual(s["rounds"]["total"], {"review": dict(finished=1, failed=0, unknown=0)})
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
-        # Even a still-running older collector cannot reinsert imported rounds/PRs.
+        # Imported resource rounds remain excluded; older PR identities survive.
         with contextlib.closing(a._connect()) as db, db:
             db.execute("INSERT INTO rounds(id,kind) VALUES ('resource:replayed','unknown')")
             db.execute("INSERT INTO prs(repo,number,created) VALUES ('org/repo',9,?)", (self.now - 100,))
@@ -477,8 +1237,39 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         with contextlib.closing(a._connect()) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM rounds").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 5)
             self.assertEqual(db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0], cutoff)
+
+    def test_landing_window_migration_replays_discarded_prs_without_double_counting(self):
+        receipt = dict(
+            version=1,
+            id="old-pr",
+            kind="pr_created",
+            repository="org/repo",
+            pr=7,
+            at=self.now - 100,
+            worker="worker",
+            group="machine",
+        )
+        journal = Path(os.environ["TAUCETI_FLEET_EVENTS"])
+        journal.write_text(json.dumps(receipt) + "\n")
+        self.finish(60)
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            # Simulate a collector that consumed this receipt, then discarded
+            # its PR because it was opened before local round recording began.
+            db.execute("DELETE FROM prs")
+            db.execute("DELETE FROM meta WHERE key='landing_window_schema'")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE id='old-pr'").fetchone()[0], 1)
+        for _ in range(2):
+            a.prepare(now=self.now + 1)
+        with contextlib.closing(a._connect()) as db, db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 1)
+            db.execute("UPDATE prs SET landed=?,head='h',state='CLOSED'", (self.now,))
+            db.execute("INSERT INTO pr_loc VALUES ('org/repo',7,'h',77,0,?)", (self.now,))
+            s = a._summary(db, self.now + 1)
+        self.assertEqual(s["pr_windows"]["total"]["authored"], 0)
+        self.assertEqual(s["costs"]["windows"]["24h"]["landed_loc_added"], 77)
 
     def test_observation_client_has_no_redirect_or_direct_api_fallback(self):
         import threading

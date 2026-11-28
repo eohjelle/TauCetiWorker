@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -15,6 +16,14 @@ LOW = 0.15
 TARGET = 0.20
 CRITICAL = 0.05
 MIN_PRIVATE_RECLAIM = 256 * 1024**2
+# The full inventory stats every file of the pool and of every worker's build trees (tens of
+# millions on a fleet host), which keeps that much filesystem metadata cached, so the kernel
+# reports the memory as unavailable. Collections in between reuse the last complete inventory,
+# grown by the device's own growth since, and do a full one at once when free space nears the
+# target or that estimate reaches the cap.
+INVENTORY_INTERVAL = 12 * 3600
+INVENTORY_PRESSURE_CHECK = 30  # seconds between free-space checks during a walk that may use the whole run
+INVENTORY_RETRY = 3600  # after a full inventory that did not finish within its run's deadline
 
 
 def headroom(total, fraction):
@@ -47,6 +56,15 @@ def initialize(pool):
         raise ValueError(f"build cache must be an owned directory, not a symlink: {pool}")
 
 
+def legacy_lock(pool, name, *, dry=False):
+    """The canonical object lock, exclusive and non-blocking, before deleting a pool copy."""
+    from .canonical_store import object_lock, store
+
+    if dry:
+        return contextlib.nullcontext()
+    return object_lock(store(pool), name, exclusive=True, blocking=False)
+
+
 def roots(configs, pool):
     from .retention import cache_roots
 
@@ -56,44 +74,158 @@ def roots(configs, pool):
             yield path
         for name in (".lake", "lake-packages", "build"):
             yield cfg.checkout / name
+        yield cfg.checkout.with_name(cfg.checkout.name + ".lake-between-rounds")
 
 
-def inventory(paths, *, protected=(), owners=None, details=None):
-    """Allocated bytes, deduplicated by inode across both pool and private hard links."""
-    seen = {}
-    owners = owners or {}
-    for root in paths:
-        if not root.is_dir() or root.is_symlink():
+class InventoryDeferred(Exception):
+    """The run's deadline passed during the walk; nothing was decided from a partial inventory."""
+
+
+INVENTORY_CHECK_EVERY = 4096  # entries between deadline checks: cheap, yet well under a second
+
+
+class _Clock:
+    """One deadline counter for a whole inventory, across every root it walks."""
+
+    def __init__(self, deadline, abort=None):
+        self.deadline, self.entries, self.abort = deadline, 0, abort
+
+    def check(self, *, now=False):
+        self.entries += 1
+        if (now or self.entries % INVENTORY_CHECK_EVERY == 0) and self.abort is not None and self.abort():
+            raise InventoryDeferred("disk pressure")
+        if (now or self.entries % INVENTORY_CHECK_EVERY == 0) and self.deadline is not None:
+            if time.monotonic() >= self.deadline:
+                raise InventoryDeferred("inventory deadline")
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _scan(root, clock):
+    """Every non-directory, non-symlink entry under ``root`` with its lstat, never following links.
+
+    One lstat per entry (scandir caches it). A directory is opened without following a final
+    symbolic link and must still be the inode that was queued, so one swapped for a link meanwhile
+    is skipped. A directory that cannot be opened or listed is skipped, as os.walk does; a failing
+    stat of an entry other than a vanished one propagates rather than leave a silent gap."""
+    try:
+        info = os.lstat(root)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    pending = [(str(root), info.st_dev, info.st_ino)]
+    while pending:
+        path, device, inode = pending.pop()
+        try:
+            descriptor = os.open(path, _DIRECTORY_FLAGS)
+        except OSError:
             continue
-        for base, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = [name for name in dirs if not (Path(base) / name).is_symlink()]
-            for name in files:
-                path = Path(base) / name
-                try:
-                    if path.is_symlink():
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (device, inode):
+                continue  # replaced since it was queued
+            try:
+                entries = os.scandir(descriptor)
+            except OSError:
+                continue
+            with entries:
+                while True:
+                    try:
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    except OSError:
+                        break  # an unreadable listing: skip the rest of it, as os.walk does
+                    clock.check()
+                    try:
+                        found = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
                         continue
-                    info = path.stat()
-                    key = info.st_dev, info.st_ino
-                    if key in seen:
-                        seen[key][1] += 1
-                        seen[key][3] = seen[key][3] or root in protected
+                    if stat.S_ISLNK(found.st_mode):
+                        continue
+                    if stat.S_ISDIR(found.st_mode):
+                        pending.append((os.path.join(path, entry.name), found.st_dev, found.st_ino))
                     else:
-                        seen[key] = [info.st_blocks * 512, 1, info.st_nlink, root in protected, {}]
-                    if root in owners:
-                        labels = seen[key][4]
-                        labels[owners[root]] = labels.get(owners[root], 0) + 1
-                except FileNotFoundError:
-                    continue
+                        yield found
+        finally:
+            os.close(descriptor)
+
+
+def _overlapping(roots):
+    """Whether one name can be reached through two walked roots: a root repeated (by any
+    spelling) or lying inside another."""
+    resolved = [Path(os.path.realpath(root)) for root in roots]
+    unique = set(resolved)
+    return len(unique) < len(resolved) or any(parent in unique for root in unique for parent in root.parents)
+
+
+def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None, abort=None):
+    """Allocated bytes, deduplicated by inode across both pool and private hard links.
+
+    `named_bytes` counts every name, as `du --count-links` would: hard-linked files count once per
+    link there, so it overstates what the disk holds. `managed_bytes` counts each inode once, and
+    `unique_inodes` is how many inodes that is.
+
+    Memory stays bounded by the hard-linked inodes: a file with one link has one name, so it is
+    totalled at once and never remembered, unless the roots overlap and that name can be reached
+    twice. ``details`` receives the remembered inodes as
+    [bytes, names seen, links, protected, {owner: names}]. ``private`` receives, per
+    (device, owner), the bytes of that owner's unprotected single-link files that were not
+    remembered. Raises InventoryDeferred once ``deadline`` (time.monotonic) has passed, checked
+    before, during and after the walk."""
+    seen, result = {}, {}
+    owners = owners or {}
+    clock = _Clock(deadline, abort)
+    clock.check(now=True)
+    roots = [root for root in paths if root.is_dir() and not root.is_symlink()]
+    remember_all = _overlapping(roots)
+
+    def row(device):
+        return result.setdefault(
+            device,
+            dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0, named_bytes=0, unique_inodes=0),
+        )
+
+    for root in roots:
+        busy, owner = root in protected, owners.get(root)
+        for info in _scan(root, clock):
+            size = info.st_blocks * 512
+            if info.st_nlink <= 1 and not remember_all:
+                totals = row(info.st_dev)
+                totals["managed_bytes"] += size
+                totals["named_bytes"] += size
+                totals["unique_inodes"] += 1
+                if busy:
+                    totals["protected_bytes"] += size
+                elif owner is not None and private is not None:
+                    key = info.st_dev, owner
+                    private[key] = private.get(key, 0) + size
+                continue
+            key = info.st_dev, info.st_ino
+            if key in seen:
+                seen[key][1] += 1
+                seen[key][3] = seen[key][3] or busy
+            else:
+                seen[key] = [size, 1, info.st_nlink, busy, {}]
+            if owner is not None:
+                labels = seen[key][4]
+                labels[owner] = labels.get(owner, 0) + 1
+    clock.check(now=True)
+    for (device, _), (size, count, links, busy, _) in seen.items():
+        clock.check()
+        totals = row(device)
+        totals["managed_bytes"] += size
+        totals["named_bytes"] += size * count
+        totals["unique_inodes"] += 1
+        if busy:
+            totals["protected_bytes"] += size
+        if links > count:
+            totals["externally_linked_bytes"] += size
+    clock.check(now=True)  # nothing is decided on an inventory finished past the deadline
     if details is not None:
         details.update(seen)
-    result = {}
-    for (device, _), (size, count, links, busy, _) in seen.items():
-        row = result.setdefault(device, dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0))
-        row["managed_bytes"] += size
-        if busy:
-            row["protected_bytes"] += size
-        if links > count:
-            row["externally_linked_bytes"] += size
     return result
 
 
@@ -142,8 +274,62 @@ def admit(cfg):
                 marker.unlink(missing_ok=True)
 
 
-def collect(configs, *, dry=False, now=None, opened=...):
-    from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, remove, workspace_idle
+_PRESSURE = ("free space", "cap")  # reasons for a full inventory that also make deletion urgent
+_INVENTORY_KEYS = ("managed_bytes", "externally_linked_bytes", "protected_bytes", "named_bytes", "unique_inodes")
+
+
+def _recorded_at(record):
+    from .retention import _stamp
+
+    return _stamp(record.get("at")) if isinstance(record, dict) else 0
+
+
+def _retry_wait(record):
+    """After consecutive full inventories that missed their deadline: 1, 2, 4... hours, up to the
+    interval. A host whose walk never fits its run's budget must not repeat the futile walk hourly."""
+    deferrals = record.get("deferrals", 0) if isinstance(record, dict) else 0
+    if isinstance(deferrals, bool) or not isinstance(deferrals, int) or deferrals <= 0:
+        return 0
+    return min(INVENTORY_INTERVAL, INVENTORY_RETRY * 2 ** min(deferrals - 1, 16))
+
+
+def _plan(record, pool, observed, now):
+    """("full", why), ("estimated", per-device totals) or ("unknown", None).
+
+    Estimated totals come from the last complete inventory: a device's cache can have grown by at
+    most the device's own growth since, unless other data on it shrank meanwhile; the interval
+    bounds how long such an underestimate can last. "unknown" is a deferred inventory's view: no
+    totals, and a full inventory is retried only after _retry_wait."""
+    from .retention import _stamp
+
+    if any(usage.free < headroom(usage.total, TARGET) for _, usage, _ in observed.values()):
+        return "full", "free space"
+    attempted = _stamp(record.get("attempted_at")) if isinstance(record, dict) else 0
+    waiting = now - attempted < _retry_wait(record)
+    at = _recorded_at(record)
+    if not at or record.get("pool") != str(pool) or not isinstance(record.get("devices"), dict):
+        return ("unknown", None) if waiting else ("full", "no inventory")
+    estimate = {}
+    for device, (_, usage, cap) in observed.items():
+        row = record["devices"].get(str(device))
+        if not isinstance(row, dict) or not all(
+            isinstance(row.get(key), int) and not isinstance(row.get(key), bool)
+            for key in (*_INVENTORY_KEYS, "used_bytes")
+        ):
+            return ("unknown", None) if waiting else ("full", "new filesystem")
+        growth = max(0, usage.total - usage.free - row["used_bytes"])
+        estimate[device] = dict({key: row[key] for key in _INVENTORY_KEYS}, managed_bytes=row["managed_bytes"] + growth)
+        if estimate[device]["managed_bytes"] > cap:
+            return "full", "cap"
+    if now - at >= INVENTORY_INTERVAL and not waiting:
+        return "full", "interval"
+    return "estimated", estimate
+
+
+def collect(configs, *, dry=False, now=None, opened=..., deadline=None, run_deadline=None):
+    """``deadline`` bounds this collection; ``run_deadline`` (both time.monotonic()), the whole
+    collector run, which a full inventory may use up once a shorter one has missed its deadline."""
+    from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, past, remove, workspace_idle
 
     now = time.time() if now is None else now
     pool = expanded_cache.root()
@@ -169,22 +355,98 @@ def collect(configs, *, dry=False, now=None, opened=...):
         for name in (".lake", "lake-packages", "build")
     }
     owners = {path: cfg.wid for cfg in configs for path, _ in cache_roots(cfg)}
-    details = {}
-    before = inventory(paths, protected=protected, owners=owners, details=details)
-    private_candidates = {}
+    from .canonical_store import Guard
+
+    # Pool copies are deleted only while no process holds them open (open fds add no link).
+    guard = Guard(opened=opened or ())
+    details, private_candidates = {}, {}
+    # Free space is observed before any walk, so growth during the walk counts as later growth.
+    observed = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        device = path.stat().st_dev
+        if device not in observed:
+            observed[device] = (path, *limits(path))
+    record_path = activity_root() / "cache-inventory.json"
+    record = read_json(record_path)
+    if not isinstance(record, dict):
+        record = {}
+    mode, plan = _plan(record, pool, observed, now)
+    reason = plan if mode == "full" else None
+    if mode == "estimated":
+        before = plan
+        # Entries a checkout links are kept until a full inventory tells busy from idle checkouts,
+        # but only while one is recent: where full inventories keep missing their deadline, expiry
+        # falls back to each candidate's own links, as a deferred inventory's does.
+        conservative = now - _recorded_at(record) < 2 * INVENTORY_INTERVAL
+    elif mode == "unknown":
+        report.setdefault("deferred", []).append("shared-cache-inventory")
+        before, conservative = {}, False
+    else:
+        conservative = False
+        # The walk gets half the time, so deletion always has the rest. A cold walk can need more,
+        # and a full inventory is rare: after a deferred one it may use the whole run but a minute,
+        # leaving this run's deletions and per-worker phases to the next run. Never under pressure:
+        # then deletion, which needs no inventory, must not wait.
+        walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+        abort, pressured_walk = None, []
+        if walk is not None and run_deadline is not None and _retry_wait(record) and reason not in _PRESSURE:
+            walk = max(walk, run_deadline - min(60.0, max(0.0, run_deadline - time.monotonic()) / 20))
+            checked = [time.monotonic()]
+
+            def abort():
+                # Space can run short during a long walk: stop it, and deletion gets the run's rest.
+                if time.monotonic() - checked[0] < INVENTORY_PRESSURE_CHECK:
+                    return False
+                checked[0] = time.monotonic()
+                for path, _, _ in observed.values():
+                    with contextlib.suppress(OSError):
+                        usage = shutil.disk_usage(path)
+                        if usage.free < headroom(usage.total, TARGET):
+                            pressured_walk.append(path)
+                            return True
+                return False
+
+        try:
+            before = inventory(
+                paths,
+                protected=protected,
+                owners=owners,
+                details=details,
+                private=private_candidates,
+                deadline=walk,
+                abort=abort,
+            )
+            recorded = dict(at=now, attempted_at=now, pool=str(pool), devices={})
+            for device, (_, usage, _) in observed.items():
+                row = before.get(device, {})
+                row = {key: row.get(key, 0) for key in _INVENTORY_KEYS}
+                recorded["devices"][str(device)] = dict(row, used_bytes=usage.total - usage.free)
+        except InventoryDeferred:
+            # Without the full picture, still delete oldest-first: each candidate's own link counts and
+            # locks decide, and urgency comes from free space alone. Private reclamation waits for a
+            # complete walk.
+            report.setdefault("deferred", []).append("shared-cache-inventory")
+            mode, before, details, private_candidates = "deferred", {}, {}, {}
+            deferrals = record.get("deferrals", 0)
+            deferrals = deferrals if isinstance(deferrals, int) and not isinstance(deferrals, bool) else 0
+            recorded = dict(record, attempted_at=now, deferrals=max(0, deferrals) + 1)
+            if pressured_walk:
+                deadline = max(deadline, run_deadline)
+        if not dry:
+            try:
+                atomic_json(record_path, recorded)
+            except OSError as error:
+                note(report, "errors", f"{record_path}: {error}")
+    report["inventory"] = dict(mode=mode, reason=reason, at=now if mode == "full" else _recorded_at(record))
     for (device, _), (size, _, _, busy, labels) in details.items():
         if not busy and labels:
             for worker in labels:
                 key = device, worker
                 private_candidates[key] = private_candidates.get(key, 0) + size // len(labels)
     devices = {}
-    for path in paths:
-        if not path.exists():
-            continue
-        device = path.stat().st_dev
-        if device in devices:
-            continue
-        usage, cap = limits(path)
+    for device, (path, usage, cap) in observed.items():
         devices[device] = dict(
             before[device] if device in before else dict(managed_bytes=0),
             device=device,
@@ -200,6 +462,10 @@ def collect(configs, *, dry=False, now=None, opened=...):
     ]
     pool_device = pool.stat().st_dev if owned else None
     urgent = str(pool_device) in pressured
+    if owned and "shared-cache-inventory" in report.get("deferred", []):
+        # The pool's size is unknown: free space alone decides, up to the usual target.
+        usage = shutil.disk_usage(pool)
+        urgent = urgent or usage.free < headroom(usage.total, TARGET)
     # Oldest reuse first. These are disposable entries, not source or accounting records.
     candidates = []
     for entry in (pool / "entries").glob("*") if owned else ():
@@ -221,6 +487,15 @@ def collect(configs, *, dry=False, now=None, opened=...):
         if path.is_file() and not path.is_symlink():
             candidates.append((path, path, "mathlib-" + path.name))
     remaining = before.get(pool_device, {}).get("managed_bytes", 0)
+    protected_roots = [os.path.realpath(path) + os.sep for path in protected]
+
+    def held(path, info):
+        """Protected: in a protected root by any name. A single-link file has only this name."""
+        row = details.get((info.st_dev, info.st_ino))
+        if row is not None:
+            return row[3]
+        return (os.path.realpath(path) + os.sep).startswith(tuple(protected_roots))
+
     removed_bytes = {device: 0 for device in devices}
 
     def stamp(candidate):
@@ -229,7 +504,15 @@ def collect(configs, *, dry=False, now=None, opened=...):
         except FileNotFoundError:
             return 0
 
+    def out_of_time():
+        if past(deadline):
+            report.setdefault("deferred", []).append("shared-cache-deletion")
+            return True
+        return False
+
     for clock, entry, key in sorted(candidates, key=stamp):
+        if out_of_time():
+            break
         usage, cap = limits(pool)
         if not urgent and now - stamp((clock, entry, key)) < LIFETIME:
             continue
@@ -249,12 +532,29 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 )
                 payload = [p for p in names if p.is_file() and p.name != "entry.json"]
                 infos = [p.stat() for p in payload]
-                if not disposable_stage and any(details.get((i.st_dev, i.st_ino), [0, 0, 0, False])[3] for i in infos):
+                if not disposable_stage and any(held(p, i) for p, i in zip(payload, infos, strict=True)):
                     note(report, "protected", str(entry))
                     continue
-                # Pool-only bundles have an entry and canonical link. Private links
-                # cannot be reclaimed by deleting a pool name, so don't churn warm entries.
-                reclaimable = sum(i.st_blocks * 512 for i in infos if i.st_nlink <= (2 if entry.is_dir() else 1))
+                # Pool-only bundles are linked only by pool names: the entry alias, the legacy
+                # artifacts/ copy and the canonical object. Private links cannot be reclaimed by
+                # deleting a pool name, so don't churn warm entries.
+                from .canonical_store import pool_aliases, release
+
+                aliases = [len(pool_aliases(pool, p.name, i)) for p, i in zip(payload, infos, strict=True)]
+                if (
+                    conservative
+                    and not disposable_stage
+                    and any(i.st_nlink > 1 + count for i, count in zip(infos, aliases, strict=True))
+                ):
+                    # Without this run's inventory a checkout's link cannot be told busy from idle:
+                    # keep the entry until the next full inventory decides.
+                    note(report, "protected", f"{entry}: linked outside the pool; the next full inventory decides")
+                    continue
+                reclaimable = sum(
+                    i.st_blocks * 512
+                    for i, count in zip(infos, aliases, strict=True)
+                    if i.st_nlink <= (1 if entry.is_dir() else 0) + max(1, count)
+                )
                 if not disposable_stage and urgent and now - stamp((clock, entry, key)) < LIFETIME and not reclaimable:
                     continue
                 unique = sum(p.stat().st_blocks * 512 for p in names if p.is_file() and p.stat().st_nlink == 1)
@@ -263,12 +563,14 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     remaining -= unique
                     removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + unique
                     for old in names:
-                        shared = pool / ("archives" if old.name.endswith(".ltar") else "artifacts") / old.name
-                        if shared.is_file() and not shared.is_symlink() and shared.stat().st_nlink == 1:
-                            size = shared.stat().st_blocks * 512
+                        if old.name == "entry.json" or not expanded_cache.ARTIFACT.fullmatch(old.name):
+                            continue
+                        # The legacy copy and canonical object go together once only they link it;
+                        # a relink holding the object lock while it adopts the copy wins.
+                        with contextlib.suppress(BlockingIOError):
+                            size = release(pool, old.name, guard)
                             remaining -= size
                             removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
-                            shared.unlink()
         except BlockingIOError:
             note(report, "protected", str(entry))
         except FileNotFoundError:
@@ -286,15 +588,43 @@ def collect(configs, *, dry=False, now=None, opened=...):
     # so a canonical file with one remaining link is safely unreferenced.
     for directory in ("artifacts", "archives"):
         for path in (pool / directory).glob("*") if owned else ():
+            if out_of_time():
+                break
             try:
                 info = path.lstat()
                 if path.is_symlink() or info.st_nlink != 1:
                     continue
-                remove(path, pool, report, dry=dry, check_users=False, mounts=[])
+                with legacy_lock(pool, path.name, dry=dry):
+                    info = path.lstat()
+                    if info.st_nlink != 1:
+                        continue  # Adopted as a canonical object since the first look.
+                    if not guard.idle((path, info), recent_ok=True):
+                        note(report, "protected", str(path))
+                        continue
+                    remove(path, pool, report, dry=dry, check_users=False, mounts=[])
                 if not dry and not path.exists():
                     removed_bytes[info.st_dev] = removed_bytes.get(info.st_dev, 0) + info.st_blocks * 512
+            except BlockingIOError:
+                note(report, "protected", str(path))
             except FileNotFoundError:
                 continue
+    if owned:
+        from .canonical_store import sweep
+
+        # Canonical objects (and their adopted pool alias) go once no checkout or store links them.
+        freed = sweep(
+            pool,
+            report,
+            dry=dry,
+            urgent=urgent,
+            now=now,
+            lifetime=LIFETIME,
+            remove=remove,
+            opened=opened or (),
+            deadline=deadline,
+        )
+        if not dry:
+            removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + freed
     # One inventory per sweep; update the estimate for known last-link removals.
     # Actual free-space recovery is separately observed with statvfs below.
     after = {
@@ -313,6 +643,8 @@ def collect(configs, *, dry=False, now=None, opened=...):
             )
         )
     report["managed_bytes"] = sum(row["managed_bytes"] for row in report["filesystems"])
+    report["named_bytes"] = sum(row.get("named_bytes", 0) for row in report["filesystems"])
+    report["unique_inodes"] = sum(row.get("unique_inodes", 0) for row in report["filesystems"])
     report["protected_bytes"] = sum(row.get("protected_bytes", 0) for row in report["filesystems"])
     report["reclaimed_bytes"] = sum(row["reclaimed_bytes"] for row in report["filesystems"])
     pressured = [
@@ -322,6 +654,23 @@ def collect(configs, *, dry=False, now=None, opened=...):
     ]
     report["pressure"] = bool(pressured)
     if not dry:
+        busy_workers = set()
+        for cfg in configs if pressured else ():
+            try:
+                # Reuse the open-file observation without taking work locks: even a
+                # brief probe could make a concurrently starting round lose its lock.
+                paths = [cfg.state / "round.lock"]
+                for path in paths if opened is not None else ():
+                    try:
+                        info = path.stat()
+                    except FileNotFoundError:
+                        continue
+                    if (info.st_dev, info.st_ino) in opened:
+                        busy_workers.add(cfg.wid)
+                        break
+            except OSError:
+                busy_workers.add(cfg.wid)
+                note(report, "protected", str(cfg.state))
         candidates = []
         for cfg in configs:
             generation = read_json(cfg.state / "cache-generation.json")
@@ -334,8 +683,8 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 if worker == cfg.wid and str(dev) in pressured
             )
             if potential >= MIN_PRIVATE_RECLAIM:
-                candidates.append((generation.get("started_at", 0), cfg.wid))
-        selected = min(candidates)[1] if candidates else None
+                candidates.append((cfg.wid in busy_workers, generation.get("started_at", 0), cfg.wid))
+        selected = min(candidates)[-1] if candidates else None
         # Request only one useful reclamation, after pool GC has had its chance.
         # Held working sets/unrelated disk use must not flush the fleet every hour.
         atomic_json(

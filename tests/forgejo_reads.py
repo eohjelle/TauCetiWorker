@@ -1,0 +1,1126 @@
+#!/usr/bin/env python3
+"""Qualified direct review-state reads never consult the shared service or gh."""
+
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
+import concurrent.futures
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tauceti_tools.forge import GITHUB, Forge, ForgeError, Incomplete, RepositoryRef
+
+from tauceti_worker import github_transport as transport
+from tauceti_worker.forgejo_reads import BoundedReadCache, ForgejoReadSource, ReadInvalidated, prune_state_cache
+from tauceti_worker.github import GitHub
+from tauceti_worker.review_state import ReviewState
+
+
+def notify_wait(joined):
+    class Waitable(concurrent.futures.Future):
+        def result(self, *args, **kwargs):
+            joined.set()
+            return super().result(*args, **kwargs)
+
+    return patch("tauceti_worker.forgejo_reads.Future", Waitable)
+
+
+class CacheTests(unittest.TestCase):
+    def test_disk_budget_covers_multiple_credentials_without_touching_other_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outbox.json"
+            outside.write_text("durable intent")
+            for actor in ["a" * 64, "b" * 64]:
+                directory = root / actor
+                directory.mkdir()
+                for number in range(1, 5):
+                    path = directory / f"{number}.key.json"
+                    path.write_text("x" * 100)
+                    os.utime(path, (number, number))
+            (root / ("b" * 64) / "5.json").symlink_to(outside)
+            durable = root / "durable"
+            durable.mkdir()
+            (durable / "1.json").write_text("durable state")
+            (root / ("c" * 64)).symlink_to(durable, target_is_directory=True)
+            abandoned = root / ("a" * 64) / ("1.key." + "a" * 32 + ".tmp")
+            abandoned.write_text("x" * 100)
+            os.utime(abandoned, (0, 0))
+            untouched = root / ("a" * 64) / "request.json"
+            untouched.write_text("must not delete")
+            prune_state_cache(root, max_files=3, max_bytes=250)
+            eligible = [path for path in root.glob("*/*.key.json") if not path.is_symlink()]
+            self.assertLessEqual(len(eligible), 2)
+            self.assertLessEqual(sum(path.stat().st_size for path in eligible), 250)
+            self.assertTrue(all(path.name == "4.key.json" for path in eligible))
+            self.assertEqual(outside.read_text(), "durable intent")
+            self.assertEqual(untouched.read_text(), "must not delete")
+            self.assertTrue((root / ("b" * 64) / "5.json").is_symlink())
+            self.assertEqual((durable / "1.json").read_text(), "durable state")
+            self.assertFalse(abandoned.exists())
+
+    def test_entry_and_serialized_byte_bounds_include_keys(self):
+        cache = BoundedReadCache(max_entries=2, max_bytes=100)
+        for n in range(20):
+            cache.read([n], lambda: {"body": "x" * 20}, ttl=15)
+            self.assertLessEqual(cache.stats()["entries"], 2)
+            self.assertLessEqual(cache.stats()["bytes"], 100)
+        cache.read(["x" * 1000], lambda: [], ttl=15)
+        self.assertLessEqual(cache.stats()["bytes"], 100)
+        self.assertLessEqual(cache.stats()["entries"], 2)
+
+    def test_mutating_returned_json_does_not_change_the_cache(self):
+        cache = BoundedReadCache()
+        value, hit = cache.read(["key"], lambda: {"rows": [1]}, ttl=15)
+        self.assertFalse(hit)
+        value["rows"].append(2)
+        again, hit = cache.read(["key"], lambda: self.fail("cache miss"), ttl=15)
+        self.assertTrue(hit)
+        self.assertEqual(again, {"rows": [1]})
+
+    def test_ttl_expiry_and_shorter_callers_cannot_extend_an_entry(self):
+        now = [10.0]
+        cache = BoundedReadCache(clock=lambda: now[0])
+        cache.read(["key"], lambda: [1], ttl=100)
+        now[0] += 5
+        self.assertEqual(cache.read(["key"], lambda: [2], ttl=1), ([2], False))
+        now[0] += 1
+        self.assertEqual(cache.read(["key"], lambda: [3], ttl=1), ([3], False))
+        now[0] = 1
+        self.assertEqual(cache.read(["key"], lambda: [4], ttl=15), ([4], False))
+
+    def test_failures_and_oversized_values_are_not_cached(self):
+        cache = BoundedReadCache(max_bytes=100)
+        for fetch in [lambda: None, lambda: "x" * 1000]:
+            value, hit = cache.read(["key"], fetch, ttl=15)
+            self.assertFalse(hit)
+            self.assertIn(value, [None, "x" * 1000])
+            self.assertEqual(cache.stats()["entries"], 0)
+        with self.assertRaises(RuntimeError):
+            cache.read(["key"], lambda: (_ for _ in ()).throw(RuntimeError("offline")), ttl=15)
+        self.assertEqual(cache.stats()["entries"], 0)
+        self.assertEqual(cache.stats()["active"], 0)
+
+    def test_invalidation_during_any_read_refuses_the_observation(self):
+        for fresh in [False, True]:
+            cache = BoundedReadCache()
+
+            def fetch(cache=cache):
+                cache.invalidate()
+                return ["before-write"]
+
+            with self.subTest(fresh=fresh), self.assertRaises(ReadInvalidated):
+                cache.read(["key"], fetch, ttl=15, fresh=fresh)
+            self.assertEqual(cache.stats()["entries"], 0)
+
+    def test_identical_triage_reads_coalesce(self):
+        cache = BoundedReadCache()
+        entered, release, second_started = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["triage"]
+
+        def second():
+            return cache.read(["key"], slow, ttl=15)
+
+        with notify_wait(second_started), concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            first = executor.submit(cache.read, ["key"], slow, ttl=15)
+            self.assertTrue(entered.wait(5))
+            other = executor.submit(second)
+            self.assertTrue(second_started.wait(5))
+            release.set()
+            self.assertEqual(first.result(timeout=5), (["triage"], False))
+            self.assertEqual(other.result(timeout=5), (["triage"], True))
+        self.assertEqual(len(calls), 1)
+
+    def test_fresh_checks_do_not_wait_or_get_overwritten_by_older_triage(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["old"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            old = executor.submit(cache.read, ["key"], slow, ttl=15)
+            self.assertTrue(entered.wait(5))
+            try:
+                fresh = executor.submit(cache.read, ["key"], lambda: ["fresh"], ttl=15, fresh=True)
+                self.assertEqual(fresh.result(timeout=5), (["fresh"], False))
+            finally:
+                release.set()
+            self.assertEqual(old.result(timeout=5), (["old"], False))
+        self.assertEqual(cache.read(["key"], lambda: self.fail("new observation lost"), ttl=15), (["fresh"], True))
+
+    def test_invalid_bounds_and_ttls_are_rejected(self):
+        for kwargs in [{"max_entries": True}, {"max_bytes": 0}, {"max_entries": 1.5}]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                BoundedReadCache(**kwargs)
+        for ttl in [-1, float("inf"), float("nan"), True]:
+            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
+                BoundedReadCache().read(["key"], lambda: [], ttl=ttl)
+
+    def test_concurrent_fresh_reads_both_return_and_later_start_wins(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["earlier"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(cache.read, ["key"], slow, ttl=15, fresh=True)
+            self.assertTrue(entered.wait(5))
+            try:
+                later = executor.submit(cache.read, ["key"], lambda: ["later"], ttl=15, fresh=True)
+                self.assertEqual(later.result(timeout=5), (["later"], False))
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), (["earlier"], False))
+        self.assertEqual(cache.read(["key"], lambda: self.fail("lost later result"), ttl=15), (["later"], True))
+        self.assertEqual(cache.stats()["active"], 0)
+
+    def test_later_triage_wins_over_slow_fresh_without_canceling_it(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["earlier"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(cache.read, ["key"], slow, ttl=15, fresh=True)
+            self.assertTrue(entered.wait(5))
+            try:
+                later = executor.submit(cache.read, ["key"], lambda: ["later"], ttl=15)
+                self.assertEqual(later.result(timeout=5), (["later"], False))
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), (["earlier"], False))
+        self.assertEqual(cache.read(["key"], lambda: self.fail("lost later result"), ttl=15), (["later"], True))
+
+    def test_distinct_keys_fetch_independently(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["slow"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(cache.read, ["one"], slow, ttl=15)
+            self.assertTrue(entered.wait(5))
+            try:
+                second = executor.submit(cache.read, ["two"], lambda: ["other"], ttl=15)
+                self.assertEqual(second.result(timeout=5), (["other"], False))
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), (["slow"], False))
+
+    def test_scoped_write_does_not_invalidate_other_inflight_or_cached_reads(self):
+        cache = BoundedReadCache()
+        cache.read(["cached"], lambda: [1], ttl=15, scope="other")
+
+        def fetch():
+            cache.invalidate(scope="written")
+            return [2]
+
+        self.assertEqual(cache.read(["active"], fetch, ttl=15, scope="other"), ([2], False))
+        self.assertEqual(
+            cache.read(["cached"], lambda: self.fail("other namespace cleared"), ttl=15, scope="other"), ([1], True)
+        )
+        self.assertEqual(cache.stats()["active"], 0)
+
+    def test_slow_fetch_does_not_extend_ttl_past_its_start(self):
+        now = [10.0]
+        cache = BoundedReadCache(clock=lambda: now[0])
+
+        def slow():
+            now[0] += 20
+            return [1]
+
+        self.assertEqual(cache.read(["key"], slow, ttl=15), ([1], False))
+        self.assertEqual(cache.stats()["entries"], 0)
+
+    def test_invalidation_releases_followers_and_allows_a_new_leader(self):
+        cache = BoundedReadCache()
+        entered, joined, release = threading.Event(), threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["old"]
+
+        with notify_wait(joined), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(cache.read, ["key"], slow, ttl=15, scope=("repo", 1))
+            self.assertTrue(entered.wait(5))
+            follower = executor.submit(cache.read, ["key"], slow, ttl=15, scope=("repo", 1))
+            self.assertTrue(joined.wait(5))
+            try:
+                cache.invalidate(scope=("repo", 1))
+                with self.assertRaises(ReadInvalidated):
+                    follower.result(timeout=2)
+                self.assertFalse(leader.done())
+                self.assertEqual(cache.read(["key"], lambda: ["new"], ttl=15, scope=("repo", 1)), (["new"], False))
+            finally:
+                release.set()
+            with self.assertRaises(ReadInvalidated):
+                leader.result(timeout=5)
+        self.assertEqual(cache.stats()["active"], 0)
+        self.assertEqual(
+            cache.read(["key"], lambda: self.fail("new result lost"), ttl=15, scope=("repo", 1)), (["new"], True)
+        )
+
+    def test_failed_and_interrupted_leaders_release_followers_without_cached_failure(self):
+        for error, expected in [(RuntimeError("offline"), RuntimeError), (KeyboardInterrupt(), ReadInvalidated)]:
+            with self.subTest(kind=type(error).__name__):
+                cache = BoundedReadCache()
+                entered, joined, release = threading.Event(), threading.Event(), threading.Event()
+
+                def failing(error=error, entered=entered, release=release):
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                    raise error
+
+                with notify_wait(joined), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    leader = executor.submit(cache.read, ["key"], failing, ttl=15)
+                    self.assertTrue(entered.wait(5))
+                    follower = executor.submit(cache.read, ["key"], failing, ttl=15)
+                    self.assertTrue(joined.wait(5))
+                    release.set()
+                    with self.assertRaises(type(error)):
+                        leader.result(timeout=5)
+                    with self.assertRaises(expected):
+                        follower.result(timeout=5)
+                self.assertEqual(cache.stats()["entries"], 0)
+                self.assertEqual(cache.stats()["active"], 0)
+                self.assertEqual(cache.read(["key"], lambda: ["recovered"], ttl=15), (["recovered"], False))
+
+
+class SourceTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        self.forge = Forge("forgejo", "https://git.example.org")
+        self.repo = RepositoryRef(self.forge, "one/project")
+        self.api = self.client(self.forge, "fixture-token")
+        self.api.comments.return_value = [self.comment()]
+        self.source = GitHub.for_repository(self.repo, api=self.api)
+        # Any accidental fallback fails, even when an ambient GitHub credential
+        # and service destination exist. No real credential/network is used.
+        for target in [
+            "tauceti_worker.github_state.read",
+            "tauceti_worker.github_state.refresh_pr",
+            "tauceti_worker.github_state.enabled",
+            "tauceti_worker.review_state.github_state_enabled",
+            "tauceti_worker.github.gh_run",
+        ]:
+            blocker = patch(target, side_effect=AssertionError("unexpected GitHub/service fallback"))
+            blocker.start()
+            self.addCleanup(blocker.stop)
+
+    def client(self, forge, token):
+        return Mock(forge=forge, _token=token, max_bytes=1024 * 1024, max_pages=100)
+
+    def comment(self, head="a" * 40):
+        return {
+            "id": 7,
+            "body": "<!--tauceti-scoreboard--><!--tauceti-meta:v1 " + json.dumps({"head_sha": head}) + "-->",
+            "created_at": "2026-11-07T00:00:00Z",
+            "updated_at": "2026-11-07T00:00:00Z",
+            "html_url": self.repo.pull_url(12) + "#issuecomment-7",
+            "user": {"id": 2, "login": "operator"},
+        }
+
+    def state(self, source=None):
+        cfg = SimpleNamespace(sbcache=Path(self.root.name) / "scoreboard")
+        return ReviewState(cfg, source or self.source)
+
+    def test_selected_head_refresh_bypasses_cached_native_header_and_never_uses_github(self):
+        from tauceti_worker.state_repair import repair_selected, retry_key
+        from tauceti_worker.survey import Candidate, Counters
+
+        self.api.pull.return_value = {
+            "number": 12,
+            "title": "Proof",
+            "body": "",
+            "html_url": self.repo.pull_url(12),
+            "flow": 0,
+            "state": "open",
+            "merged": False,
+            "draft": False,
+            "mergeable": True,
+            "user": {"id": 2, "login": "operator"},
+            "labels": [],
+            "updated_at": "2026-11-07T00:00:00Z",
+            "head": {
+                "sha": "a" * 40,
+                "label": "feature",
+                "ref": "feature",
+                "repo": {
+                    "id": 7,
+                    "name": "project",
+                    "full_name": self.repo.name,
+                    "html_url": self.repo.url,
+                    "owner": {"id": 10, "login": "one"},
+                },
+            },
+        }
+        self.assertEqual(self.source.pr_view(12, ["headRefOid"]), {"headRefOid": "a" * 40})
+        self.api.pull.return_value["head"]["sha"] = "b" * 40
+        cfg = SimpleNamespace(state=Path(self.root.name))
+        worker = SimpleNamespace(gh=self.source, rs=self.state(), counters=Counters(cfg))
+        repair_selected(worker, Candidate(12, "a" * 40), "b" * 40)
+        self.assertTrue(worker.selection_changed)
+        self.assertEqual(self.api.pull.call_count, 2)
+        # A successful native refresh needs no outage backoff from the GitHub service.
+        self.assertLess(worker.counters.read(retry_key(12, "a" * 40)), time.time() + 5)
+
+    def test_native_refresh_failure_does_not_reuse_the_cached_head(self):
+        from tauceti_worker.state_repair import repair_selected, retry_key
+        from tauceti_worker.survey import Candidate, Counters
+
+        self.api.pull.return_value = {
+            "number": 12,
+            "html_url": self.repo.pull_url(12),
+            "flow": 0,
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "a" * 40},
+        }
+        self.source.pr_view(12, ["headRefOid"])
+        self.api.pull.side_effect = ForgeError("offline", status=503)
+        result = self.source.refresh_pr_state(12, "a" * 40, "b" * 40)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotIn("data", result)
+        worker = SimpleNamespace(
+            gh=self.source, rs=self.state(), counters=Counters(SimpleNamespace(state=Path(self.root.name)))
+        )
+        repair_selected(worker, Candidate(12, "a" * 40), "b" * 40)
+        retry = worker.counters.read(retry_key(12, "a" * 40))
+        self.assertGreater(retry, time.time() + 25)
+        self.assertLess(retry, time.time() + 35)
+
+    def test_review_state_consumes_native_comments_and_cache_provenance(self):
+        state = self.state()
+        first = state.gh_meta(12)
+        self.assertEqual(first.provenance, "fresh")
+        self.assertEqual(first.data["head_sha"], "a" * 40)
+        self.assertEqual(state.sbcache.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(state._cache_path(12).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(state._key_path(12).stat().st_mode & 0o777, 0o600)
+        self.api.comments.assert_called_once_with(self.repo, 12)
+        again = self.state().gh_meta(12)
+        self.assertEqual(again.provenance, "assumed")
+        self.assertEqual(self.api.comments.call_count, 1)
+        self.api.comments.return_value = [self.comment("b" * 40)]
+        forced = state.gh_meta(12, force=True)
+        self.assertEqual(forced.provenance, "fresh")
+        self.assertEqual(forced.data["head_sha"], "b" * 40)
+        self.assertEqual(self.api.comments.call_count, 2)
+
+    def test_inherited_fresh_context_bypasses_triage_cache(self):
+        self.source.issue_comments(12)
+        with transport.read_context(fresh=True):
+            self.source.issue_comments(12)
+            self.assertFalse(transport.cache_hit())
+        self.assertEqual(self.api.comments.call_count, 2)
+
+    def test_memory_memo_does_not_relabel_cached_metadata_as_fresh(self):
+        state = self.state()
+        self.assertEqual(state.gh_meta(12).provenance, "fresh")
+        fetched = json.loads(state._key_path(12).read_text())["fetched_at"]
+        state._cache_path(12).unlink()
+        self.assertEqual(state.gh_meta(12).provenance, "assumed")
+        self.assertFalse(state._cache_path(12).exists())
+        self.assertEqual(json.loads(state._key_path(12).read_text())["fetched_at"], fetched)
+
+    def test_review_state_does_not_retain_histories_beyond_source_cache_bounds(self):
+        state = self.state()
+        self.api.comments.return_value = []
+        for number in range(1, 201):
+            self.assertEqual(state._issue_comments(number), ([], False))
+        self.assertEqual(state._comments, {})
+        self.assertLessEqual(self.source.cache.stats()["entries"], 128)
+
+    def test_normal_read_recovers_without_memoizing_failure(self):
+        state = self.state()
+        self.api.comments.side_effect = ForgeError("private failure", status=503)
+        self.assertEqual(state.gh_meta(12).provenance, "fetch_failed")
+        self.api.comments.side_effect = None
+        self.api.comments.return_value = []
+        self.assertEqual(state.gh_meta(12).provenance, "missing")
+        self.assertEqual(self.api.comments.call_count, 2)
+
+    def test_source_sidecar_answers_until_the_facts_backstop_while_the_pr_is_unchanged(self):
+        from tauceti_worker.constants import SOURCE_FACTS_TTL
+
+        now = [10.0]
+        self.source.cache.clock = lambda: now[0]
+        state = self.state()
+        state.observe([SimpleNamespace(number=12, updated_at="unchanged", head_oid="a" * 40)])
+        wall = time.time()
+        with patch("tauceti_worker.review_state.time.time", return_value=wall):
+            self.assertEqual(state.gh_meta(12).data["head_sha"], "a" * 40)
+        self.api.comments.return_value = [self.comment("b" * 40)]
+        now[0] += 16
+        with patch("tauceti_worker.review_state.time.time", return_value=wall + 16):
+            result = state.gh_meta(12)
+        self.assertEqual((result.data["head_sha"], result.provenance), ("a" * 40, "assumed"))
+        self.assertEqual(self.api.comments.call_count, 1)
+        # An edit or deletion does not move Forgejo's clock; the backstop bounds that blind spot.
+        now[0] += SOURCE_FACTS_TTL
+        with patch("tauceti_worker.review_state.time.time", return_value=wall + 16 + SOURCE_FACTS_TTL):
+            result = state.gh_meta(12)
+        self.assertEqual((result.data["head_sha"], result.provenance), ("b" * 40, "fresh"))
+        # A new head is a new observation key, whatever the clock says.
+        state.observe([SimpleNamespace(number=12, updated_at="unchanged", head_oid="c" * 40)])
+        self.api.comments.return_value = [self.comment("c" * 40)]
+        now[0] += 16
+        with patch("tauceti_worker.review_state.time.time", return_value=wall + 32 + SOURCE_FACTS_TTL):
+            self.assertEqual(state.gh_meta(12).data["head_sha"], "c" * 40)
+
+    def test_source_disk_age_starts_before_fetch_and_older_writer_cannot_replace_newer(self):
+        state = self.state()
+        state.observe([SimpleNamespace(number=12, updated_at="unchanged")])
+        started = time.time()
+        wall = [started]
+
+        def slow(*args):
+            wall[0] += 20
+            return [self.comment()]
+
+        self.api.comments.side_effect = slow
+        with patch("tauceti_worker.review_state.time.time", side_effect=lambda: wall[0]):
+            self.assertEqual(state.gh_meta(12, force=True).provenance, "fresh")
+        self.assertEqual(json.loads(state._key_path(12).read_text())["fetched_at"], started)
+        self.assertAlmostEqual(state._cache_path(12).stat().st_mtime, started, places=4)
+        state._write_source_cache(state._cache_path(12), {"head_sha": "newer"}, observed_at=started + 10)
+        state._write_source_cache(state._cache_path(12), {"head_sha": "older"}, observed_at=started)
+        self.assertEqual(json.loads(state._cache_path(12).read_text())["head_sha"], "newer")
+
+    def test_nonfinite_or_surrogate_meta_cannot_turn_a_cache_write_into_a_read_failure(self):
+        for value in ['{"x":1e400}', '{"x":"\\ud800"}']:
+            with self.subTest(value=value):
+                comment = {**self.comment(), "body": "<!--tauceti-scoreboard--><!--tauceti-meta:v1 " + value + "-->"}
+                self.api.comments.return_value = [comment]
+                result = self.state().gh_meta(12, force=True)
+                self.assertEqual(result.provenance, "fresh")
+                self.assertIn("x", result.data)
+                self.assertFalse(self.state()._cache_path(12).exists())
+
+    def test_busy_directory_lock_skips_cache_write_without_blocking_a_fresh_read(self):
+        state = self.state()
+        state.sbcache.mkdir(mode=0o700, parents=True)
+        directory = os.open(state.sbcache, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(state.gh_meta, 12, force=True)
+                try:
+                    self.assertEqual(future.result(timeout=2).provenance, "fresh")
+                finally:
+                    fcntl.flock(directory, fcntl.LOCK_UN)
+            self.assertFalse(state._cache_path(12).exists())
+        finally:
+            os.close(directory)
+
+    def test_concurrent_forced_states_return_their_reads_but_keep_the_later_disk_record(self):
+        state = self.state()
+        entered, release = threading.Event(), threading.Event()
+        calls = iter(["slow", "fast"])
+        lock = threading.Lock()
+
+        def fetch(*args):
+            with lock:
+                kind = next(calls)
+            if kind == "slow":
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return [self.comment("a" * 40 if kind == "slow" else "b" * 40)]
+
+        self.api.comments.side_effect = fetch
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            slow = executor.submit(state.gh_meta, 12, force=True)
+            self.assertTrue(entered.wait(5))
+            try:
+                fast = executor.submit(state.gh_meta, 12, force=True).result(timeout=5)
+                self.assertEqual((fast.data["head_sha"], fast.provenance), ("b" * 40, "fresh"))
+            finally:
+                release.set()
+            slow = slow.result(timeout=5)
+            self.assertEqual((slow.data["head_sha"], slow.provenance), ("a" * 40, "fresh"))
+        self.assertEqual(json.loads(state._cache_path(12).read_text())["head_sha"], "b" * 40)
+        self.assertEqual(json.loads(state._key_path(12).read_text())["meta"]["head_sha"], "b" * 40)
+
+    def test_bust_targets_one_pr_across_credentials_without_touching_other_prs(self):
+        other_api = self.client(self.forge, "other-token")
+        other_api.comments.side_effect = lambda repo, number: [{**self.comment(), "html_url": repo.pull_url(number)}]
+        self.api.comments.side_effect = lambda repo, number: [{**self.comment(), "html_url": repo.pull_url(number)}]
+        other = ForgejoReadSource(self.repo, other_api, cache=self.source.cache)
+        for source in [self.source, other]:
+            source.issue_comments(12)
+            source.issue_comments(13)
+        self.state().bust(12)
+        for source in [self.source, other]:
+            source.issue_comments(12)
+            source.issue_comments(13)
+        self.assertEqual(self.api.comments.call_count, 3)
+        self.assertEqual(other_api.comments.call_count, 3)
+
+    def test_service_facts_cannot_entitle_a_different_source(self):
+        state = self.state()
+        state.seed_survey([{"pr": {"number": 12}, "review": {"issue_complete": True, "meta": {"head_sha": "forged"}}}])
+        self.assertEqual(state.gh_meta(12, force=True).data["head_sha"], "a" * 40)
+        self.api.comments.assert_called_once()
+
+    def test_origins_credentials_and_repository_names_isolate_all_caches(self):
+        first = self.state()
+        first.gh_meta(12)
+        variants = [
+            (RepositoryRef(self.forge, "other/project"), self.client(self.forge, "fixture-token")),
+            (self.repo, self.client(self.forge, "other-token")),
+            (
+                RepositoryRef(Forge("forgejo", "https://other.example.org"), self.repo.name),
+                self.client(Forge("forgejo", "https://other.example.org"), "fixture-token"),
+            ),
+        ]
+        for repo, api in variants:
+            api.comments.return_value = []
+            source = ForgejoReadSource(repo, api, cache=self.source.cache)
+            with self.subTest(repo=repo.key):
+                self.assertNotEqual(source.cache_namespace, self.source.cache_namespace)
+                self.assertNotEqual(self.state(source).sbcache, first.sbcache)
+                self.assertEqual(self.state(source).gh_meta(12).provenance, "missing")
+                api.comments.assert_called_once()
+
+    def test_reused_logins_never_replace_origin_qualified_native_ids(self):
+        value = self.source.issue_comments(12)[0]
+        self.assertEqual(value["id"], 7)
+        self.assertEqual(value["node_id"], self.forge.key + "/comments/7")
+        self.assertEqual(value["user"]["node_id"], self.forge.key + "/users/2")
+        self.assertNotIn("author_association", value)
+
+    def test_credential_or_origin_rotation_refuses_old_reader_and_sidecars(self):
+        state = self.state()
+        self.assertEqual(state.gh_meta(12).data["head_sha"], "a" * 40)
+        for changed in ["changed-token", "fixture-token"]:
+            with self.subTest(changed=changed):
+                self.api._token = changed
+                if changed == "fixture-token":
+                    self.api.forge = Forge("forgejo", "https://other.example.org")
+                self.assertIsNone(self.source.issue_comments(12))
+                self.assertEqual(self.source.last_failure.kind, "SourceBindingChanged")
+                self.assertNotIn(changed, repr(self.source.last_failure))
+                for force in [False, True]:
+                    result = state.gh_meta(12, force=force)
+                    self.assertEqual((result.data, result.provenance), ({}, "fetch_failed"))
+                self.assertEqual(self.state().gh_meta(12).data, {})
+        self.assertEqual(self.api.comments.call_count, 1)
+
+    def test_failed_forced_read_is_stale_then_recovers_without_cached_failure(self):
+        state = self.state()
+        state.gh_meta(12)
+        self.api.comments.side_effect = ForgeError("secret diagnostic must not be retained", status=503)
+        failed = state.gh_meta(12, force=True)
+        self.assertEqual(failed.provenance, "stale")
+        self.assertEqual(self.source.last_failure.status, 503)
+        self.assertNotIn("secret", repr(self.source.last_failure))
+        self.api.comments.side_effect = None
+        self.api.comments.return_value = []
+        recovered = state.gh_meta(12, force=True)
+        self.assertEqual(recovered.provenance, "missing")
+        self.assertIsNone(self.source.last_failure)
+
+    def test_wrong_discussion_or_incomplete_body_is_unavailable_not_empty(self):
+        self.api.comments.return_value = [{**self.comment(), "html_url": "https://evil.example/one/project/pulls/12"}]
+        self.assertIsNone(self.source.issue_comments(12))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
+        self.assertEqual(self.state().gh_meta(12).provenance, "fetch_failed")
+
+    def test_bust_invalidates_only_this_sources_read_path(self):
+        state = self.state()
+        state.gh_meta(12)
+        with patch("tauceti_worker.review_state.invalidate", side_effect=AssertionError("GitHub invalidation")):
+            state.bust(12)
+        self.assertEqual(self.source.cache.stats()["entries"], 0)
+        self.api.comments.return_value = [self.comment("b" * 40)]
+        self.assertEqual(state.gh_meta(12).data["head_sha"], "b" * 40)
+
+    def test_partial_thread_support_is_explicitly_unavailable(self):
+        self.source.issue_comments(12)
+        before = self.source.cache.stats()
+        self.assertIsNone(self.source.review_comments(12))
+        self.assertEqual(self.source.last_failure.kind, "Unsupported")
+        self.assertEqual(self.source.cache.stats(), before)
+
+    def test_credential_change_during_fetch_cannot_publish_a_cache_entry(self):
+        def changed(*args):
+            self.api._token = "new-token"
+            return [self.comment()]
+
+        self.api.comments.side_effect = changed
+        self.assertIsNone(self.source.issue_comments(12))
+        self.assertEqual(self.source.cache.stats()["entries"], 0)
+        self.assertEqual(self.source.last_failure.kind, "SourceBindingChanged")
+
+    def test_pr_metadata_projection_uses_direct_typed_reader(self):
+        self.api.pull.return_value = {
+            "id": 3,
+            "number": 12,
+            "title": "Proof",
+            "body": "",
+            "state": "open",
+            "user": {"id": 2, "login": "operator"},
+            "html_url": self.repo.pull_url(12),
+            "flow": 0,
+            "merged": False,
+        }
+        self.assertEqual(self.source.pr_view(12, ["number", "title"]), {"number": 12, "title": "Proof"})
+        self.api.pull.side_effect = Incomplete("unavailable")
+        self.assertIsNone(self.source.pr_view(12, ["number", "title"], fresh=True))
+
+    def test_scoreboard_order_handles_timezone_offsets_and_same_second_ids(self):
+        older = {**self.comment("a" * 40), "updated_at": "2026-04-05T01:50:00+11:00"}
+        later = {**self.comment("b" * 40), "id": 8, "updated_at": "2026-04-05T01:10:00+10:00"}
+        self.api.comments.return_value = [older, later]
+        state = self.state()
+        self.assertEqual(state.gh_meta(12, force=True).data["head_sha"], "b" * 40)
+        tied = {**later, "id": 9, "body": self.comment("c" * 40)["body"]}
+        self.api.comments.return_value = [older, later, tied]
+        self.assertEqual(state.gh_meta(12, force=True).data["head_sha"], "c" * 40)
+
+    def test_invalid_timestamp_and_malformed_projection_are_unavailable(self):
+        self.api.comments.return_value = [{**self.comment(), "updated_at": "no offset or valid time"}]
+        self.assertIsNone(self.source.issue_comments(12))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
+        self.api.pull.return_value = {"number": 12, "html_url": 42}
+        self.assertIsNone(self.source.pr_view(12, ["number"], fresh=True))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
+        with self.assertRaises(ValueError):
+            self.source.pr_view(12, None)
+        self.api.pull.return_value = {
+            "number": 12,
+            "title": "Wrong source",
+            "html_url": "https://evil.example/pulls/12",
+        }
+        self.assertIsNone(self.source.pr_view(12, ["number", "title"], fresh=True))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
+
+    def test_factory_and_constructor_reject_ambiguous_bindings(self):
+        with self.assertRaises(ValueError):
+            GitHub(self.repo)
+        with self.assertRaises(ValueError):
+            GitHub.for_repository(self.repo)
+        with self.assertRaises(ValueError):
+            GitHub.for_repository(self.repo, api=self.client(GITHUB, "token"))
+        with self.assertRaises(ValueError):
+            GitHub.for_repository("one/project", api=self.api)
+        self.assertIsInstance(GitHub.for_repository(RepositoryRef(GITHUB, self.repo.name)), GitHub)
+
+    def test_real_worker_bootstrap_accepts_native_content_and_refuses_unported_shared_sources(self):
+        root = Path(self.root.name)
+        config = root / "project.toml"
+        config.write_text("""schema_version=2
+[forges.source]
+kind="forgejo"
+url="https://git.example.org"
+[repositories]
+content={forge="source",name="one/Project"}
+roadmap="one/Roadmap"
+[ci]
+backend="github-actions"
+repository="one/Project"
+""")
+        env = os.environ.copy()
+        for key in ("TAUCETI_CONF", "TAUCETI_CONF_SOURCE", "TAUCETI_CONF_SNAPSHOT"):
+            env.pop(key, None)
+        env["XDG_STATE_HOME"] = str(root / "state")
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / "tauceti"), "--conf", str(config), "--help"],
+            env=env,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config.write_text(
+            config.read_text().replace('roadmap="one/Roadmap"', 'roadmap={forge="source",name="one/Roadmap"}')
+        )
+        script = "import tauceti_worker"
+        result = subprocess.run(
+            [sys.executable, "-c", script, "--conf", str(config)],
+            env=env,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Shared roadmap, tool and archive repositories must currently use GitHub bindings", result.stderr)
+
+    def test_generic_test_doubles_do_not_select_direct_source_by_truthiness(self):
+        cfg = SimpleNamespace(sbcache=Path(self.root.name) / "legacy")
+        state = ReviewState(cfg, Mock())
+        self.assertFalse(state._direct_source)
+        self.assertEqual(state.sbcache, cfg.sbcache)
+
+    def test_revision_context_and_invalidation_races_do_not_entitle_old_reads(self):
+        for revision in ["before", "after"]:
+            with transport.read_context(revision=revision):
+                self.source.issue_comments(12)
+        self.assertEqual(self.api.comments.call_count, 2)
+        self.source.invalidate()
+
+        def fetch(*args):
+            self.source.invalidate()
+            return [self.comment()]
+
+        self.api.comments.side_effect = fetch
+        self.assertIsNone(self.source.issue_comments(12))
+        self.assertEqual(self.source.last_failure.kind, "ReadInvalidated")
+
+    def test_cache_only_reads_answer_from_current_observations_and_never_fetch(self):
+        with self.assertRaises(transport.CacheOnlyMiss), transport.read_context(cache_only=True):
+            self.source.issue_comments(12)
+        self.api.comments.assert_not_called()
+        self.assertEqual(self.source.issue_comments(12), self.source.issue_comments(12))
+        self.assertEqual(self.api.comments.call_count, 1)
+        with transport.read_context(cache_only=True):
+            self.assertEqual(self.source.issue_comments(12)[0]["id"], 7)
+            self.assertTrue(transport.cache_hit())
+            with self.assertRaises(transport.CacheOnlyMiss):
+                self.source.issue_comments(12, fresh=True)
+        self.assertEqual(self.api.comments.call_count, 1)
+
+    def test_shared_cache_only_reads_never_lock_or_fetch_and_respect_revision(self):
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            return ["value"]
+
+        with tempfile.TemporaryDirectory() as shared, patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared):
+            options = dict(identity="i" * 64, ttl=60, generation_scope=["scope"])
+            with transport.read_context(cache_only=True), self.assertRaises(transport.CacheOnlyMiss):
+                transport.shared_read(["key"], fetch, **options)
+            self.assertFalse(calls)
+            self.assertFalse(list(Path(shared).rglob("*.lock")), "a cache-only miss takes no lock")
+            with transport.read_context(revision="r1"):
+                self.assertEqual(transport.shared_read(["key"], fetch, **options), ["value"])
+            with transport.read_context(revision="r1", cache_only=True):
+                self.assertEqual(transport.shared_read(["key"], fetch, **options), ["value"])
+            with transport.read_context(revision="r2", cache_only=True), self.assertRaises(transport.CacheOnlyMiss):
+                transport.shared_read(["key"], fetch, **options)
+            transport.invalidate_shared(["scope"])
+            with transport.read_context(revision="r1", cache_only=True), self.assertRaises(transport.CacheOnlyMiss):
+                transport.shared_read(["key"], fetch, **options)
+            self.assertEqual(len(calls), 1)
+
+    def test_shared_row_update_keeps_age_and_refuses_another_generation(self):
+        with tempfile.TemporaryDirectory() as shared, patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared):
+            options = dict(identity="i" * 64, generation_scope=["scope"])
+            transport.shared_read(["key"], lambda: [1, 2], ttl=60, **options)
+            path = next(Path(shared).rglob("*.json"))
+            saved = json.loads(path.read_text())["time"]
+            self.assertTrue(transport.update_shared(["key"], lambda rows: rows + [3], **options))
+            self.assertEqual(json.loads(path.read_text())["time"], saved)
+            self.assertEqual(transport.shared_read(["key"], lambda: ["refetched"], ttl=60, **options), [1, 2, 3])
+            transport.invalidate_shared(["scope"])
+            self.assertFalse(transport.update_shared(["key"], lambda rows: rows + [4], **options))
+            self.assertFalse(transport.update_shared(["other"], lambda rows: rows, **options))
+
+
+class IncrementalInventory(unittest.TestCase):
+    """A stored listing is refreshed from what changed, not listed again."""
+
+    def setUp(self):
+        from datetime import UTC, datetime
+        from urllib.parse import parse_qsl, urlsplit
+
+        from tauceti_tools.forge import Forgejo
+
+        self.forge = Forge("forgejo", "https://git.example.org")
+        self.repo = RepositoryRef(self.forge, "one/project")
+        self.client = Forgejo(self.forge, token="t" * 8)
+        self.now = time.time()
+        # number -> native state; three listing pages of open PRs, older ones last updated longer ago
+        self.prs = {
+            n: dict(open=True, updated=self.now - 3600 - 60 * (121 - n), head="a" * 40, mergeable=True)
+            for n in range(1, 121)
+        }
+        self.calls = []
+
+        def stamp(value):
+            return datetime.fromtimestamp(value, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def native(n, stat=True):
+            pr = self.prs[n]
+            return {
+                # Forgejo's diff stat, zero under the TauCeti fork's `stat=false`.
+                "additions": 3 if stat else 0,
+                "deletions": 1 if stat else 0,
+                "changed_files": 1 if stat else 0,
+                "number": n,
+                "title": "Proof",
+                "body": "",
+                "html_url": self.repo.pull_url(n),
+                "flow": 0,
+                "state": "open" if pr["open"] else "closed",
+                "merged": False,
+                "draft": False,
+                "mergeable": pr["mergeable"],
+                "user": {"id": 2, "login": "worker"},
+                "head": {
+                    "sha": pr["head"],
+                    "ref": f"roadmap/{n}",
+                    "label": f"roadmap/{n}",
+                    "repo": {
+                        "id": 7,
+                        "name": "project",
+                        "full_name": self.repo.name,
+                        "html_url": self.repo.url,
+                        "owner": {"id": 10, "login": "one"},
+                    },
+                },
+                "labels": [],
+                "updated_at": stamp(pr["updated"]),
+                "pull_request": {"merged": False},
+            }
+
+        def request(method, path, *args, **kwargs):
+            self.calls.append(path)
+            parsed = urlsplit(path)
+            query = dict(parse_qsl(parsed.query))
+            numbers = sorted(self.prs, reverse=True)
+            if parsed.path.endswith("/issues"):
+                wanted = query["state"] == "open"
+                numbers = [n for n in numbers if self.prs[n]["open"] == wanted]
+                if "since" in query:
+                    since = datetime.fromisoformat(query["since"]).timestamp()
+                    numbers = [n for n in numbers if self.prs[n]["updated"] >= since]
+            else:
+                numbers = [n for n in numbers if self.prs[n]["open"]]
+                if query.get("sort") == "recentupdate":
+                    numbers.sort(key=lambda n: self.prs[n]["updated"], reverse=True)
+            page, limit = int(query["page"]), int(query["limit"])
+            stat = query.get("stat") != "false"
+            return [native(n, stat) for n in numbers[(page - 1) * limit : page * limit]]
+
+        self.client.request = request
+        self.source = ForgejoReadSource(self.repo, self.client)
+
+    def numbers(self, inventory):
+        return [row["number"] for row in inventory["rows"]]
+
+    def test_a_refresh_reads_closures_changes_and_one_page_instead_of_the_whole_listing(self):
+        full = self.source.inventory(None)
+        self.assertEqual(self.numbers(full), list(range(120, 0, -1)))
+        self.assertEqual(full["sweep"], 1)
+        self.assertLess(full["since"], self.now - 3660)
+        self.assertEqual(len(self.calls), 4, "three pages and the empty page that ends them")
+        self.calls.clear()
+        self.prs[5].update(updated=time.time(), head="b" * 40)
+        self.prs[7].update(updated=time.time(), open=False)
+        refreshed = self.source.inventory(full)
+        self.assertNotIn(7, self.numbers(refreshed))
+        self.assertEqual(next(r for r in refreshed["rows"] if r["number"] == 5)["headRefOid"], "b" * 40)
+        self.assertEqual(self.numbers(refreshed), sorted(self.numbers(refreshed), reverse=True))
+        self.assertEqual(refreshed["sweep"], 2)
+        self.assertGreater(refreshed["since"], full["since"])
+        self.assertEqual(
+            [path.split("?")[0].rsplit("/", 1)[1] for path in self.calls], ["issues", "issues", "pulls", "pulls"]
+        )
+        self.assertEqual(sum("sort=recentupdate" in path for path in self.calls), 1)
+
+    def test_listings_ask_forgejo_to_skip_the_diff_stat(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        def stat(path):
+            return parse_qs(urlsplit(path).query).get("stat")
+
+        full = self.source.inventory(None)
+        self.source.inventory(full)
+        pulls = [path for path in self.calls if urlsplit(path).path.endswith("/pulls")]
+        self.assertEqual(len(pulls), 6, "the full listing's four pages and the refresh's two")
+        self.assertTrue(all(stat(path) == ["false"] for path in pulls), pulls)
+        self.assertTrue(all(stat(path) is None for path in self.calls if path not in pulls))
+
+        # A projection that reads the diff stat keeps it; one that does not drops it.
+        self.assertIs(self.source._fields_reader(["number", "additions"]), self.source.reader)
+        self.assertIs(self.source._fields_reader(None), self.source.reader)
+        self.calls.clear()
+        rows = self.source._fields_reader(["number", "title"]).pulls(self.repo, ["number", "title"], state="open")
+        self.assertEqual(len(rows), 120)
+        self.assertTrue(self.calls and all(stat(path) == ["false"] for path in self.calls))
+        self.assertFalse([path for path in self.calls if "/files" in path or "/git/refs" in path], "no stat recovery")
+        self.calls.clear()
+        rows = self.source._fields_reader(["number", "additions"]).pulls(
+            self.repo, ["number", "additions"], state="open"
+        )
+        self.assertEqual({row["additions"] for row in rows}, {3})
+        self.assertTrue(self.calls and all(stat(path) is None for path in self.calls))
+
+    def test_the_sweep_sees_unmoved_changes_and_drops_closures_the_index_missed(self):
+        inventory = self.source.inventory(None)
+        self.prs[15]["mergeable"] = False  # on the last page; its update time does not move
+        self.prs[60]["open"] = False  # closed without a newer update, so the closed feed misses it
+        for sweep in (1, 2):
+            self.assertEqual(inventory["sweep"], sweep)
+            inventory = self.source.inventory(inventory)
+            self.assertEqual(next(r for r in inventory["rows"] if r["number"] == 15)["mergeable"], "MERGEABLE")
+        inventory = self.source.inventory(inventory)
+        self.assertEqual(next(r for r in inventory["rows"] if r["number"] == 15)["mergeable"], "UNKNOWN")
+        self.assertIn(60, self.numbers(inventory), "absence from one page proves nothing")
+        self.calls.clear()
+        inventory = self.source.inventory(inventory)  # page 4 is empty: the sweep comes round
+        self.assertEqual(inventory["sweep"], 1)
+        self.assertNotIn(60, self.numbers(inventory))
+        self.assertEqual(len(self.numbers(inventory)), 119)
+        self.assertEqual(sum("state=open" in path and "/issues" in path for path in self.calls), 4)
+
+    def test_an_unusable_base_lists_in_full_and_a_failed_refresh_is_unavailable(self):
+        for previous in (
+            None,
+            [],
+            {"rows": []},
+            {"rows": [], "since": None, "sweep": 1},
+            {"rows": {}, "since": 1.0, "sweep": 1},
+        ):
+            self.calls.clear()
+            self.assertEqual(len(self.source.inventory(previous)["rows"]), 120)
+            self.assertNotIn("issues", " ".join(self.calls))
+        full = self.source.inventory(None)
+        from tauceti_worker import forgejo_reads
+
+        request = self.client.request
+        self.client.request = Mock(side_effect=ForgeError("busy", status=502))
+        with patch.dict(forgejo_reads._page_retrying.__kwdefaults__, sleep=lambda _: None):
+            self.assertIsNone(self.source.inventory(full))
+        self.assertEqual(self.client.request.call_count, 3, "one retried page; no full listing behind it")
+        self.assertEqual((self.source.last_failure.operation, self.source.last_failure.status), ("open_inventory", 502))
+
+        def rejecting(method, path, *args, **kwargs):
+            if "/issues?" in path:
+                raise ForgeError("unprocessable", status=422)
+            return request(method, path, *args, **kwargs)
+
+        # A refresh the server rejects would fail every time, so it lists in full instead.
+        self.client.request = rejecting
+        self.calls.clear()
+        self.assertEqual(len(self.source.inventory(full)["rows"]), 120)
+        self.assertEqual(sum("/pulls?" in path and "sort" not in path for path in self.calls), 4)
+
+
+class ListingWithoutStat(unittest.TestCase):
+    def test_only_pull_listings_gain_stat_false(self):
+        from tauceti_tools.forge import Forgejo
+
+        from tauceti_worker.forgejo_reads import _page_retrying, needs_stat, without_listing_stat
+
+        client = Forgejo(Forge("forgejo", "https://git.example.org"), token="t" * 8)
+        calls = []
+        client.request = lambda method, path, *args, **kwargs: calls.append((method, path)) or []
+        view = without_listing_stat(_page_retrying(client))
+        self.assertEqual(list(view.pages("repos/one/project/pulls?state=open")), [])
+        view.request("GET", "/repos/one/project/pulls")
+        view.request("GET", "repos/one/project/pulls?stat=true")
+        view.request("GET", "repos/one/project/pulls/7")
+        view.request("GET", "repos/one/project/issues?type=pulls")
+        view.request("POST", "repos/one/project/pulls")
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "repos/one/project/pulls?state=open&limit=50&page=1&stat=false"),
+                ("GET", "/repos/one/project/pulls?stat=false"),
+                ("GET", "repos/one/project/pulls?stat=true"),
+                ("GET", "repos/one/project/pulls/7"),
+                ("GET", "repos/one/project/issues?type=pulls"),
+                ("POST", "repos/one/project/pulls"),
+            ],
+        )
+        calls.clear()
+        client.request("GET", "repos/one/project/pulls")
+        self.assertEqual(calls, [("GET", "repos/one/project/pulls")], "the client itself is unchanged")
+        double = Mock()
+        self.assertIs(without_listing_stat(double), double, "other clients pass through unchanged")
+        self.assertTrue(needs_stat(None))
+        self.assertTrue(needs_stat(["number", "files"]))
+        self.assertFalse(needs_stat(["number", "headRefOid", "statusCheckRollup"]))
+
+
+class ListingPageRetries(unittest.TestCase):
+    def setUp(self):
+        from tauceti_tools.forge import Forgejo
+
+        self.forge = Forge("forgejo", "https://git.example.org")
+        self.client = Forgejo(self.forge, token="t" * 8)
+        self.calls = []
+
+    def respond(self, failures):
+        def request(method, path, *args, **kwargs):
+            self.calls.append((method, path))
+            if failures:
+                raise failures.pop(0)
+            return []
+
+        self.client.request = request
+
+    def test_transient_page_failures_retry_that_page_only(self):
+        from tauceti_worker.forgejo_reads import _page_retrying
+
+        self.respond([ForgeError("gateway", status=502), ForgeError("transport")])
+        sleeps = []
+        view = _page_retrying(self.client, sleep=sleeps.append)
+        self.assertEqual(list(view.pages("repos/one/project/pulls?state=open")), [])
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(set(self.calls)), 1, "the same page is requested again")
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_permanent_malformed_and_exhausted_failures_still_fail(self):
+        from tauceti_worker.forgejo_reads import _page_retrying
+
+        for failures, attempts in [
+            ([ForgeError("missing", status=404)], 1),
+            ([Incomplete("not an array")], 1),
+            ([ForgeError("busy", status=503) for _ in range(3)], 3),
+        ]:
+            self.calls.clear()
+            self.respond(list(failures))
+            with self.assertRaises(ForgeError):
+                list(_page_retrying(self.client, sleep=lambda _: None).pages("repos/one/project/pulls"))
+            self.assertEqual(len(self.calls), attempts)
+        self.respond([ForgeError("busy", status=503)])
+        with self.assertRaises(ForgeError):
+            _page_retrying(self.client, sleep=lambda _: None).request("POST", "repos/one/project/issues")
+        double = Mock()
+        self.assertIs(_page_retrying(double), double, "other clients pass through unchanged")
+
+
+if __name__ == "__main__":
+    # All real installations and credential files stay outside this harness.
+    with patch.dict(
+        os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://must-not-contact.example", "GH_TOKEN": "github-sentinel"}
+    ):
+        unittest.main()

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Structured Codex/Claude events become readable, bounded transcripts."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 from pathlib import Path
@@ -22,6 +25,20 @@ def check(name, condition):
 
 def event(renderer, value):
     return renderer.render_line(json.dumps(value, ensure_ascii=False) + "\n")
+
+
+# Captured from Claude 2.1.316 against a local API returning a credit-balance 400.
+# The assistant is synthetic and the final subtype says "success", despite exit 1.
+credit = tc.AgentTranscriptRenderer("claude")
+credit_out = "".join(
+    credit.render_line(line)
+    for line in (REPO / "tests/fixtures/claude_credit_refusal_2_1_316.jsonl").read_text().splitlines(keepends=True)
+)
+check("synthetic credit refusal remains visible", "Credit balance is too low" in credit_out)
+check("synthetic refusal is not structured work", not credit.saw_work)
+check(
+    "credit refusal has terminal HTTP evidence", credit.terminal_failure_final and "400" in credit.terminal_failure_text
+)
 
 
 # Captured from a real Codex 0.146 `exec --json` smoke call. Replaying the provider output guards the

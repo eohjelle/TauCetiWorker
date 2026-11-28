@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import signal
 
 TAUCETI = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
 BASE_BRANCH = os.environ.get("TAUCETI_BASE_BRANCH", "main")
@@ -32,11 +33,21 @@ MAX_FIX_ATTEMPTS = 6  # per-head: stop re-running the fixer on a commit it can't
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
 # still blocking). The worker no longer caps its own review rounds — it keeps reviewing on every new
 # head until the PR merges or CI closes it — so every PR reaches a terminal state.
+# Per PR and host: once review has sent this many other heads of a PR back for a fix, the fleet
+# closes the PR if it maintains it (its own, or an adopted Forgejo author's) and otherwise stops
+# offering it fix rounds. An approved PR leaves the fix stage for the queue, so the count only grows
+# while review keeps asking for changes.
+MAX_FIX_ROUNDS_WITHOUT_APPROVAL = 6
 MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an attempt back before
 # the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
 # retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
-# matched the transient patterns, an uncapped refund would retry it until a human noticed.
-MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without completing a review
+# matched the transient patterns, an uncapped refund would retry it forever.
+# Per PR and host: review rounds that ERROR without completing a review (the engine can't produce a
+# review at all) are retried with a back-off of REVIEW_ERROR_BACKOFF_S, doubling after each further
+# error. At MAX_REVIEW_ERRORS the fleet closes the PR if it maintains it (its own, or an adopted
+# Forgejo author's) and otherwise stops offering it review rounds. A completed review resets the count.
+MAX_REVIEW_ERRORS = 6
+REVIEW_ERROR_BACKOFF_S = 60 * 60
 
 # The tauceti-review engine's exit status for "I stopped because the provider is unusable, and I
 # posted nothing" (TauCetiReview `runner/review.py: PROVIDER_DOWN_EXIT`). It is a separate status
@@ -51,7 +62,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "2d7bd8b7636560a50acf1b419761186f247009b9")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "ddaaed27a70d9f376d300edf32d521843c27cc16")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -72,9 +83,6 @@ PROGRESS_TOOL_TAIL = 20
 # message at its full length. Wide enough for a traceback's last line, which is the one that matters.
 PROGRESS_TOOL_LINE = 500
 
-# (the engine can't produce a review at all), stop retrying and ESCALATE —
-# a loud per-round warning + a tracking issue — since a PR that can never be
-# reviewed neither merges nor reaches CI's round cap, so a human must step in.
 MAX_REVIEW_CONTESTS = 10  # per-PR lifetime cap on author-contest re-reviews (no-bar: anyone may
 
 # reply, so this bounds spend; separate from the review-round budget)
@@ -84,6 +92,11 @@ MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't s
 # reviewable head (or an author contest) for twenty minutes. After that the unit returns to the shared
 # fleet queue. Fixed fleet policy rather than an operator knob: reviewers must agree on the same grace.
 REVIEW_AFFINITY_GRACE_S = 20 * 60
+
+# Build affinity (build_affinity.py): a worker on the host that already built a PR gets first refusal
+# on its next fix, fix-ci or rebase round for ten minutes, so the round starts from that worker's warm
+# Lake store. Ten minutes keeps about two thirds of the decision 210 warm-start gain at a bounded delay.
+FIX_AFFINITY_GRACE_S = 10 * 60
 
 # Review candidates are drawn by an age-weighted lottery. One hour of waiting adds one unit of weight;
 # cap at one day so old work is strongly preferred without making every worker converge deterministically
@@ -121,7 +134,7 @@ LINT_REPAIR_HEAD_PREFIX = "lint-repair/"
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
 # are open.
-MAX_OPEN_PRS = 8
+MAX_OPEN_PRS = 32
 
 # The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
 # The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
@@ -144,16 +157,32 @@ STATUS_LABELS = (
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
-ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "10800"))  # 3-hour hard cap per round
+# Hard safety cap per round, against a hung agent or tool: the loop kills the round's whole process
+# group and abandons it (nothing is checkpointed or continued). Work, including verification, is
+# expected to finish inside the round, so this is set far above any healthy round, not as a budget.
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 
-INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
+# How long a loop-spawned round waits for its worker's round.lock before giving up without failure.
+# Another worker's round briefly holds it while removing this worker's leftover worktree, and a round
+# of a restarted loop can still be finishing.
+ROUND_LOCK_WAIT = int(os.environ.get("TAUCETI_ROUND_LOCK_WAIT", "120"))
+
+# Min gap after a PRODUCTIVE round. Short: the next round's own selection, claims and admission
+# already pace the loop; decision 210 found the old 20 s cost about 50 slot-hours a day.
+INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "2"))
+
+# A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
+# request a graceful restart: the loop exits at its next round boundary, or at once between rounds.
+DRAIN_SIGNAL = signal.SIGUSR1
 
 EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
 EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
-EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
+REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
+REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
+REVIEW_PUBLICATION_SUPERSEDED_EXIT = 87  # Saved paid review superseded by a newer publication
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -165,13 +194,11 @@ BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))  # cap on the es
 # GitHub REST rate-limit handling. We pace LLM quota carefully; GitHub's REST budget needs the same
 # care, or a 403 mid-round throws away the agent's (expensive) work. Two layers:
 #  - gh_run() waits IN PLACE for a rate limit to clear and retries (so a transient limit costs a pause,
-#    not a lost round), bounded by GH_INROUND_WAIT so it can't blow ROUND_TIMEOUT.
+#    not a lost round); only the round's hard cap bounds the wait.
 #  - cmd_loop preflights core budget BEFORE launching a round (no hard cap there) — the right place to
 #    wait out an hourly primary reset, and what keeps us from launching the review engine (whose own
 #    diff fetch would 403) without enough budget to finish.
 GH_MIN_BUDGET = int(os.environ.get("TAUCETI_GH_MIN_BUDGET", "200"))  # core requests a round needs to finish
-
-GH_INROUND_WAIT = int(os.environ.get("TAUCETI_GH_INROUND_WAIT", "900"))  # cap on gh_run's in-place wait (15 min)
 
 GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is given (then exponential)
 
@@ -245,6 +272,24 @@ AGENT_LOG_MAX_BYTES = 256 * 1024**2
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
+# Native source surveys list every open PR once and classify every one of them from the host-shared
+# review-state index (review_state.shared_index_root), reading only the PRs whose (updatedAt, head)
+# the index does not yet describe. One worker refreshes at a time; a peer waits at most this long for
+# the refresh lock before classifying from the index as it stands.
+REFRESH_LOCK_WAIT_S = 900
+# Consecutive failed reads that end a refresh: the source is unavailable, so stop rather than fail
+# once per PR. The next survey continues.
+REFRESH_FAILURE_LIMIT = 3
+# Ambiguous owned mergeability checks per automatic survey. Each is a Git fetch, not a review-state
+# read, so it stays small; explicit `--pr` targets are always checked.
+MERGEABILITY_CHECKS = 4
+
+# How long a native source's discussion and review-thread observation, keyed on the PR's
+# (updatedAt, head), may answer survey triage. Forgejo does not move updatedAt for comment edits or
+# deletions, so this bounds that blind spot. Such reads are `assumed`, never `fresh`; dispatch
+# re-reads the selected PR before acting on it.
+SOURCE_FACTS_TTL = int(os.environ.get("TAUCETI_SOURCE_FACTS_TTL", str(6 * 3600)))
+
 # Agents.
 OPENROUTER_MODELS = {
     "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek/deepseek-v4-pro"),
@@ -270,7 +315,7 @@ AUTHORING_DEFAULTS = {
     # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     "codex": ("gpt-6.1-sol", "high"),
-    # Pin Claude authoring, reviews and quota bootstrap to an exact model, not the moving opus alias.
+    # Pin Claude authoring and reviews to an exact model, not the moving opus alias.
     # The review engine must price a new model first, so update TauCetiReview before this default.
     "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled

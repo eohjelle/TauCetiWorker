@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Pooled costs, initiated-PR cohorts, half-credit open output and cached readers."""
+"""Pooled costs, landing windows, measured output and cached readers."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json
@@ -41,11 +44,6 @@ class CostTests(unittest.TestCase):
                 "TAUCETI_FLEET_EVENTS": str(self.root / "worker-events.jsonl"),
             },
         )
-        from tauceti_worker import work_recovery
-
-        recovery_home = patch.object(work_recovery, "HERE", self.root / "worker")
-        recovery_home.start()
-        self.addCleanup(recovery_home.stop)
         env.start()
         self.addCleanup(env.stop)
         with patch.object(a.time, "time", return_value=self.now - 10 * DAY):
@@ -132,6 +130,15 @@ class CostTests(unittest.TestCase):
         a.prepare(now=self.now + 1)
         return a.cached(group="machine")["summary"]
 
+    def test_scope_resolution_scales_with_workers_not_invocations(self):
+        for i in range(120):
+            self.session(f"historical-{i}", 2 * DAY, "author" if i % 2 else "reviewer", "1", settled=True)
+        self.write_ledger()
+        with patch.object(a, "_worker_scope", wraps=a._worker_scope) as lookup:
+            summary = self.summary()
+        self.assertEqual(sorted(call.args[1] for call in lookup.call_args_list), ["author", "reviewer"])
+        self.assertEqual(Decimal(summary["costs"]["windows"]["total"]["spent_usd"]), Decimal(180))
+
     def test_recovered_estimate_uses_recorded_interval_in_spending_windows(self):
         self.session("d" * 32, 2 * DAY, "author", "6", settled=True)
         self.records[-1]["timestamp"] = self.now
@@ -177,31 +184,32 @@ class CostTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             a.display(cached)
-        self.assertIn("1 live; 1 settled estimates (1 recovered); 1 unresolved stopped", output.getvalue())
+        self.assertIn("Accounting: 1 stopped conversation with unresolved usage.", output.getvalue())
+        self.assertNotIn("settled estimates", output.getvalue())
 
-    def test_all_fleet_costs_include_reviews_but_only_initiated_output_counts(self):
+    def test_all_fleet_costs_include_reviews_and_all_prs_landed_in_window(self):
         s = self.summary()
         rows = s["costs"]["windows"]
         self.assertEqual(set(rows), {"24h", "7d", "total"})
         self.assertEqual(Decimal(rows["total"]["spent_usd"]), Decimal(60))
         self.assertEqual(Decimal(rows["total"]["active_accrued_usd"]), 0)
         self.assertEqual(Decimal(rows["total"]["unresolved_stopped_usd"]), Decimal(40))
-        self.assertEqual(Decimal(rows["total"]["weighted_loc"]), Decimal(650))
-        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 650)
-        # An old PR landing yesterday does not enter the seven-day initiation cohort.
+        self.assertEqual(Decimal(rows["total"]["landed_loc"]), Decimal(300))
+        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 300)
+        # An older PR landing today enters both the seven-day and 24-hour windows.
         self.assertEqual(Decimal(rows["7d"]["estimated_usd"]), Decimal(90))
-        self.assertEqual(Decimal(rows["7d"]["weighted_loc"]), Decimal(350))
-        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal(90) / 350)
+        self.assertEqual(Decimal(rows["7d"]["landed_loc"]), Decimal(300))
+        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal(90) / 300)
         self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
         self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
         self.assertIn("All time", output.getvalue())
         self.assertIn("7 days", output.getvalue())
-        self.assertIn("$0.1538", output.getvalue())
-        self.assertIn("$0.2571", output.getvalue())
+        self.assertIn("$0.3333", output.getvalue())
+        self.assertIn("$0.3000", output.getvalue())
 
-    def test_24h_costs_use_all_conversations_but_only_prs_opened_in_window(self):
+    def test_24h_costs_use_all_conversations_and_prs_landed_in_window(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute(
                 "INSERT INTO prs VALUES ('org/repo',6,'author','machine',?,'OPEN',NULL,?,?,'head',NULL)",
@@ -211,10 +219,35 @@ class CostTests(unittest.TestCase):
         summary = self.summary()
         row = summary["costs"]["windows"]["24h"]
         self.assertEqual(Decimal(row["estimated_usd"]), 90)  # Includes the review of another author's PR.
-        self.assertEqual(row["open_prs"], 1)
-        self.assertEqual(row["landed_prs"], 0)  # Older PRs landing today do not enter this cohort.
-        self.assertEqual(Decimal(row["weighted_loc"]), 40)
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("2.25"))
+        self.assertNotIn("open_prs", row)
+        self.assertEqual(row["landed_prs"], 2)  # Both older PRs landed today.
+        self.assertEqual(Decimal(row["landed_loc"]), 300)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.3"))
+
+    def test_landing_windows_ignore_creation_time_and_exclude_future_landings(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET created=? WHERE number=1", (self.now - 30 * DAY,))
+            db.execute("UPDATE prs SET landed=? WHERE number=1", (self.now - 3600,))
+            db.execute("UPDATE meta SET value=? WHERE key='history_cutoff'", (str(self.now - 60),))
+            db.execute("UPDATE prs SET landed=? WHERE number=2", (self.now - 8 * DAY,))
+            db.execute("UPDATE prs SET landed=? WHERE number=5", (self.now + DAY,))
+        s = self.summary()
+        for window in ("24h", "7d"):
+            row = s["costs"]["windows"][window]
+            self.assertEqual(row["landed_prs"], 1)
+            self.assertEqual(row["landed_loc_added"], 100)
+        self.assertEqual(s["costs"]["windows"]["total"]["landed_loc_added"], 300)
+        self.assertEqual(s["costs"]["windows"]["total"]["known_loc_prs"], 2)
+
+    def test_landed_output_preserves_worker_and_machine_attribution(self):
+        self.summary()
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET worker='other',scope='other-machine' WHERE number=1")
+            author = a._summary(db, self.now + 1, "worker", "author")
+            machine = a._summary(db, self.now + 1, "scope", "machine")
+        for s in (author, machine):
+            self.assertEqual(s["costs"]["windows"]["24h"]["landed_loc_added"], 200)
+            self.assertEqual(s["costs"]["windows"]["total"]["landed_prs"], 1)
 
     def test_cost_breakdown_is_additive_and_total_is_last(self):
         summary = self.summary()
@@ -234,6 +267,17 @@ class CostTests(unittest.TestCase):
         self.assertIn("recovered_estimates_usd", summary["costs"]["windows"]["24h"])
         lines = output.getvalue().splitlines()
         self.assertEqual(lines[lines.index(rows[-1]) + 1], "")
+
+    def test_zero_stopped_usage_is_hidden_but_unknown_or_nonzero_usage_is_visible(self):
+        summary = self.summary()
+        for value, visible in (("0", False), ("0.0001", True), (None, True)):
+            with self.subTest(value=value):
+                for row in summary["costs"]["windows"].values():
+                    row["unresolved_stopped_usd"] = "0"
+                summary["costs"]["windows"]["24h"]["unresolved_stopped_usd"] = value
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    a.display(dict(available=True, summary=summary))
+                self.assertEqual("API cost: stopped usage estimate" in output.getvalue(), visible)
 
     def test_old_prepared_windows_still_display_and_combine_without_io(self):
         summary = self.summary()
@@ -260,15 +304,15 @@ class CostTests(unittest.TestCase):
         for line in output.getvalue().splitlines():
             if line.startswith("Finished rounds"):
                 self.assertNotIn("1h", line)
-            if line.startswith("Costs / initiated PR output"):
+            if line.startswith("Costs / landed PR output"):
                 self.assertNotIn("24h", line)
 
-    def test_odd_open_LOC_gets_exactly_half_credit(self):
+    def test_open_LOC_does_not_contribute_to_landed_output(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE pr_loc SET added=301 WHERE number=3")
         row = self.summary()["costs"]["windows"]["7d"]
-        self.assertEqual(Decimal(row["weighted_loc"]), Decimal("350.5"))
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal("350.5"))
+        self.assertEqual(Decimal(row["landed_loc"]), Decimal(300))
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal(300))
 
     def test_unchanged_usage_is_cached_and_new_checkpoint_invalidates_it(self):
         self.summary()
@@ -351,7 +395,7 @@ class CostTests(unittest.TestCase):
             )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
-        self.assertIn("Spending (recorded usage)", output.getvalue())
+        self.assertIn("\nSpending ", output.getvalue())
         self.assertIn("API spend ($/elapsed hour)", output.getvalue())
         self.assertIn("Worker-hours recorded", output.getvalue())
         self.assertIn("$17.33", output.getvalue())
@@ -395,6 +439,213 @@ class CostTests(unittest.TestCase):
             db.execute("DELETE FROM rounds")
             rows = activity_costs.summarize(db, self.now, self.now - 10 * DAY, "scope", "machine")["spending"]
             self.assertTrue(all(row["usd_per_worker_hour"] is None for row in rows.values()))
+
+    def test_summary_read_sets_preserve_scope_time_and_estimate_filters(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM cost_accruals")
+            db.execute("DELETE FROM conversation_accounting")
+            for invocation, worker, scope, start, finish, cost, active in (
+                ("point", "author", "machine", -100, -100, "2", 0),
+                ("interval", "author", "machine", -7200, 0, "4", 1),
+                ("recovered", "author", "machine", -50, -50, "3", 0),
+                ("other-worker", "peer", "machine", -100, -100, "8", 0),
+                ("other-scope", "author", "elsewhere", -100, -100, "16", 0),
+                ("old", "author", "machine", -7202, -7201, "64.00000", 0),
+                ("future", "author", "machine", 50, 100, "128", 0),
+                ("missing-end", "author", "machine", -1, None, "256", 0),
+                (None, "author", "machine", -5, -5, "1", 0),
+            ):
+                db.execute(
+                    "INSERT INTO cost_accruals VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        invocation,
+                        worker,
+                        scope,
+                        self.now + start,
+                        self.now + finish if finish is not None else None,
+                        cost,
+                        "native-allocated",
+                        active,
+                    ),
+                )
+            for invocation, settled, recovered in (("point", 1, 0), ("recovered", 1, 1), ("other-worker", 1, 2)):
+                db.execute(
+                    "INSERT INTO conversation_accounting VALUES (?, 'author', 'machine', 0, ?, ?, 0)",
+                    (invocation, settled, recovered),
+                )
+            db.execute("INSERT INTO conversation_accounting VALUES (NULL, 'author', 'machine', 0, 1, 1, 0)")
+            for column, identity, completed, total, estimated in (
+                ("scope", "machine", 14, 16, 13),
+                ("worker", "author", 22, 24, 5),
+                (None, None, 30, 32, 13),
+            ):
+                for history in (3600, 8 * DAY):
+                    value = activity_costs.summarize(db, self.now, self.now - history, column, identity)
+                    for key, window in value["windows"].items():
+                        wider = history > 3600 and key != "1h"
+                        spent = f"{completed + 64}.00000" if wider else str(completed)
+                        combined = f"{total + 66}.00000" if wider else str(total)
+                        self.assertEqual(Decimal(window["spent_usd"]), Decimal(spent))
+                        self.assertEqual(Decimal(window["active_accrued_usd"]), Decimal("4" if wider else "2"))
+                        self.assertEqual(Decimal(window["estimated_usd"]), Decimal(combined))
+                        self.assertEqual(Decimal(window["settled_estimates_usd"]), Decimal(estimated))
+                        self.assertEqual(Decimal(window["recovered_estimates_usd"]), 3)
+                    for key, window in value["spending"].items():
+                        expected = f"{total + 66}.00000" if history > 3600 and key != "1h" else str(total)
+                        self.assertEqual(Decimal(window["spent_usd"]), Decimal(expected))
+
+    def test_unchanged_preparation_does_not_rewrite_derived_rows(self):
+        with contextlib.closing(a._connect()) as db, db:
+
+            def scope(worker):
+                return a._worker_scope(db, worker)
+
+            activity_costs.prepare(db, self.now, scope)
+            before = db.total_changes
+            activity_costs.prepare(db, self.now, scope)
+            # Only the ordinary funding metadata is replaced. The ledger and
+            # active usage are checked, with no derived table rewrites.
+            self.assertEqual(db.total_changes - before, 1)
+
+    def test_activity_replays_only_appended_transactions_without_admission_lock(self):
+        from tauceti_worker.budget import Budget
+
+        with contextlib.closing(a._connect()) as db, db:
+            with patch.object(Budget, "locked", side_effect=AssertionError("reporting cannot own admission lock")):
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                funding = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+                self.assertEqual(funding["preparation_metrics"]["replayed_bytes"], 0)
+                event = dict(
+                    version=1, seq=len(self.records) + 1, timestamp=self.now, events=[dict(type="grant", delta="1")]
+                )
+                raw = (json.dumps(event) + "\n").encode()
+                with (self.root / "budget/events.jsonl").open("ab") as stream:
+                    stream.write(raw)
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                updated = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+                self.assertEqual(updated["preparation_metrics"]["replayed_bytes"], len(raw))
+                self.assertEqual(Decimal(updated["balance"]), Decimal(funding["balance"]) + 1)
+        self.assertNotEqual(
+            self.root / "activity/cost-accounting/projection.sqlite", self.root / "budget/projection.sqlite"
+        )
+
+    def test_reporting_ignores_torn_final_transaction_then_recovers_it(self):
+        with contextlib.closing(a._connect()) as db, db:
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            before = db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0]
+            event = dict(
+                version=1, seq=len(self.records) + 1, timestamp=self.now, events=[dict(type="grant", delta="5")]
+            )
+            raw = json.dumps(event).encode()
+            ledger = self.root / "budget/events.jsonl"
+            with ledger.open("ab") as stream:
+                stream.write(raw[:20])
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            partial = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+            self.assertEqual(partial["balance"], json.loads(before)["balance"])
+            self.assertEqual(partial["preparation_metrics"]["replayed_bytes"], 0)
+            with ledger.open("ab") as stream:
+                stream.write(raw[20:] + b"\n")
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            after = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+            self.assertEqual(Decimal(after["balance"]), Decimal(partial["balance"]) + 5)
+
+    def test_corrupt_reporting_projection_rebuilds_without_touching_ledger(self):
+        with contextlib.closing(a._connect()) as db, db:
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            ledger = self.root / "budget/events.jsonl"
+            original = ledger.read_bytes()
+            projection = self.root / "activity/cost-accounting/projection.sqlite"
+            projection.write_bytes(b"corrupt disposable cache")
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            funding = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+            self.assertTrue(funding["preparation_metrics"]["rebuilt"])
+            self.assertEqual(ledger.read_bytes(), original)
+
+    def test_prefix_sums_preserve_small_payments_at_timestamp_ties(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM cost_accruals")
+            for identity, cost in (
+                ("z-big", "1.000000000000000000000000000"),
+                ("a-small", "0.0000000000000000000000000004"),
+                ("b-small", "0.0000000000000000000000000004"),
+            ):
+                db.execute(
+                    "INSERT INTO cost_accruals VALUES (?, 'author', 'machine', ?, ?, ?, 'native-allocated', 0)",
+                    (identity, self.now - 100, self.now - 100, cost),
+                )
+            for column, identity in ((None, None), ("worker", "author"), ("scope", "machine")):
+                value = activity_costs.summarize(db, self.now, self.now - 3600, column, identity)
+                self.assertEqual(value["windows"]["total"]["spent_usd"], "1.000000000000000000000000001")
+
+    def test_summary_indexes_cover_queries_after_legacy_upgrade(self):
+        for upgrade in (False, True):
+            if upgrade:
+                with contextlib.closing(a._connect()) as db, db:
+                    for name in (
+                        "round_worker_covering",
+                        "round_scope_covering",
+                        "round_finish_covering",
+                        "quality_worker",
+                        "accounting_worker",
+                        "accounting_estimates",
+                    ):
+                        db.execute(f"DROP INDEX IF EXISTS {name}")
+                    db.execute("CREATE INDEX round_worker ON rounds(worker,finished)")
+                    db.execute("CREATE INDEX round_scope ON rounds(scope,finished)")
+                    db.execute("CREATE INDEX round_finish ON rounds(finished,kind)")
+            with contextlib.closing(a._connect()) as db:
+                for name in ("round_worker", "round_scope", "round_finish"):
+                    self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name=?", (name,)).fetchone())
+                statements = []
+                db.set_trace_callback(statements.append)
+                a._summary(db, self.now, "worker", "author")
+                db.set_trace_callback(None)
+                for query in statements:
+                    self.assertNotIn("SELECT kind,COUNT(*)", query)
+                    self.assertNotIn("SELECT id,settled_estimates,recovered_estimates", query)
+                for column, identity in (("worker", "author"), ("scope", "machine"), (None, None)):
+                    a._summary(db, self.now + 60, column, identity)
+                    statements = []
+                    db.set_trace_callback(statements.append)
+                    a._summary(db, self.now + 120, column, identity)
+                    db.set_trace_callback(None)
+                    queries = [q for q in statements if "FROM report_events WHERE at" in q]
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any("report_event_time" in line for line in plan), plan)
+                        self.assertIn("AND at", query)  # Existing cursors never rescan the prefix.
+                    queries = [q for q in statements if "SELECT COALESCE(started,finished) FROM rounds" in q]
+                    self.assertTrue(queries)
+                    index = "report_rounds_" + (column or "all") + "_first"
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any(index in line for line in plan), plan)
+
+    def test_replacement_ledger_removes_old_prepared_sessions(self):
+        tables = ("conversation_costs", "cost_accruals", "conversation_accounting", "conversation_quality")
+        with contextlib.closing(a._connect()) as db, db:
+            for remaining in ("replacement", None):
+                self.records = []
+                self.record(self.now - 30, dict(type="grant", delta="1000"))
+                if remaining:
+                    self.session(remaining, 10, "author", "7", settled=True)
+                self.write_ledger()
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                with contextlib.closing(sqlite3.connect(":memory:")) as fresh:
+                    fresh.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+                    activity_costs.install(fresh)
+                    activity_costs.prepare(fresh, self.now, lambda worker: "machine")
+                    for table in tables:
+                        self.assertEqual(
+                            {row[0] for row in db.execute(f"SELECT id FROM {table}")},
+                            {remaining} if remaining else set(),
+                        )
+                        self.assertEqual(
+                            [tuple(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY rowid")],
+                            fresh.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall(),
+                        )
 
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()
@@ -450,21 +701,21 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(spending["7d"]["spent_usd"]), 90)
         self.assertEqual(Decimal(spending["total"]["spent_usd"]), 105)
 
-    def test_missing_or_changed_head_LOC_is_extrapolated_with_half_weight_open_prs(self):
+    def test_missing_or_changed_landed_head_LOC_is_extrapolated(self):
         with contextlib.closing(a._connect()) as db, db:
-            db.execute("UPDATE prs SET head='new-head' WHERE number=3")
+            db.execute("UPDATE prs SET head='new-head' WHERE number=2")
         rows = self.summary()["costs"]["windows"]
-        self.assertEqual(Decimal(rows["total"]["measured_weighted_loc"]), 500)
-        self.assertEqual(Decimal(rows["total"]["weighted_loc"]), 600)
-        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 600)
-        self.assertEqual(Decimal(rows["7d"]["weighted_loc"]), 300)
-        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal("0.3"))
+        self.assertEqual(Decimal(rows["total"]["landed_loc_added"]), 100)
+        self.assertEqual(Decimal(rows["total"]["landed_loc"]), 200)
+        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 200)
+        self.assertEqual(Decimal(rows["7d"]["landed_loc"]), 200)
+        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal("0.45"))
         self.assertEqual(rows["7d"]["missing_loc_prs"], 1)
         self.assertTrue(rows["7d"]["loc_estimated"])
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=self.summary()))
-        self.assertIn("~$0.1667", output.getvalue())
-        self.assertIn("~$0.3000", output.getvalue())
+        self.assertIn("~$0.5000", output.getvalue())
+        self.assertIn("~$0.4500", output.getvalue())
         self.assertIn("~ Missing LOC estimated", output.getvalue())
 
     def test_missing_all_LOC_keeps_rate_visible_without_inventing_output(self):
@@ -472,24 +723,24 @@ class CostTests(unittest.TestCase):
             db.execute("DELETE FROM pr_loc")
         s = self.summary()
         for row in s["costs"]["windows"].values():
-            self.assertEqual(Decimal(row["weighted_loc"]), 0)
+            self.assertEqual(Decimal(row["landed_loc"]), 0)
             self.assertEqual(row["usd_per_loc"], "Infinity")
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
-        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
-        self.assertEqual(rate.count("~$∞"), 2)
+        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / landed LOC"))
+        self.assertEqual(rate.count("~$∞"), 3)
 
     def test_unknown_pr_state_contributes_zero_without_hiding_rate(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET state=NULL WHERE number=3")
         row = self.summary()["costs"]["windows"]["7d"]
-        self.assertTrue(row["loc_estimated"])
-        self.assertEqual(Decimal(row["weighted_loc"]), 200)
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.45"))
+        self.assertFalse(row["loc_estimated"])
+        self.assertEqual(Decimal(row["landed_loc"]), 300)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.3"))
 
     def test_partial_fleet_estimate_pools_measurements_before_dividing(self):
         with contextlib.closing(a._connect()) as db, db:
-            db.execute("UPDATE prs SET head='new-head' WHERE number=3")
+            db.execute("UPDATE prs SET head='new-head' WHERE number=2")
         s = self.summary()
         other = json.loads(json.dumps(s))
         for row in other["costs"]["windows"].values():
@@ -505,33 +756,45 @@ class CostTests(unittest.TestCase):
             )
         combined = activity_summary.combine([dict(available=True, summary=s), dict(available=True, summary=other)])
         row = combined["summary"]["costs"]["windows"]["total"]
-        self.assertEqual(Decimal(row["weighted_loc"]), 800)  # 700 measured LOC * 4 / 3.5
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.15"))
+        self.assertEqual(Decimal(row["landed_loc"]), 450)  # 300 measured LOC * 3 / 2
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(120) / 450)
         self.assertTrue(row["loc_estimated"])
 
-    def test_old_prepared_summary_gets_numeric_fallback_without_refresh(self):
+    def test_old_prepared_summary_cannot_be_relabelled_as_landed_output(self):
         s = self.summary()
         for row in s["costs"]["windows"].values():
-            for key in ("loc_estimated", "measured_pr_weight"):
-                row.pop(key)
-            row.update(usd_per_loc=None, missing_loc_prs=1, known_loc_prs=3)
+            row.pop("loc_basis")
         with (
             patch.object(a, "_connect", side_effect=AssertionError("SQL in status")),
             patch.object(a, "observe", side_effect=AssertionError("network in status")),
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             a.display(dict(available=True, summary=s))
-        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
-        self.assertEqual(rate.count("~$"), 3)
-        self.assertNotIn("—", rate)
+        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / landed LOC"))
+        self.assertEqual(rate.count("—"), 3)
+        self.assertIn("older summaries", output.getvalue())
+        modern = self.summary()
+        combined = activity_summary.combine([dict(available=True, summary=modern), dict(available=True, summary=s)])
+        self.assertTrue(all(r["usd_per_loc"] is None for r in combined["summary"]["costs"]["windows"].values()))
+
+    def test_missing_host_preserves_known_landed_loc_without_inventing_costs(self):
+        s = self.summary()
+        combined = activity_summary.combine([dict(available=True, summary=s), dict(available=False)])
+        for row in combined["summary"]["costs"]["windows"].values():
+            self.assertEqual(row["loc_basis"], "landed_at")
+            self.assertEqual(Decimal(row["landed_loc"]), 300)
+            self.assertIsNone(row["usd_per_loc"])
+        self.assertIn("Some hosts have no prepared activity", combined["errors"])
 
     def test_zero_output_and_failed_ledger_are_not_zero_dollars_per_LOC(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET state='CLOSED',landed=NULL")
         self.assertEqual(self.summary()["costs"]["windows"]["total"]["usd_per_loc"], "Infinity")
-        self.assertEqual(activity_summary.loc_estimate(dict(estimated_usd="0"))["usd_per_loc"], "0")
+        self.assertEqual(
+            activity_summary.loc_estimate(dict(estimated_usd="0", loc_basis="landed_at"))["usd_per_loc"], "0"
+        )
         p = self.root / "budget/events.jsonl"
-        p.write_text(p.read_text() + '{"torn":')
+        p.write_text(p.read_text() + '{"invalid":true}\n')
         s = self.summary()
         self.assertIsNone(s["costs"]["windows"]["total"]["spent_usd"])
         self.assertTrue(all(r["usd_per_hour"] is None for r in s["costs"]["spending"].values()))
@@ -571,15 +834,18 @@ class CostTests(unittest.TestCase):
         ):
             s = self.summary()
         self.assertEqual(s["unknown_landings"], 0)
-        self.assertEqual(s["costs"]["windows"]["7d"]["landed_loc_added"], 10200)
-        self.assertEqual(Decimal(s["costs"]["windows"]["7d"]["weighted_loc"]), 10350)
+        self.assertEqual(s["costs"]["windows"]["7d"]["landed_loc_added"], 10300)
+        self.assertEqual(Decimal(s["costs"]["windows"]["7d"]["landed_loc"]), 10300)
 
     def test_native_and_compatibility_review_receipts_are_not_double_counted(self):
         # Clear the direct fixture receipt so just the dual-written review remains.
         self.summary()
         with contextlib.closing(a._connect()) as db, db:
             db.execute("DELETE FROM pr_contributions")
-        fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
+        # At the fixture's time: a receipt later than `summary()`'s clock is deferred, and on a slow
+        # runner the wall clock passes it before this line.
+        with patch.object(fleet_events.time, "time", return_value=self.now):
+            fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
         s = self.summary()
         self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
         self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)
@@ -593,7 +859,7 @@ class CostTests(unittest.TestCase):
             row.update(spent_usd="0", pending_usd="0", estimated_usd="0", landed_loc_added=1000, open_loc_added=0)
         v = activity_summary.combine([dict(available=True, summary=s), dict(available=True, summary=other)])
         row = v["summary"]["costs"]["windows"]["total"]
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(100) / 1650)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(100) / 1300)
 
     def test_CI_history_is_local_incremental_and_accepts_late_receipts(self):
         p = self.root / "ci.sqlite"

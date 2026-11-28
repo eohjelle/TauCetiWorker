@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Compose-style SIGTERM tears down the active round before the loop exits 143."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
+import faulthandler
+import os
 import signal
 import subprocess
 import sys
@@ -25,6 +30,8 @@ def child(started: Path, cleaned: Path) -> int:
 
 
 def driver(started: Path, cleaned: Path) -> int:
+    # If the round child never starts, show where the driver is stuck before the parent gives up.
+    faulthandler.dump_traceback_later(60, exit=False)
     import tauceti_worker.loop as loop
     import tauceti_worker.round as round_lifecycle
 
@@ -56,10 +63,20 @@ if len(sys.argv) > 1 and sys.argv[1] == "driver":
 with tempfile.TemporaryDirectory() as temporary:
     base = Path(temporary)
     started, cleaned = base / "started", base / "cleaned"
-    process = subprocess.Popen([sys.executable, __file__, "driver", str(started), str(cleaned)])
-    if not wait_for(started):
+    # Operational settings inherited from a worker host would hold the loop in a fleet admission
+    # or budget wait, or fetch a remote configuration, before it spawns the round.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("TAUCETI_FLEET_ADMISSION_FILE", "TAUCETI_USE_BUDGET", "TAUCETI_CONF")
+    }
+    process = subprocess.Popen([sys.executable, __file__, "driver", str(started), str(cleaned)], env=env)
+    # The driver imports the whole worker package before it spawns the round; under a fully
+    # parallel CI start that alone has taken over 10 seconds.
+    if not wait_for(started, timeout=90):
+        exited = process.poll()
         process.kill()
-        raise AssertionError("round child did not start")
+        raise AssertionError(f"round child did not start (driver exit status {exited})")
     process.terminate()
     return_code = process.wait(15)
     if return_code != 143:

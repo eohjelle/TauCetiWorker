@@ -5,6 +5,9 @@ The review/probe path supplies its own command and must remain untouched: it doe
 not gain project-cache egress. Exit 0 = the bootstrap/config/argv contract agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import os
@@ -208,7 +211,11 @@ tc.agents._bubble_pop = lambda _cfg, _env: None
 os.environ["TAUCETI_AGENT_ECHO"] = "1"
 try:
     out = io.StringIO()
-    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"), contextlib.redirect_stdout(out):
+    with (
+        patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1", TAUCETI_SHELL_LIMIT_SECONDS=""),
+        patch("tauceti_worker.agents.time.time", return_value=1000),
+        contextlib.redirect_stdout(out),
+    ):
         rc = tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts)
     work_argv = out.getvalue()
     check("work echo succeeds", rc == 0)
@@ -218,7 +225,7 @@ try:
         "tauceti-verify" in work_argv and "--stage build" in work_argv,
     )
     check("work disables background tasks", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in work_argv)
-    check("work bounds foreground commands", "BASH_MAX_TIMEOUT_MS=600000" in work_argv)
+    check("work bounds each foreground command to an hour", "BASH_MAX_TIMEOUT_MS=3600000" in work_argv)
     with (
         patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"),
         patch("tauceti_worker.verification.cache_root", side_effect=PermissionError("unavailable cache")),

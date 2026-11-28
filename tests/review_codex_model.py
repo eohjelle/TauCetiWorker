@@ -5,6 +5,10 @@ Only $TAUCETI_REVIEW_CODEX_MODEL is forwarded to the engine; authoring model
 overrides must leave its default/fallback policy untouched.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
+import contextlib
 import os
 import sys
 import tempfile
@@ -73,11 +77,17 @@ def fake_run_in_bubble(w, target, prompt, opts, mounts=None, inner_cmd=None, cre
 agents.run_in_bubble = fake_run_in_bubble
 agents.fetch_ref = lambda repo, d: True  # no network
 agents.me = lambda: "tester"  # no gh call
-agents._review_mathlib_source = lambda cfg, head: None  # no dependency in this fixture
+agents._review_mathlib_source = lambda cfg, head: contextlib.nullcontext(None)  # no dependency in this fixture
 
 tmp = Path(tempfile.mkdtemp())
+(tmp / "engine/runner").mkdir(parents=True)
+(tmp / "engine/runner/cli.py").touch()
+(tmp / "engine/rubrics").mkdir()
 os.environ["TAUCETI_REVIEW_ENGINE_DIR"] = str(tmp / "engine")  # skip the engine fetch
-w = types.SimpleNamespace(cfg=types.SimpleNamespace(state=tmp / "state", store_dir=tmp / "store"))
+w = types.SimpleNamespace(
+    gh=types.SimpleNamespace(repo="TauCetiProject/TauCeti"),
+    cfg=types.SimpleNamespace(state=tmp / "state", store_dir=tmp / "store"),
+)
 opts = types.SimpleNamespace()
 
 os.environ.pop("TAUCETI_REVIEW_CODEX_MODEL", None)
@@ -111,14 +121,14 @@ check(
 )
 
 check("bubble: no Mathlib snapshot -> --no-mathlib", "--no-mathlib" in captured["inner"])
-agents._review_mathlib_source = lambda cfg, head: tmp / "mathlib-src-x"
+agents._review_mathlib_source = lambda cfg, head: contextlib.nullcontext(tmp / "mathlib-src-x")
 agents._review_in_bubble(w, 470, "abc123", "claude", opts)
 check("bubble: Mathlib snapshot is mounted read-only", f"{tmp / 'mathlib-src-x'}:/opt/mathlib:ro" in captured["mounts"])
 check(
     "bubble: engine greps the mounted Mathlib",
     "--mathlib-dir /opt/mathlib" in captured["inner"] and "--no-mathlib" not in captured["inner"],
 )
-agents._review_mathlib_source = lambda cfg, head: None
+agents._review_mathlib_source = lambda cfg, head: contextlib.nullcontext(None)
 
 # --- host: exercise the actual do_review command construction without a provider/network ----------
 host_commands = []
@@ -140,6 +150,40 @@ for configured, provider, expected in (
     argv = host_commands[-1]
     actual = argv[argv.index("--claude-model") + 1] if "--claude-model" in argv else None
     check(f"host: {provider} override {configured!r} -> {expected!r}", actual == expected)
+
+# Separate-usage launches require the compatible file-route CLI before any paid review.
+usage_var = "TAUCETI_CLAUDE_USAGE_CREDENTIALS"
+old_usage = os.environ.pop(usage_var, None)
+try:
+    for configured in (False, True):
+        if configured:
+            os.environ[usage_var] = str(tmp / "usage-login.json")
+        work_units.do_review(w, None, c, types.SimpleNamespace(work_model="claude"), False)
+        check(
+            f"host: usage={configured} file-route compatibility flag",
+            ("--require-claude-config-file" in host_commands[-1]) == configured,
+        )
+        agents._review_in_bubble(w, 470, "abc123", "claude", opts)
+        check(
+            f"bubble: usage={configured} file-route compatibility flag",
+            ("--require-claude-config-file" in captured["inner"]) == configured,
+        )
+    os.environ["TAUCETI_CLAUDE_BILLING"] = "api"
+    work_units.do_review(w, None, c, types.SimpleNamespace(work_model="claude"), False)
+    check(
+        "host: separate usage does not impose subscription file routing on API review",
+        "--require-claude-config-file" not in host_commands[-1],
+    )
+    agents._review_in_bubble(w, 470, "abc123", "claude", opts)
+    check(
+        "bubble: API review has no subscription file compatibility flag",
+        "--require-claude-config-file" not in captured["inner"],
+    )
+finally:
+    os.environ.pop("TAUCETI_CLAUDE_BILLING", None)
+    os.environ.pop(usage_var, None)
+    if old_usage is not None:
+        os.environ[usage_var] = old_usage
 
 os.environ.pop("TAUCETI_CLAUDE_MODEL", None)
 os.environ.pop("TAUCETI_AUTHORING_CLAUDE_MODEL", None)

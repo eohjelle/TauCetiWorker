@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Fleet admission fails closed and provenance never affects a mutation."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import fcntl
 import json
 import os
@@ -17,7 +20,7 @@ from tauceti_worker import activity, agents, cli, github_outbox, loop, work_unit
 from tauceti_worker.claude_api import ClaudeAPIContext
 from tauceti_worker.config import AdmissionUnavailable
 from tauceti_worker.constants import EX_ADMISSION_WAIT
-from tauceti_worker.fleet_capacity import admission_reason, admission_unit, check_launch_admission
+from tauceti_worker.fleet_capacity import admission_reason, admission_unit, check_launch_admission, roadmap_focus
 from tauceti_worker.fleet_events import emit, mutation
 from tauceti_worker.round import Claims, RoundContext
 from tauceti_worker.survey import Counters
@@ -25,6 +28,29 @@ from tauceti_worker.usage_lifecycle import identity
 
 
 class FleetTests(unittest.TestCase):
+    def test_clock_is_sampled_after_a_slow_policy_read(self):
+        # The controller rewrites the policy (expiry = write time + 25s) while a
+        # worker's read blocks for 10s on a contended disk; the expiry is valid.
+        with tempfile.TemporaryDirectory() as root:
+            p = Path(root) / "policy.json"
+            env = {"TAUCETI_FLEET_ADMISSION_FILE": str(p)}
+            policy = dict(version=1, expires_at=1025, workers=["a"], roadmap_focus=dict(workers=["a"], areas=["PDE"]))
+            p.write_text(json.dumps(policy))
+            clock = {"now": 990.0}
+            real = Path.read_text
+
+            def slow_read(path, *args, **kwargs):
+                clock["now"] = 1000.0
+                return real(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "read_text", slow_read),
+                patch("tauceti_worker.fleet_capacity.time.time", side_effect=lambda: clock["now"]),
+            ):
+                self.assertIsNone(admission_reason("a", env=env))
+                clock["now"] = 990.0
+                self.assertEqual(roadmap_focus("a", env=env), ["PDE"])
+
     def test_unmanaged_and_expired(self):
         self.assertIsNone(admission_reason("a", env={}))
         with tempfile.TemporaryDirectory() as root:
@@ -47,6 +73,70 @@ class FleetTests(unittest.TestCase):
             ]:
                 p.write_text(json.dumps(value))
                 self.assertIn("unavailable", admission_reason("a", env=env, now=10))
+
+    def test_live_focus_is_optional_and_does_not_change_admission(self):
+        self.assertEqual(roadmap_focus("a", env={}), [])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "admission.json"
+            env = {"TAUCETI_FLEET_ADMISSION_FILE": str(path)}
+            policy = dict(
+                version=1,
+                expires_at=20,
+                workers=["a", "b"],
+                roadmap_focus=dict(workers=["a"], areas=["PDE", "PDE", "SymplecticGeometry"]),
+            )
+            path.write_text(json.dumps(policy))
+            self.assertEqual(roadmap_focus("a", env=env, now=10), ["PDE", "SymplecticGeometry"])
+            self.assertEqual(roadmap_focus("b", env=env, now=10), [])
+            self.assertEqual(roadmap_focus("a", env=env, now=21), [])
+            self.assertEqual(roadmap_focus("a", env=env, now=-20), [])
+            self.assertIsNone(admission_reason("a", env=env, now=10))
+            self.assertIsNone(admission_reason("b", env=env, now=10))
+            for bad in (None, [], "invalid", dict(areas="PDE", workers=["a"]), dict(areas=[None], workers=["a"])):
+                policy["roadmap_focus"] = bad
+                path.write_text(json.dumps(policy))
+                self.assertEqual(roadmap_focus("a", env=env, now=10), [])
+            policy["roadmap_focus"] = dict(workers=["b"], areas=["PDE"])
+            path.write_text(json.dumps(policy))
+            self.assertEqual(roadmap_focus("a", env=env, now=10), [])
+            self.assertEqual(roadmap_focus("b", env=env, now=10), ["PDE"])
+
+    def test_fractional_slot_draws_per_round_at_small_scale(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "admission.json"
+            env = {"TAUCETI_FLEET_ADMISSION_FILE": str(path)}
+            policy = dict(
+                version=1,
+                expires_at=20,
+                workers=["a"],
+                roadmap_focus=dict(workers=[], areas=["PDE"], fractional_worker="a", fractional_percent=20),
+            )
+            path.write_text(json.dumps(policy))
+            with patch("tauceti_worker.fleet_capacity.random.randrange", side_effect=range(100)):
+                draws = [roadmap_focus("a", env=env, now=10) for _ in range(100)]
+            self.assertEqual(draws.count(["PDE"]), 20)
+            self.assertEqual(draws.count([]), 80)
+            self.assertEqual(roadmap_focus("other", env=env, now=10), [])
+
+    def test_random_authoring_focus_honors_skips_and_falls_back_when_stale(self):
+        worker = SimpleNamespace(cfg=SimpleNamespace(wid="a"), gh=None)
+        with (
+            patch.object(work_units, "roadmap_areas", return_value=["Algebra", "PDE", "SymplecticGeometry"]),
+            patch.object(work_units, "roadmap_skip", return_value=["PDE"]) as skip,
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["PDE", "SymplecticGeometry"]) as focus,
+            patch.object(work_units.random, "choice", side_effect=lambda areas: areas[0]) as choice,
+        ):
+            self.assertEqual(work_units.random_roadmap_area(worker), "SymplecticGeometry")
+            choice.assert_called_with(["SymplecticGeometry"])
+            focus.return_value = ["RemovedArea"]
+            self.assertEqual(work_units.random_roadmap_area(worker), "Algebra")
+            choice.assert_called_with(["Algebra", "SymplecticGeometry"])
+            focus.return_value = []
+            work_units.random_roadmap_area(worker)
+            choice.assert_called_with(["Algebra", "SymplecticGeometry"])
+            skip.return_value = ["Algebra", "PDE", "SymplecticGeometry"]
+            with self.assertRaisesRegex(work_units.NoProgress, "every area"):
+                work_units.random_roadmap_area(worker)
 
     def test_bridge_checks_capacity_even_without_budget_and_never_launches(self):
         context = ClaudeAPIContext("worker", "roadmap")
@@ -84,6 +174,72 @@ class FleetTests(unittest.TestCase):
             self.assertFalse(
                 context.handle(dict(action="admit", id="c" * 32, model="test", process=identity()))["allowed"]
             )
+
+    def test_shim_holds_prepared_work_for_fleet_capacity_but_not_for_funding(self):
+        from tauceti_worker import claude_api_client as client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "key").write_text("test-key")
+            config = {"bridge": str(root), "command": ["fake-claude"], "key": str(root / "key")}
+            (root / "config.json").write_text(json.dumps({**config, "usage_dir": str(root / "usage")}))
+            capacity = dict(allowed=False, reason="host memory headroom low", capacity=True)
+            funding = dict(allowed=False, reason="waiting for funding")
+            for answers, deadline, sleeps, rc, configured in (
+                # Capacity reopens after two polls: the prepared work launches.
+                ([capacity, capacity, dict(allowed=True, id="i" * 32)], None, 2, 0, False),
+                # Capacity stays closed: the hold ends and the round waits outside it.
+                ([capacity] * 1000, None, client.CAPACITY_HOLD_SECONDS // client.CAPACITY_POLL_SECONDS - 1, 75, False),
+                # Too little round time left to hold.
+                ([capacity] * 1000, 1000 + client.CAPACITY_HOLD_RESERVE_SECONDS, 0, 75, False),
+                # A sandboxed shim has no host environment; the bridge config carries the deadline.
+                ([capacity] * 1000, 1000 + client.CAPACITY_HOLD_RESERVE_SECONDS, 0, 75, True),
+                ([funding], None, 0, 75, False),
+            ):
+                with self.subTest(answers=answers[0], deadline=deadline, configured=configured):
+                    settings = {**config, "usage_dir": str(root / "usage")}
+                    if configured:
+                        settings["deadline"] = deadline
+                    (root / "config.json").write_text(json.dumps(settings))
+                    clock = [1000.0]
+                    replies = iter(answers)
+
+                    def sleep(seconds, clock=clock):
+                        clock[0] += seconds
+
+                    admits = []
+
+                    def request(_bridge, action, admits=admits, replies=replies, **_fields):
+                        if action != "admit":
+                            return dict(ok=True)
+                        admits.append(action)
+                        return next(replies)
+
+                    env = {"TAUCETI_ROUND_DEADLINE": str(deadline)} if deadline and not configured else {}
+                    with (
+                        patch.object(client, "__file__", str(root / "shim.py")),
+                        patch.object(sys, "argv", ["claude", "-p", "hello", "--model", "opus"]),
+                        patch.dict(os.environ, env),
+                        patch.object(client, "api_environment", return_value={}),
+                        patch.object(client, "authenticate"),
+                        patch.object(client, "request", side_effect=request),
+                        patch.object(client, "warning"),
+                        patch.object(client.time, "time", side_effect=lambda clock=clock: clock[0]),
+                        patch.object(client.time, "sleep", side_effect=sleep) as slept,
+                        patch.object(client.subprocess, "Popen", side_effect=OSError("fake launch")) as popen,
+                    ):
+                        if not env:
+                            os.environ.pop("TAUCETI_ROUND_DEADLINE", None)
+                        if rc == 75:
+                            self.assertEqual(client.main(), 75)
+                            popen.assert_not_called()
+                        else:
+                            # Admitted on the third poll; the launch itself is exercised elsewhere,
+                            # so this fake launch fails and settles as launch-failed.
+                            client.main()
+                            self.assertEqual(len(admits), 3)
+                        holds = [c for c in slept.call_args_list if c.args == (client.CAPACITY_POLL_SECONDS,)]
+                        self.assertEqual(len(holds), sleeps)
 
     def test_context_start_refuses_capacity_before_setup(self):
         context = ClaudeAPIContext("worker", "review")
@@ -338,7 +494,13 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
             git = directory / "git"
-            git.write_text("#!/bin/sh\nexit 0\n")
+            git.write_text(
+                '#!/bin/sh\ncase "$*" in\n'
+                "  'rev-parse --verify'*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n"
+                "  mktag) cat >/dev/null; echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;\n"
+                "  '-c push.followTags=false push'*) printf '*\\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/test\\t[new branch]\\n' ;;\n"
+                "esac\nexit 0\n"
+            )
             git.chmod(0o700)
             (directory / "json.py").write_text("raise RuntimeError('untrusted import')\n")
             journal = directory / "events.jsonl"

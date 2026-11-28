@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""GitHub execution adapter boundaries, single sends and ownership evidence."""
+
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
+import base64
+import copy
+import dataclasses
+import json
+import socket
+import sys
+import unittest
+import urllib.error
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from queue_ci_requests import CONFIG, policy
+from tauceti_tools import ci_candidate as cc
+from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
+
+from tauceti_queue.ci_execution import ExecutionEvidence, GitHubSourceExecution
+from tauceti_queue.github_adapter import GitHubError, RateLimited
+from tauceti_queue.github_app import AppCredentials, CredentialsError, InstallationToken, InstallationTokenSource
+from tauceti_queue.ports import DispatchNotAccepted
+
+
+class Reader:
+    def __init__(self, frozen):
+        self.frozen = frozen
+        self.metadata = {"id": 42, "full_name": "team/Execution", "default_branch": "main"}
+        self.runs = {}
+        self.receipts = {}
+        self.results = {}
+        self.pages = [{"total_count": 0, "workflow_runs": []}]
+
+    def repository(self):
+        return self.metadata
+
+    def get(self, path):
+        if path.startswith("/branches/"):
+            return {"commit": {"sha": self.frozen.request.workflow_revision}}
+        if "/actions/workflows/" in path:
+            return self.pages[int(path.rsplit("page=", 1)[1]) - 1]
+        return self.runs[path.rsplit("/", 1)[1]]
+
+    def receipt(self, request, *, run_id, observed_attempt):
+        value = self.receipts.get(str(run_id))
+        if value is None:
+            raise EvidenceUnavailable("missing receipt")
+        return value
+
+    def result(self, request, *, run_id, attempt):
+        value = self.results.get(str(run_id))
+        if value is None:
+            raise EvidenceUnavailable("missing current result")
+        return value
+
+    def add(self, run_id="101", *, attempt=1, status="in_progress"):
+        req, config = self.frozen.request, self.frozen.policy
+        self.runs[run_id] = dict(
+            id=int(run_id),
+            run_attempt=attempt,
+            status=status,
+            conclusion="success" if status == "completed" else None,
+            head_sha=req.workflow_revision,
+            event="repository_dispatch",
+            path=config.workflow,
+            repository={"id": 42, "full_name": "team/Execution"},
+            referenced_workflows=[
+                {
+                    "path": "team/Tools/.github/workflows/pr-build.yml@main",
+                    "sha": "a" * 40,
+                    "ref": "refs/heads/main",
+                }
+            ],
+            display_title="source request=" + req.request_id,
+        )
+        proof = dict(
+            kind="request",
+            run_id=int(run_id),
+            request_digest=req.digest,
+            receipt_attempt=1,
+            observed_attempt=attempt,
+            artifact_id=201,
+            artifact_digest="sha256:" + "a" * 64,
+        )
+        self.receipts[run_id] = proof
+        return proof
+
+
+def caller_text(revision):
+    return (
+        "jobs:\n  candidate:\n"
+        f"    uses: team/Tools/.github/workflows/pr-build.yml@{revision}\n"
+        f"    with:\n      tools_repository: team/Tools\n      tools_ref: {revision}\n"
+    )
+
+
+class Execution(unittest.TestCase):
+    def setUp(self):
+        config = policy()
+        request = cc.CandidateRequest(
+            "1" * 32,
+            "2" * 32,
+            config.digest,
+            config.source,
+            config.execution,
+            "b" * 40,
+            config.config_digest,
+            5,
+            7,
+            "c" * 40,
+            "d" * 40,
+            "e" * 40,
+            (cc.Member(17, "f" * 40),),
+        )
+        self.frozen = SimpleNamespace(policy=config, request=request)
+        self.reader = Reader(self.frozen)
+        credentials = AppCredentials(1, "test", 2, b"unused", b"unused")
+        self.tokens = InstallationTokenSource(
+            credentials,
+            lambda *_: self.fail("unexpected mint"),
+            repository_id=42,
+            permissions={"contents": "write", "actions": "write"},
+        )
+        self.tokens._current = InstallationToken("fixture-only", 10**12)
+        self.posts = []
+        self.status = 204
+
+        def transport(*args):
+            self.posts.append(args)
+            if isinstance(self.status, Exception):
+                raise self.status
+            return self.status, {}, b""
+
+        self.adapter = GitHubSourceExecution(
+            self.tokens, transport=transport, reader_factory=lambda *_: self.reader, max_pages=2
+        )
+
+    def test_canonical_dispatch_and_no_mutation_retry_after_lost_response(self):
+        self.assertEqual(self.adapter.dispatch(self.frozen), self.frozen.request.request_id)
+        method, url, headers, body = self.posts[0]
+        self.assertEqual((method, url), ("POST", "https://api.github.com/repos/team/Execution/dispatches"))
+        self.assertEqual(json.loads(body), self.frozen.request.dispatch())
+        self.assertEqual(headers["Authorization"], "Bearer fixture-only")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.status = OSError("lost response")
+        with self.assertRaises(OSError):
+            self.adapter.dispatch(self.frozen)
+        self.assertEqual(len(self.posts), 2)  # exactly one POST per explicit call
+
+    def test_deleted_reads_run_and_reports_only_404(self):
+        self.status = 404
+        self.assertTrue(self.adapter.deleted(self.frozen, "101"))
+        method, url, _headers, _body = self.posts[-1]
+        self.assertEqual((method, url), ("GET", "https://api.github.com/repos/team/Execution/actions/runs/101"))
+        self.status = 422
+        with self.assertRaises(GitHubError):
+            self.adapter.deleted(self.frozen, "101")
+
+    def caller_reader(self, *, revision="b" * 40, protected=True, configuration=CONFIG, configured=None):
+        selected = configured or policy(configuration)
+        files = {
+            ".tauceti/ci-source.toml": configuration,
+            ".tauceti/ci-source.json": cc.canonical(selected.record(with_config=False)),
+            selected.workflow: caller_text("main").encode(),
+        }
+        reads = []
+
+        def get(path):
+            reads.append(path)
+            if path == "/branches/main":
+                return {"commit": {"sha": revision}, "protected": protected}
+            location, ref = path.removeprefix("/contents/").split("?ref=", 1)
+            self.assertEqual(ref, revision)
+            raw = files[location]
+            return dict(
+                type="file", path=location, encoding="base64", size=len(raw), content=base64.b64encode(raw).decode()
+            )
+
+        self.reader.get = get
+        return files, reads
+
+    def test_caller_reads_consistent_files_at_protected_execution_main(self):
+        _, reads = self.caller_reader()
+        revision, selected, configuration = self.adapter.caller(policy())
+        self.assertEqual((revision, selected, configuration), ("b" * 40, policy(), CONFIG))
+        self.assertTrue(all("?ref=" + revision in path for path in reads[1:]))
+        self.assertEqual(self.posts, [])
+
+    def test_caller_adopts_reviewed_configuration_changes(self):
+        configuration = CONFIG + b"\n# protected main config update\n"
+        selected = policy(configuration)
+        self.caller_reader(revision="c" * 40, configuration=configuration, configured=selected)
+        self.assertEqual(self.adapter.caller(policy()), ("c" * 40, selected, configuration))
+
+    def test_caller_uses_the_same_snapshot_rules_for_shared_content_execution(self):
+        configuration = CONFIG.replace(b'repository="team/Execution"', b'repository="team/Math"')
+        shared = dataclasses.replace(
+            policy(configuration),
+            execution=cc.RepositoryIdentity(dataclasses.replace(policy().execution.repository, name="team/Math"), 42),
+        )
+        self.reader.metadata["full_name"] = "team/Math"
+        self.caller_reader(revision="d" * 40, configured=shared, configuration=configuration)
+        self.assertEqual(self.adapter.caller(shared), ("d" * 40, shared, configuration))
+
+    def test_caller_harness_literals_are_not_the_queue_s_concern(self):
+        # Runner groups admit only TauCetiTools main, and results must come from it.
+        files, _ = self.caller_reader()
+        files[policy().workflow] = caller_text("main").encode()
+        self.assertEqual(self.adapter.caller(policy())[0], "b" * 40)
+        del files[policy().workflow]  # the configured caller must still exist at that commit
+        with self.assertRaises(KeyError):
+            self.adapter.caller(policy())
+        self.assertEqual(self.posts, [])
+
+    def test_caller_refuses_a_configuration_that_changes_the_source_location(self):
+        configuration = CONFIG.replace(b'name="team/Math"', b'name="other/Untrusted"')
+        self.caller_reader(configuration=configuration)
+        with self.assertRaisesRegex(ValueError, "project source/execution"):
+            self.adapter.caller(policy())
+
+    def test_caller_refuses_unprotected_main_and_changed_enrollment(self):
+        self.caller_reader(protected=False)
+        with self.assertRaisesRegex(ValueError, "protected main"):
+            self.adapter.caller(policy())
+        selected = dataclasses.replace(policy(), source=dataclasses.replace(policy().source, native_id=99))
+        self.caller_reader(configured=selected)
+        with self.assertRaisesRegex(ValueError, "enrolled"):
+            self.adapter.caller(policy())
+        self.assertEqual(self.posts, [])
+
+    def test_caller_refuses_truncated_or_malformed_configuration(self):
+        files, _ = self.caller_reader()
+        files[".tauceti/ci-source.json"] = b'{"workflow":"candidate-selected"}'
+        with self.assertRaises(ValueError):
+            self.adapter.caller(policy())
+        original = self.reader.get
+
+        def truncated(path):
+            value = original(path)
+            if path.startswith("/contents/"):
+                value["size"] += 1
+            return value
+
+        self.reader.get = truncated
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            self.adapter.caller(policy())
+
+    def test_preflight_rejects_default_branch_caller_and_wrong_resource_credential(self):
+        self.reader.metadata["default_branch"] = "other"
+        with self.assertRaises(DispatchNotAccepted) as caught:
+            self.adapter.dispatch(self.frozen)
+        self.assertFalse(caught.exception.retryable)
+        self.reader.metadata["default_branch"] = "main"
+        with patch.object(self.reader, "get", return_value={"commit": {"sha": "a" * 40}}):
+            with self.assertRaises(DispatchNotAccepted):
+                self.adapter.dispatch(self.frozen)
+        self.tokens._repository_id = 99
+        with self.assertRaises(DispatchNotAccepted):
+            self.adapter.dispatch(self.frozen)
+        self.assertEqual(self.posts, [])
+        self.tokens._repository_id = None
+        with self.assertRaises(ValueError):
+            GitHubSourceExecution(self.tokens)
+
+    def test_http_rejections_are_nonsends_but_5xx_is_uncertain(self):
+        for status in (400, 401, 403, 404, 410, 422, 429):
+            self.tokens._current = InstallationToken("fixture-only", 10**12)
+            self.status = status
+            with self.subTest(status=status), self.assertRaises(DispatchNotAccepted):
+                self.adapter.dispatch(self.frozen)
+        self.status = 500
+        with self.assertRaises(OSError):
+            self.adapter.dispatch(self.frozen)
+        self.assertEqual(len(self.posts), 8)
+
+    def test_discovery_requires_evidence_not_matching_title_and_rejects_truncated_pages(self):
+        self.reader.add()
+        self.reader.receipts.clear()
+        self.reader.pages = [{"total_count": 1, "workflow_runs": [self.reader.runs["101"]]}]
+        observations, unavailable = self.adapter.discover(self.frozen, since=100)
+        self.assertEqual(observations, [])
+        self.assertTrue(unavailable)
+        self.reader.add()
+        observations, unavailable = self.adapter.discover(self.frozen, since=100)
+        self.assertEqual([obs.run.run_id for obs in observations], ["101"])
+        self.assertFalse(unavailable)
+        self.reader.runs["101"]["repository"]["id"] = 99
+        observations, _ = self.adapter.discover(self.frozen, since=100)
+        self.assertEqual(observations, [])
+        self.reader.pages = [{"total_count": 2, "workflow_runs": []}]
+        with self.assertRaises(EvidenceUnavailable):
+            self.adapter.discover(self.frozen, since=100)
+
+    def test_verified_failure_keeps_diagnostics_without_giving_logs_verdict_authority(self):
+        self.reader.add(status="completed")
+        self.reader.results["101"] = {"classification": "source_failure"}
+        failure = self.adapter._run(self.reader.runs["101"])
+        finding = {"kind": "lint", "module": "", "message": "lint driver timed out"}
+        detail = replace(failure, diagnostics=(finding,), runner_name="reserved-staging")
+        with patch("tauceti_queue.ci_execution.GitHubAdapter.read_run", return_value=detail):
+            observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertEqual(observation.run.diagnostics, (finding,))
+        self.assertEqual(observation.run.runner_name, "reserved-staging")
+        self.assertEqual(observation.result, {"classification": "source_failure"})
+        for result in [replace(detail, attempt=2), None]:
+            with patch("tauceti_queue.ci_execution.GitHubAdapter.read_run", return_value=result):
+                observation = self.adapter.observe(self.frozen, "101", owned=True)
+            self.assertEqual(observation.run.diagnostics, ())
+            self.assertEqual(observation.result["classification"], "source_failure")
+        with patch("tauceti_queue.ci_execution.GitHubAdapter.read_run", side_effect=OSError("logs unavailable")):
+            observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertEqual(observation.result["classification"], "source_failure")
+
+    def test_progress_reads_one_jobs_listing_for_the_run_attempt(self):
+        self.reader.add(attempt=2, status="in_progress")
+        run = self.adapter._run(self.reader.runs["101"])
+        job = {
+            "name": "build / Build",
+            "runner_name": "staging-1",
+            "labels": ["tauceti-staging"],
+            "status": "in_progress",
+            "started_at": "2026-11-17T13:00:00Z",
+            "steps": [
+                {"name": "Set up job", "status": "completed", "conclusion": "success"},
+                {"name": "Build exact candidate under bwrap", "status": "in_progress"},
+            ],
+        }
+        calls = []
+
+        def paginate(_client, path, **kwargs):
+            calls.append((path, kwargs))
+            return [job]
+
+        with patch("tauceti_queue.github_adapter.GitHubClient.paginate", paginate):
+            progressed = self.adapter.progress(self.frozen, run)
+        self.assertEqual(calls, [("repos/team/Execution/actions/runs/101/attempts/2/jobs", {"key": "jobs"})])
+        self.assertEqual(
+            [(p.name, p.status) for p in progressed.phases],
+            [
+                ("build / Build", "in_progress"),
+                ("build / Build: Set up job", "completed"),
+                ("build / Build: Build exact candidate under bwrap", "in_progress"),
+            ],
+        )
+        self.assertEqual((progressed.runner_name, progressed.host), ("staging-1", "staging-1"))
+        self.assertEqual(replace(progressed, phases=(), runner_name=None, runner_labels=(), host=None), run)
+
+    def test_owned_rerun_needs_current_result(self):
+        self.reader.add(attempt=2, status="completed")
+        self.reader.receipts.clear()  # recorded ownership survives receipt expiry
+        observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertIsNone(observation.result)
+        self.assertEqual(observation.run.attempt, 2)
+
+    def cancel_adapter(self, runs):
+        """An adapter whose GitHub run reads come from `runs`; no frozen-request reader is available."""
+
+        def transport(method, url, headers, body):
+            self.posts.append((method, url, headers, body))
+            if method == "GET":
+                run = runs.get(url.rsplit("/", 1)[1])
+                return (404, {}, b"{}") if run is None else (200, {}, json.dumps(run).encode())
+            if isinstance(self.status, Exception):
+                raise self.status
+            return self.status, {}, b""
+
+        return GitHubSourceExecution(
+            self.tokens, transport=transport, reader_factory=lambda *_: self.fail("cancel reads no frozen policy")
+        )
+
+    def test_cancel_uses_the_stored_ownership_proof_and_rechecks_the_live_run(self):
+        proof = self.reader.add(status="completed")
+        adapter = self.cancel_adapter(self.reader.runs)
+        execution, digest = self.frozen.policy.execution, self.frozen.request.digest
+
+        def cancel(run_id="101", **overrides):
+            arguments = {"execution": execution, "request_digest": digest, "proof": proof, **overrides}
+            return adapter.cancel(arguments.pop("execution"), run_id, **arguments)
+
+        def cancels():
+            return [post for post in self.posts if post[0] == "POST"]
+
+        self.assertEqual(cancel(), "already-completed")
+        self.assertEqual(cancels(), [])
+        self.reader.runs["101"].update(status="in_progress", conclusion=None)
+        self.status = 202
+        self.assertEqual(cancel(), "cancelled")
+        self.assertEqual(cancels()[0][1], "https://api.github.com/repos/team/Execution/actions/runs/101/cancel")
+        self.assertEqual(cancels()[0][2]["Authorization"], "Bearer fixture-only")
+        self.status = 409
+        self.assertEqual(cancel(), "already-completed")
+        self.status = 500
+        with self.assertRaises(OSError):
+            cancel()
+        posted = len(cancels())
+        for overrides in (
+            dict(proof=dict(proof, request_digest="0" * 64)),
+            dict(request_digest="0" * 64),
+            dict(proof=dict(proof, run_id=102)),
+            dict(proof=dict(proof, kind="claim")),
+            dict(proof=None),
+            dict(run_id="0101"),
+            dict(execution=cc.RepositoryIdentity(execution.repository, 43)),
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                cancel(**overrides)
+        for field, value in (
+            ("repository", {"id": 43, "full_name": "team/Execution"}),
+            ("repository", {"id": 42, "full_name": "team/Other"}),
+            ("event", "workflow_dispatch"),
+            ("id", 102),
+        ):
+            original = copy.deepcopy(self.reader.runs["101"])
+            self.reader.runs["101"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                cancel()
+            self.reader.runs["101"] = original
+        self.assertEqual(len(cancels()), posted, "nothing unproven was cancelled")
+        del self.reader.runs["101"]
+        self.assertEqual(cancel(), "already-completed", "GitHub deleted the run")
+        self.assertEqual(len(cancels()), posted)
+
+    def test_cancel_rate_limits_never_sleep_and_carry_githubs_deadline(self):
+        proof = self.reader.add(status="in_progress")
+        execution, digest = self.frozen.policy.execution, self.frozen.request.digest
+        now = [1_000_000.0]
+        responses = []
+
+        def transport(method, url, headers, body):
+            self.posts.append((method, url))
+            return responses.pop(0)
+
+        adapter = GitHubSourceExecution(
+            self.tokens,
+            transport=transport,
+            reader_factory=lambda *_: self.fail("cancel reads no frozen policy"),
+            clock=lambda: now[0],
+        )
+
+        def cancel():
+            return adapter.cancel(execution, "101", request_digest=digest, proof=proof)
+
+        live = (200, {}, json.dumps(self.reader.runs["101"]).encode())
+        with patch("time.sleep", side_effect=AssertionError("a cancellation never sleeps")):
+            # A rate-limited read is one request, and its deadline is GitHub's Retry-After.
+            responses[:] = [(429, {"Retry-After": "180"}, b"")]
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual((len(self.posts), caught.exception.retry_at), (1, now[0] + 180))
+            # The shared client remembers it: the next cancellation sends nothing until then.
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual((len(self.posts), caught.exception.retry_at), (1, now[0] + 180))
+            now[0] += 181
+            # The cancel POST's own rate-limit headers are recorded and honoured.
+            reset = now[0] + 600
+            limited = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset), "x-ratelimit-limit": "5000"}
+            responses[:] = [live, (403, limited, b'{"message": "API rate limit exceeded"}')]
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual(caught.exception.retry_at, reset + 1)
+            self.assertEqual(adapter.cancel_client.rate_limit(), (0, reset))
+            with self.assertRaises(RateLimited):
+                cancel()
+            self.assertEqual(len(self.posts), 3)
+            now[0] = reset + 2
+            responses[:] = [
+                live,
+                (202, {"x-ratelimit-remaining": "4999", "x-ratelimit-reset": str(now[0] + 3600)}, b""),
+            ]
+            self.assertEqual(cancel(), "cancelled")
+            self.assertEqual(adapter.cancel_client.rate_limit()[0], 4999)
+
+    def test_repository_reader_rejects_name_reuse_and_malformed_api_metadata(self):
+        # Exercise the real bounded metadata validator, independent of our reader fake.
+        evidence = ExecutionEvidence(self.frozen.policy, token="fixture-only", token_origin=cc.GITHUB)
+        for raw, exception in (
+            (b"[]", ValueError),
+            (b"{", EvidenceUnavailable),
+            (b'{"id":99,"full_name":"team/Execution"}', ValueError),
+            (b'{"id":42,"full_name":"team/Renamed"}', ValueError),
+        ):
+            with self.subTest(raw=raw), patch.object(evidence, "_read", return_value=raw):
+                with self.assertRaises(exception):
+                    evidence.repository()
+        with patch.object(evidence, "_read", return_value=json.dumps(self.reader.metadata).encode()):
+            self.assertEqual(evidence.repository()["id"], 42)
+
+    def test_rate_limit_deadlines_are_finite_and_bad_credentials_are_invalidated(self):
+        with patch.object(self.adapter, "_post", return_value=(401, {}, b"")):
+            with self.assertRaises(DispatchNotAccepted) as caught:
+                self.adapter.dispatch(self.frozen)
+        self.assertTrue(caught.exception.retryable)  # Minted App credentials can refresh.
+        self.assertIsNone(self.tokens._current)
+        for value, expected in (("NaN", None), ("inf", None), ("-1", None), ("2000", 2000)):
+            self.tokens._current = InstallationToken("fixture-only", 10**12)
+            with patch.object(self.adapter, "_post", return_value=(429, {"x-ratelimit-reset": value}, b"")):
+                with self.assertRaises(DispatchNotAccepted) as caught:
+                    self.adapter.dispatch(self.frozen)
+                self.assertEqual(caught.exception.retry_at, expected)
+
+    def test_token_is_prepared_once_and_definite_connect_failure_is_a_nonsend(self):
+        with patch.object(self.tokens, "token", side_effect=["fixture-only", RuntimeError("late refresh")]) as token:
+            self.adapter.dispatch(self.frozen)
+            self.assertEqual(token.call_count, 1)
+        failure = urllib.error.URLError(socket.gaierror("DNS failed"))
+        with patch.object(self.adapter, "_post", side_effect=failure):
+            with self.assertRaises(DispatchNotAccepted) as caught:
+                self.adapter.dispatch(self.frozen)
+            self.assertTrue(caught.exception.retryable)
+        with patch.object(self.adapter, "_post", return_value=(403, {"x-ratelimit-reset": "2000"}, b"")):
+            with self.assertRaises(DispatchNotAccepted) as caught:
+                self.adapter.dispatch(self.frozen)
+            self.assertFalse(caught.exception.retryable)
+            self.assertIsNone(caught.exception.retry_at)
+
+    def test_expired_known_run_checks_status_without_downloading_artifacts(self):
+        self.reader.add(status="completed")
+        self.reader.pages = [{"total_count": 1, "workflow_runs": [self.reader.runs["101"]]}]
+        with (
+            patch.object(self.reader, "receipt", side_effect=AssertionError("expired receipt")),
+            patch.object(self.reader, "result", side_effect=AssertionError("expired result")),
+        ):
+            observations, unavailable = self.adapter.discover(self.frozen, since=100, known_run_ids={"101"})
+        self.assertFalse(unavailable)
+        self.assertEqual(observations[0].run.status, "completed")
+        self.assertIsNone(observations[0].ownership)
+        self.assertIsNone(observations[0].result)
+
+    def test_bad_result_does_not_discard_valid_ownership_receipt(self):
+        receipt = self.reader.add(status="completed")
+        self.reader.pages = [{"total_count": 1, "workflow_runs": [self.reader.runs["101"]]}]
+        with patch.object(self.reader, "result", side_effect=ValueError("tested another candidate")):
+            observations, unavailable = self.adapter.discover(self.frozen, since=100)
+        self.assertFalse(unavailable)
+        self.assertEqual(observations[0].ownership, receipt)
+        self.assertIsNone(observations[0].result)
+
+    def test_permanent_scope_or_configuration_error_is_not_retried(self):
+        with patch.object(self.tokens, "token", side_effect=CredentialsError("wrong repository scope")):
+            with self.assertRaises(DispatchNotAccepted) as caught:
+                self.adapter.preflight(self.frozen)
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(self.posts, [])
+
+    def test_prepared_dispatch_performs_only_one_post_without_preflight_io(self):
+        prepared = self.adapter.preflight(self.frozen)
+        self.assertNotIn("fixture-only", repr(prepared))
+        with (
+            patch.object(self.tokens, "token", side_effect=AssertionError("token read after claim")),
+            patch.object(self.reader, "repository", side_effect=AssertionError("repository read after claim")),
+        ):
+            self.assertEqual(self.adapter.dispatch(self.frozen, prepared=prepared), self.frozen.request.request_id)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_discovery_uses_closed_creation_window(self):
+        with patch.object(self.reader, "get", wraps=self.reader.get) as get:
+            self.adapter.discover(self.frozen, since=100)
+        path = get.call_args[0][0]
+        self.assertIn("created=1970-01-01T00%3A00%3A00Z..", path)
+        self.assertNotIn("%3E%3D", path)
+
+    def test_large_filtered_listing_splits_windows_and_deduplicates_boundary_runs(self):
+        self.adapter.max_pages = 10
+        self.adapter.clock = lambda: 201
+        rows = [{"id": number, "second": 50 if number <= 750 else 150} for number in range(1, 1501)]
+        rows[0]["second"] = 100  # Included by both inclusive child windows.
+        calls = []
+
+        def listing(path):
+            query = parse_qs(urlsplit(path).query)
+            start, end = query["created"][0].split("..")
+            lo, hi = [datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() for value in (start, end)]
+            selected = [row for row in rows if lo <= row["second"] <= hi]
+            page = int(query["page"][0])
+            calls.append((lo, hi, page))
+            return {"total_count": len(selected), "workflow_runs": selected[(page - 1) * 100 : page * 100]}
+
+        with patch.object(self.reader, "get", side_effect=listing):
+            found = self.adapter._list_runs(self.reader, self.frozen, since=100)
+        self.assertEqual({row["id"] for row in found}, set(range(1, 1501)))
+        self.assertEqual(len(found), 1500)
+        self.assertGreater(len(calls), 10)
+        self.assertLessEqual(len(calls), 64)
+        self.assertTrue(all(end <= 200 for _start, end, _page in calls))
+
+    def test_overfull_single_second_listing_is_unavailable_without_unbounded_pagination(self):
+        self.adapter.max_pages = 10
+        self.adapter.clock = lambda: 201
+        with patch.object(self.reader, "get", return_value={"total_count": 1500, "workflow_runs": []}) as get:
+            with self.assertRaisesRegex(EvidenceUnavailable, "time precision bound"):
+                self.adapter._list_runs(self.reader, self.frozen, since=100)
+        self.assertLessEqual(get.call_count, 10)
+
+    def test_only_complete_confirmed_absence_can_start_missing_result_recovery(self):
+        self.reader.add(status="completed")
+        raw = self.reader.runs["101"]
+        raw["conclusion"] = "failure"
+        run = self.adapter._run(raw)
+        original = self.reader.get
+        expected = cc.artifact_name(self.frozen.request, 101, 1)
+
+        def get(path):
+            if "/artifacts?" in path:
+                return {"total_count": 0, "artifacts": []}
+            return original(path)
+
+        with patch.object(self.reader, "get", side_effect=get):
+            self.assertTrue(self.adapter._result_absent(self.reader, self.frozen, run))
+        with patch.object(self.reader, "get", side_effect=EvidenceUnavailable("artifact API outage")):
+            self.assertFalse(self.adapter._result_absent(self.reader, self.frozen, run))
+        for value in (
+            {"total_count": 1, "artifacts": [{"id": 201, "name": expected, "expired": True}]},
+            {"total_count": 2, "artifacts": []},
+            {"total_count": False, "artifacts": []},
+        ):
+            with patch.object(self.reader, "get", return_value=value):
+                self.assertFalse(self.adapter._result_absent(self.reader, self.frozen, run))
+
+    def test_absence_is_refused_if_attempt_or_conclusion_changes_during_confirmation(self):
+        self.reader.add(status="completed")
+        original = self.reader.runs["101"]
+        run = self.adapter._run(original)
+        for change in ({"run_attempt": 2}, {"conclusion": "failure"}):
+
+            def get(path, change=change):
+                if "/artifacts?" in path:
+                    return {"total_count": 0, "artifacts": []}
+                return dict(original, **change)
+
+            with patch.object(self.reader, "get", side_effect=get):
+                self.assertFalse(self.adapter._result_absent(self.reader, self.frozen, run))
+
+    def test_download_outage_with_present_result_does_not_prove_absence(self):
+        self.reader.add(status="completed")
+        self.reader.runs["101"]["conclusion"] = "failure"
+        original = self.reader.get
+        expected = cc.artifact_name(self.frozen.request, 101, 1)
+
+        def get(path):
+            if "/artifacts?" in path:
+                return {"total_count": 1, "artifacts": [{"id": 201, "name": expected, "expired": False}]}
+            return original(path)
+
+        with (
+            patch.object(self.reader, "get", side_effect=get),
+            patch.object(self.reader, "result", side_effect=EvidenceUnavailable("signed download unavailable")),
+        ):
+            observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertIsNone(observation.result)
+        self.assertFalse(observation.result_absent)
+
+
+if __name__ == "__main__":
+    unittest.main()

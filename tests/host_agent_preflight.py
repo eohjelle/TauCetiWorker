@@ -2,13 +2,16 @@
 """A host round shells out to `codex`/`claude`/`pi`. If that binary slips off the worker's PATH (an npm
 reinstall relocating codex is the case that bit us), the review engine rejects `--reviewer codex` and
 do_review counts it as a PER-PR review error — so a machine-wide outage marches PRs one-by-one to the
-"needs a human" escalation cap. dispatch() must preflight the binary and, when it is missing, pause the
+review-error cap, where they are closed. dispatch() must preflight the binary and, when it is missing, pause the
 round as NoProgress (⇒ backoff, no counter bump) rather than launch a doomed stage.
 
 This test drives dispatch() with the do_* stage stubbed out, so it needs no real Worker: the preflight
 raises before any stage work. Exit 0 = every case agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,7 +105,7 @@ try:
     wu.shutil.which = lambda name: None
     # The pre-launch re-read of the candidate is a separate concern (see dispatch_revalidation); these
     # cases pass no Worker at all because the PATH check is what they are about.
-    wu._still_actionable = lambda *a: True
+    wu._still_actionable = lambda *a, **kw: True
     reset()
     raised, msg = False, ""
     try:
@@ -140,6 +143,18 @@ try:
     rc = wu.dispatch("review", WORKER, None, CAND, opts(sandbox_host=False))
     check("bubble -> host preflight skipped, stage runs", runs["n"], 1)
     check("bubble -> no red warning", len(warns), 0)
+
+    # 3b) a bubble code-writing round would build a private Mathlib in the container: refused
+    #     before any stage work, with a reason that names the copy.
+    reset()
+    raised, msg = False, ""
+    try:
+        wu.dispatch("fix", WORKER, None, CAND, opts(sandbox_host=False))
+    except tc.NoProgress as e:
+        raised, msg = True, str(e)
+    check("bubble fix -> NoProgress", raised, True)
+    check("bubble fix -> stage NOT run", runs["n"], 0)
+    check("bubble fix -> reason names the private Mathlib build", "private Mathlib" in msg, True)
 
     # 4) a non-review OpenRouter stage: the gate is `pi` (host_agent_argv), missing -> pause, no stage run.
     wu._bubble = lambda stage, o: False

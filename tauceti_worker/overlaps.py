@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .config import Die, NoProgress, log, max_open_prs, positive_integer
 from .constants import CLAIMS, TAUCETI
+from .excerpt import ends
 from .github import GitHub, can_push, ensure_fork, me, shared_claims_granted
 from .overlap_state import Lease, State, environment, git
 from .overlap_support import atomic, locked, read_context, root, shared_read, snapshot
@@ -97,8 +98,44 @@ def sources():
     return tauceti, tc_sha, pin
 
 
+SOURCES_IDLE = 2 * 86400  # longer than any round that could still be reading an older pin
+
+
+def collect_sources(parent: Path, keep: Path, now: float | None = None) -> list[Path]:
+    """Remove extracted Mathlib trees for pins nothing has used recently.
+
+    Each pin is a full Mathlib source tree and every Mathlib bump adds one, so without this they
+    accumulate forever. A tree is taken only under its own extraction lock, and its age is checked
+    again there, so a pin acquired meanwhile survives. Readers hold no lock once they have the
+    path, but every reader runs inside a round, and rounds end within ROUND_TIMEOUT (6 hours
+    by default), far inside SOURCES_IDLE."""
+    removed = []
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        if entry == keep or entry.suffix == ".lock" or entry.is_symlink() or not entry.is_dir():
+            continue
+        name = entry.name
+        pin = name.rsplit("-", 1)[0] if re.fullmatch(r"[0-9a-f]{40}-\d+", name) else name
+        if not re.fullmatch(r"[0-9a-f]{40}", pin):
+            continue  # not ours
+        try:
+            with locked(parent / (pin + ".lock"), timeout=0):
+                current = time.time() if now is None else now
+                if current - entry.stat().st_mtime < SOURCES_IDLE:
+                    continue
+                shutil.rmtree(entry)
+            removed.append(entry)
+        except OSError:
+            continue  # in use, or already gone
+    return removed
+
+
 def pinned_sources(repo: Path, pin: str) -> Path:
     target = root() / "overlap" / "sources" / pin
+    extracted_now = False
     with locked(target.with_suffix(".lock"), timeout=240):
         if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -114,8 +151,12 @@ def pinned_sources(repo: Path, pin: str) -> Path:
                 if archive.wait() or extracted.returncode:
                     raise Die("overlap: could not extract pinned Mathlib sources")
                 temporary.rename(target)
+                extracted_now = True
             finally:
                 shutil.rmtree(temporary, ignore_errors=True)
+        os.utime(target)  # last use, which collect_sources() measures
+    if extracted_now:  # a new pin is the only time another can have become unused
+        collect_sources(target.parent, target)
     return target
 
 
@@ -136,7 +177,7 @@ def issues(gh: GitHub, *, fresh=False) -> list[dict]:
             ["api", "--paginate", "--slurp", f"repos/{TAUCETI}/issues?labels={LABEL}&state=all&per_page=100"]
         )
         if result.returncode:
-            raise Die("overlap: issue inventory failed: " + result.stderr.strip()[-300:])
+            raise Die("overlap: issue inventory failed: " + ends(result.stderr, 300))
         pages = json.loads(result.stdout)
         if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
             raise Die("overlap: incomplete issue inventory")
@@ -158,7 +199,7 @@ def overlap_prs(gh, *, fresh=False):
                 return rows
         result = gh._gh(["api", "--paginate", "--slurp", f"repos/{TAUCETI}/pulls?state=open&per_page=100"])
         if result.returncode:
-            raise Die("overlap: open PR inventory failed: " + result.stderr.strip()[-300:])
+            raise Die("overlap: open PR inventory failed: " + ends(result.stderr, 300))
         pages = json.loads(result.stdout)
         if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
             raise Die("overlap: incomplete PR inventory")
@@ -268,7 +309,7 @@ def publish(gh, findings, lease):
         atomic(payload, {"title": finding["title"], "body": body, "labels": [LABEL]})
         result = gh._gh(["api", "--method", "POST", f"repos/{TAUCETI}/issues", "--input", str(payload)])
         if result.returncode:
-            raise Die("overlap: issue publication failed; cursor unchanged: " + result.stderr.strip()[-400:])
+            raise Die("overlap: issue publication failed; cursor unchanged: " + ends(result.stderr, 400))
         try:
             published = json.loads(result.stdout)
             number = published["number"]
@@ -499,6 +540,7 @@ def do_scan(w, sv, c, opts, bubble):
                 logdir=work,
                 label="conversation",
                 provider=profile.provider,
+                quota_cfg=w.cfg,
                 cancel_event=lease.lost,
             )
             if rc:
@@ -520,7 +562,15 @@ def do_scan(w, sv, c, opts, bubble):
 
 
 def do_fix(w, sv, c, opts, bubble):
-    from .agents import fill_prompt, local_verification, prepare_checkout, run_agent_host, run_in_bubble, wrapper_bin
+    from .agents import (
+        fill_prompt,
+        local_verification,
+        prepare_checkout,
+        quality_scope,
+        run_agent_host,
+        run_in_bubble,
+        wrapper_bin,
+    )
     from .work_units import _effective_authoring_profile
 
     require_shared()
@@ -548,6 +598,7 @@ def do_fix(w, sv, c, opts, bubble):
             FORK_OWNER=fork.split("/", 1)[0],
             BIN=wrapper_bin(bubble=bubble),
             LOCAL_VERIFICATION=local_verification("ordinary", bubble),
+            QUALITY_SCOPE=quality_scope(),
         )
         with environment(
             {
@@ -567,9 +618,7 @@ def do_fix(w, sv, c, opts, bubble):
                 rc = run_in_bubble(w, TAUCETI, prompt, opts, allow_push=fork, cancel_event=lease.lost)
             else:
                 if not prepare_checkout(w.cfg, work="overlap-fix"):
-                    from .work_recovery import LAST_REFUSAL
-
-                    raise Die(f"overlap-fix: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
+                    raise Die("overlap-fix: checkout preparation failed")
                 lease.require()
                 rc = run_agent_host(
                     w.cfg.checkout,
@@ -577,6 +626,7 @@ def do_fix(w, sv, c, opts, bubble):
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,
                     cancel_event=getattr(lease, "lost", None),
+                    quota_cfg=w.cfg,
                 )
         if rc:
             return rc

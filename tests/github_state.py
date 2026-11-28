@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Service age independence, conditional results, outage fallback, and cutoff configuration."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import http.client
 import io
 import json
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -72,6 +77,161 @@ class Response(io.BytesIO):
         self.headers = {"ETag": etag}
 
 
+# Unconfigured Tau Ceti workers read the public mirror without a per-machine secret.
+with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp}):
+    for key in ("TAUCETI_GITHUB_STATE_URL", "TAUCETI_GITHUB_STATE_TOKEN_FILE", "TAUCETI_REPO"):
+        os.environ.pop(key, None)
+    assert state.enabled()
+    from tauceti_worker import work_units
+
+    with patch("tauceti_worker.github_transport.observed_budget", return_value={"graphql": (0, 9999999999)}):
+        work_units._check_stage_read_quota("review")
+    # Mirrored workers continue with unknown quota or a low direct read pool,
+    # but recorded REST exhaustion stops a paid launch until the existing reset.
+    from tauceti_worker import loop
+    from tauceti_worker.config import GitHubUnavailable
+
+    for budget, expected_launch in [
+        ({}, True),
+        ({"graphql": (0, 9999999999)}, True),
+        ({"core": (1, 9999999999)}, True),
+        ({"core": (0, 9999999999)}, False),
+    ]:
+        with (
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch.object(loop, "github_budget", side_effect=AssertionError("no quota probe needed")),
+            patch("tauceti_worker.github_transport.scope", return_value="fixture"),
+            patch("tauceti_worker.github_transport.observed_budget", return_value=budget),
+            patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
+            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            loop.cmd_loop(
+                SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None),
+                SimpleNamespace(wid="default-state-test"),
+                only=["review"],
+                agent="codex",
+            )
+            assert launch.called is expected_launch
+            try:
+                work_units._check_stage_read_quota("review")
+            except GitHubUnavailable as error:
+                assert not expected_launch and 9999999999 <= error.retry_at <= 9999999999 + 120
+            else:
+                assert expected_launch
+    # Plain gh-auth workers retain their pre-existing probe because no token
+    # identity is available for local observations. Failure stays nonblocking.
+    for budget, expected_launch in [
+        (None, True),
+        ({"core": (1, 9999999999), "graphql": (0, 9999999999)}, True),
+        ({"core": (0, 9999999999)}, False),
+    ]:
+        with (
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch("tauceti_worker.github_transport.scope", return_value=None),
+            patch.object(loop, "github_budget", return_value=budget) as probe,
+            patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
+            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            loop.cmd_loop(
+                SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None),
+                SimpleNamespace(wid="unconfigured-account-test"),
+                only=["review"],
+                agent="codex",
+            )
+            probe.assert_called_once()
+            assert launch.called is expected_launch
+    public = {
+        "version": 1,
+        "repository": state.PUBLIC_REPOSITORY,
+        "operation": "issue_comments",
+        "status": "ok",
+        "complete": True,
+        "revision": 1,
+        "observed_at": 1,
+        "verified_at": 1,
+        "data": [{"id": "123", "body": "mirrored"}],
+    }
+    with patch.object(state.urllib.request, "urlopen", return_value=Response(public)) as fetch:
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (
+            True,
+            [{"id": 123, "body": "mirrored"}],
+        )
+        request = fetch.call_args.args[0]
+        assert request.full_url.startswith(state.DEFAULT_URL + "/v1/query?")
+        assert not request.has_header("Authorization")
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": ""}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert not state.enabled()
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
+        fetch.assert_not_called()
+    with (
+        patch.dict(os.environ, {"TAUCETI_REPO": "other/private"}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read("other/private", "issue_comments", number=7) == (False, None)
+        fetch.assert_not_called()
+    with patch.object(
+        state.urllib.request,
+        "urlopen",
+        side_effect=urllib.error.HTTPError(state.DEFAULT_URL, 401, "unavailable", {}, io.BytesIO(b"{}")),
+    ) as rejected:
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=8) == (False, None)
+        assert state.last_failure()["reason"] == "public_read_unavailable"
+        assert rejected.call_count == 1
+    assert state.read("other/private", "issue_comments", number=7) == (False, None)
+    assert state.last_failure() is None
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://custom.test"}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
+        assert state.last_failure()["reason"] == "client_auth_configuration"
+        fetch.assert_not_called()
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_TOKEN_FILE": tmp + "/missing"}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
+        assert state.last_failure()["reason"] == "client_auth_configuration"
+        fetch.assert_not_called()
+    # TauCetiRoadmap is not mirrored: a configured client goes to GitHub without asking, so the
+    # server's answer for a removed repository cannot set the host's fallback marker.
+    roadmap_token = Path(tmp) / "roadmap-token"
+    roadmap_token.write_text("client-token\n")
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_TOKEN_FILE": str(roadmap_token)}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+        patch.object(state, "_unavailable", side_effect=AssertionError("not a failure")),
+    ):
+        for repository in ("TauCetiProject/TauCetiRoadmap", "taucetiproject/taucetiroadmap"):
+            assert state.read(repository, "open_issues") == (False, None)
+            assert state.refresh_pr(repository, 7, "a" * 40)["status"] == "unavailable"
+        assert state.last_failure() is None
+        fetch.assert_not_called()
+
+    # A public 429 is shared across operations, then expires without an operator.
+    with tempfile.TemporaryDirectory() as limited, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": limited}):
+        now = time.time()
+        rejected = urllib.error.HTTPError(state.DEFAULT_URL, 429, "limited", {"Retry-After": "60"}, io.BytesIO(b"{}"))
+        with patch.object(state.urllib.request, "urlopen", side_effect=rejected) as fetch:
+            assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=9) == (False, None)
+            assert not fetch.call_args.args[0].has_header("Authorization")
+            assert state.read(state.PUBLIC_REPOSITORY, "pr", number=9) == (False, None)
+            assert fetch.call_count == 1
+            assert state.last_failure()["actionable"] is False
+        with (
+            patch.object(state.time, "time", return_value=now + 61),
+            patch.object(state.urllib.request, "urlopen", return_value=Response(public)) as fetch,
+        ):
+            assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=9)[0]
+            assert fetch.call_count == 1
+            assert state.last_failure() is None
+
+
 with (
     tempfile.TemporaryDirectory() as tmp,
     patch.dict(
@@ -117,7 +277,7 @@ with (
     clock = [0.0]
 
     def healthy_slow_read(request, timeout):
-        assert 4.9 <= timeout <= 5.0
+        assert timeout == state.READ_PAGE_SECONDS
         clock[0] += 3.6
         return Response(payload)
 
@@ -137,8 +297,8 @@ with (
         patch.object(state.urllib.request, "urlopen", side_effect=stalled_read) as fetch,
     ):
         assert state.read("org/repo", "issue_comments", number=7) == (False, None)
-        assert fetch.call_count == 1, "a stalled read must exhaust the same five-second budget"
-        assert clock[0] == 8.6
+        assert fetch.call_count == 1, "a stalled read must exhaust the page budget, not retry with a fresh one"
+        assert clock[0] == 3.6 + state.READ_PAGE_SECONDS
     with patch.object(state.urllib.request, "urlopen", return_value=Response(payload)) as fetch:
         available, rows = state.read("org/repo", "issue_comments", number=7)
         assert available and rows[0]["id"] == 123 and fetch.call_count == 1
@@ -201,4 +361,21 @@ with (
     Path(tmp + "/token").write_text("malformed-json-client")
     with patch.object(state.urllib.request, "urlopen", side_effect=lambda *_a, **_kw: Response([])):
         assert state.read("org/repo", "issue_comments", number=7) == (False, None)
+    # A cold survey snapshot takes 5-6s to build its first page; that is a success, not an outage.
+    clock = [0.0]
+    budgets = []
+
+    def cold_survey(request, timeout):
+        budgets.append(timeout)
+        clock[0] += 6
+        return Response({**payload, "operation": "survey", "data": [{"id": "1"}]})
+
+    Path(tmp + "/token").write_text("cold-survey-client")
+    with (
+        patch.object(state.time, "monotonic", side_effect=lambda: clock[0]),
+        patch.object(state.urllib.request, "urlopen", side_effect=cold_survey),
+    ):
+        assert state.read("org/repo", "survey")[0]
+        assert budgets == [state.READ_PAGE_SECONDS]
+    assert state.PROBE_LEASE > state.READ_PAGE_SECONDS, "a recovery probe must outlive the page it covers"
 print("PASS: shared-state freshness, fallback, conditional reads and configurable cutoff")

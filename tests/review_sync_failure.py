@@ -8,6 +8,9 @@ This test drives do_review with a minimal fake Worker and the engine + sync stub
 network and no real store. Exit 0 = every case agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
 import types
@@ -15,6 +18,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 import tauceti_worker as tc
 
 wu = tc.work_units
@@ -57,7 +64,7 @@ class FakeRS:
 
 
 class FakeGH:
-    pass
+    repo = "TauCetiProject/TauCeti"
 
 
 _tmp = tempfile.TemporaryDirectory()

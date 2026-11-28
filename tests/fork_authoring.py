@@ -16,6 +16,9 @@ not land roadmap work). This harness pins three pure-ish decisions without touch
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys
@@ -137,8 +140,10 @@ def test_fixlike():
     cap = {}
     tc.work_units.run_in_bubble = lambda w, target, prompt, opts, **k: cap.update(target=target, **k) or 0
     w = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(state=Path(tempfile.gettempdir()) / "fork-authoring-test"),
         claims=types.SimpleNamespace(begin_branch_work=lambda *a: True),
         rs=types.SimpleNamespace(bust=lambda *a: None),
+        gh=types.SimpleNamespace(pr_progress_state=lambda _: None, pr_view=lambda *_: None),
     )
     tc.work_units._do_fixlike(w, sv, c, opts, True, prompt_file="fix.md", label="fix")
     check("fixlike: fork head -> allow_push=owner/repo", cap.get("allow_push") == "alice/TauCeti")
@@ -237,9 +242,10 @@ def test_roadmap():
     check("roadmap: URL clone is mounted read-only", f"{cloned['dest']}:/opt/source:ro" in cap.get("mounts", []))
 
     host_cap = {}
+    tc.work_units.claims_repo = lambda: FORK
     tc.work_units.fetch_git_source = fake_fetch_source
     tc.work_units.prepare_checkout = lambda cfg, **_: True
-    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir: host_cap.update(prompt=prompt) or 0
+    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir, **_kwargs: host_cap.update(prompt=prompt) or 0
     opts.source = str(source)
     tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
     host_prompt = host_cap.get("prompt", "")

@@ -20,9 +20,11 @@ The worker passes the policy from surveyed labels/branch; `scope_policy` is chec
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -40,16 +42,6 @@ def check(name, cond, detail=""):
     global fails
     fails += not cond
     print(f"[{'OK ' if cond else 'BAD'}] {name}" + (f"  ({detail})" if not cond and detail else ""))
-
-
-def blocks(policy):
-    from unittest.mock import patch
-
-    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"):
-        text = tc.agents.local_verification(policy)
-    found = re.findall(r"```bash\n(.*?)```", text, re.S)
-    assert len(found) == 3, "expected scope, audit and lint blocks"
-    return found
 
 
 def git(repo, *args, **kw):
@@ -98,13 +90,17 @@ def fixture(root, name, *, remote=CANONICAL, track_main=True):
 
 
 def scope(repo, policy="ordinary", cwd=None, config=None):
-    recipe = blocks(policy)[0]
-    env = dict(os.environ, GIT_CONFIG_GLOBAL=config or "/dev/null", GIT_CONFIG_NOSYSTEM="1")
-    run = subprocess.run(["bash", "-c", recipe], cwd=cwd or repo, capture_output=True, text=True, env=env)
-    out = Path(repo) / ".lake" / "tauceti-scope"
-    mode = (out / "mode").read_text().strip() if (out / "mode").exists() else f"<none: {run.stderr}>"
-    modules = (out / "modules.txt").read_text().split() if (out / "modules.txt").exists() else None
-    return run.returncode, mode, modules
+    from unittest.mock import patch
+
+    from tauceti_worker.verification_scope import local_main
+    from tauceti_worker.verification_scope import scope as shared_scope
+
+    with patch.dict(os.environ, GIT_CONFIG_GLOBAL=config or "/dev/null", GIT_CONFIG_NOSYSTEM="1"):
+        try:
+            selected = shared_scope(Path(repo), local_main(Path(repo)), policy)
+        except ValueError as error:
+            selected = dict(mode="unknown", reason=str(error), modules=[])
+    return 0, selected["mode"] + ": " + selected["reason"], selected["modules"]
 
 
 def expect(name, repo, kind, modules=None, reason="", policy="ordinary", **kw):
@@ -120,7 +116,9 @@ def expect(name, repo, kind, modules=None, reason="", policy="ordinary", **kw):
     except ValueError:
         actual = dict(mode="unknown", modules=[])
     check(
-        f"{name}: helper matches V0 scope", actual["mode"] == kind and actual["modules"] == (listed or []), str(actual)
+        f"{name}: shared scope matches expected modules",
+        actual["mode"] == kind and actual["modules"] == (listed or []),
+        str(actual),
     )
     check(f"{name}: recipe exits 0", rc == 0, mode)
     check(f"{name}: mode {kind}", mode.startswith(kind), mode)
@@ -281,7 +279,7 @@ def main():
         r = fixture(root, "unrelated")
         git(r, "checkout", "-q", "--orphan", "orphan")
         git(r, "commit", "-qm", "unrelated")
-        expect("no merge base", r, "unknown", [], "no merge base")
+        expect("merge-base", r, "unknown", [], "merge-base")
 
         src = fixture(root, "shallow-src")
         shallow = Path(root) / "shallow"
@@ -289,69 +287,6 @@ def main():
         git(shallow, "remote", "set-url", "origin", CANONICAL)
         git(shallow, "update-ref", "refs/remotes/origin/main", "HEAD")
         expect("shallow history", shallow, "unknown", [], "shallow")
-
-        # The audit and lint blocks consume the recipe's files with a stand-in lake.
-        bin_dir = Path(root) / "bin"
-        bin_dir.mkdir()
-        log = Path(root) / "calls.log"
-        stub = bin_dir / "lake"
-        stub.write_text(f'#!/bin/sh\necho "lake $* AXIOMS=${{AXIOMS_ONLY_MODULES-unset}}" >> {log}\n')
-        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-        local_stub = bin_dir / "local-checker"
-        local_stub.write_text(
-            "import os, sys\nfrom pathlib import Path\n"
-            f"Path({str(log)!r}).write_text('local-checker ' + ' '.join(sys.argv[1:]) + "
-            "' AXIOMS=' + os.environ.get('AXIOMS_ONLY_MODULES', 'unset'))\n"
-        )
-        # An inherited scope must never narrow a full audit.
-        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", AXIOMS_ONLY_MODULES="/stale/list")
-        _, audit, lint = blocks("ordinary")
-        audit = audit.replace(str(tc.paths.HERE / "scripts/tauceti-local-axioms"), str(local_stub))
-
-        def audit_call(repo):
-            log.write_text("")
-            rc = subprocess.run(["bash", "-c", audit], cwd=repo, env=env, capture_output=True).returncode
-            return rc, log.read_text().strip()
-
-        r = Path(root) / "committed"
-        scope(r)
-        rc, call = audit_call(r)
-        listed = r / ".lake" / "tauceti-scope" / "modules.txt"
-        check(
-            "scoped audit passes an absolute module list",
-            rc == 0 and "local-checker --modules" in call and str(listed) in call and "exe axioms" not in call,
-            call,
-        )
-        check("module list path is absolute", listed.is_absolute())
-        r = Path(root) / "docs"
-        scope(r)
-        rc, call = audit_call(r)
-        check(
-            "empty scope uses the cheap local checker",
-            "local-checker --modules" in call and "exe axioms" not in call,
-            call,
-        )
-        r = Path(root) / "deleted"
-        scope(r)
-        rc, call = audit_call(r)
-        check(
-            "full CI scope still uses changed-file diagnostics",
-            rc == 0 and "local-checker --modules" in call and call.endswith("AXIOMS="),
-            call,
-        )
-        r = Path(root) / "no-main"
-        scope(r)
-        rc, call = audit_call(r)
-        check("unknown scope fails without any full-library fallback", rc != 0 and call == "", call)
-        lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
-        check("unknown scope skips the local lint", "CI runs the environment lint" in lint_run.stdout)
-        r = fixture(root, "never-scoped")
-        rc, _ = audit_call(r)
-        check("audit without a computed scope fails", rc != 0)
-        r = Path(root) / "docs"
-        scope(r)
-        lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
-        check("empty scope skips lint-env", "no changed TauCeti module" in lint_run.stdout, lint_run.stdout)
 
     # The canary helper path is explicitly opted in; V0 remains the dispatch default.
     os.environ["TAUCETI_VERIFY_HELPER"] = "1"
@@ -373,6 +308,61 @@ def main():
         check(f"{name}: no unscoped whole-suite rerun", "run the WHOLE suite" not in text)
         check(f"{name}: no bare unscoped audit command block", "\nlake exe axioms\n" not in text)
         check(f"{name}: no stale DuplicateDeclarations script", "DuplicateDeclarations.lean" not in text)
+
+    # Both verifier paths add the same optional publication instruction.
+    from unittest.mock import patch
+
+    for helper in ("0", "1"):
+        with patch.dict(os.environ, TAUCETI_VERIFY_HELPER=helper, TAUCETI_SELF_TESTED="1"):
+            text = tc.agents.local_verification("ordinary")
+            check(
+                f"self-tested helper={helper}: label the PR after verification",
+                "Apply the `self-tested` label to the PR" in text
+                and "gh-safe-pr-create" in text
+                and "matching verification receipt" in text
+                and "failed, incomplete, or outdated" in text,
+            )
+            check(
+                f"self-tested helper={helper}: author-only comment fallback for missing label permissions",
+                "lack label permissions" in text
+                and ".permissions.triage" in text
+                and "do not run `gh pr edit`" in text
+                and "you are the PR author" in text
+                and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
+                and "do not post duplicate requests" in text,
+            )
+            check(
+                f"self-tested helper={helper}: keep declaration across fix pushes",
+                "Keep the label in place through fix/rebase pushes" in text
+                and "--remove-label self-tested" in text
+                and "A push clears" not in text,
+            )
+            check(
+                f"self-tested helper={helper}: remove only on failed local verification, never for PR CI",
+                "Remove it only when local verification of the current head actually fails" in text
+                and "verification fails or is incomplete" not in text
+                and "Never remove `self-tested` (or post `-self-tested`) to request or re-trigger PR CI" in text
+                and "`awaiting-CI` or `ci-failed` labels" in text,
+            )
+            for policy in ("bump", "full-lint", "lint-repair"):
+                check(
+                    f"self-tested helper={helper}: excludes {policy}",
+                    "Apply the self-tested label after verification" not in tc.agents.local_verification(policy),
+                )
+        with patch.dict(os.environ, TAUCETI_SELF_TESTED="0"):
+            check(
+                f"self-tested helper={helper}: off by default",
+                "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
+            )
+
+    with (
+        patch.dict(os.environ, TAUCETI_SELF_TESTED="1"),
+        patch(
+            "tauceti_worker.worker_sources.repository_url",
+            return_value="https://git.example.org/Other/Project",
+        ),
+    ):
+        check("self-tested never labels a different source", tc.agents.self_tested_guidance("ordinary") == "")
 
     # Policy comes from surveyed labels and branch only.
     sp = tc.agents.scope_policy

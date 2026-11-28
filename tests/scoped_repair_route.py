@@ -1,5 +1,8 @@
 """One explicitly scoped foreign repair; no live reads, pushes, or paid agents."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import importlib
 import json
@@ -43,6 +46,15 @@ def fixture():
     }
     gh = GitHub()
     gh.issue_comments = Mock(return_value=[comment])
+    gh.pr_progress_state = Mock(
+        side_effect=lambda _: dict(
+            head=live["head"]["sha"],
+            state=live["state"].upper(),
+            isDraft=live["draft"],
+            labels=live["labels"],
+            ncomments=1,
+        )
+    )
 
     def api(path, jq):
         if path.endswith("/pulls/13940"):

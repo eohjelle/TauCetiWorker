@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Scoped native lint: dependency findings stay out, changed docstrings/nolints stay in."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json
@@ -16,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import importlib.machinery
 import importlib.util
 
-HELPER = Path(__file__).resolve().parents[1] / "scripts/tauceti-local-lint"
+from tauceti_tools.templates import ASSETS
+
+HELPER = ASSETS / "scripts/local_lint.py"
 loader = importlib.machinery.SourceFileLoader("local_lint", str(HELPER))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 lint = importlib.util.module_from_spec(spec)
